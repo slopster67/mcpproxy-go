@@ -407,10 +407,6 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 		probe.SetCredentialBinding(desired.Binding)
 		defer probe.Retire()
 		values, warning := probe.OAuthDefaults(ctx)
-		if a.url.Scheme == "https" {
-			values.CallbackBaseURL = a.cfg.PeerPrimaryURL
-			values.RedirectURI, _ = config.OAuthRemoteCallbackURL(a.cfg.PeerPrimaryURL, f.Server)
-		}
 		return &oauth.Settings{Automatic: values, DiscoveryError: warning}, nil
 
 	case "connect":

@@ -1,7 +1,6 @@
 package oauth
 
 import (
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,15 +10,44 @@ import (
 
 // configureRemoteCallback retains the loopback listener for local callers, but
 // makes the same single-use state dispatcher reachable from the main HTTP mux.
-// A config reload must not move a callback while a sign-in is waiting for it.
-func (c *CallbackServer) configureRemoteCallback(callbackURL string) error {
+// Each waiting sign-in keeps its own redirect, so a later login can use a
+// different host without cancelling the one already in progress. An empty URL
+// leaves an in-flight public callback alone.
+func (c *CallbackServer) configureRemoteCallback(callbackURL string) {
 	c.waitersMu.Lock()
 	defer c.waitersMu.Unlock()
-	if c.remoteCallbackURL != callbackURL && len(c.waiters) > 0 {
-		return fmt.Errorf("cannot change oauth.callback_base_url while a sign-in is waiting; finish or cancel that sign-in first")
+	if callbackURL == "" && len(c.waiters) > 0 {
+		return
 	}
 	c.remoteCallbackURL = callbackURL
-	return nil
+}
+
+// NoteRedirect records the redirect URI this state was registered with.
+// Token exchange uses that exact string.
+func (c *CallbackServer) NoteRedirect(state, redirectURI string) {
+	if state == "" || redirectURI == "" {
+		return
+	}
+	c.waitersMu.Lock()
+	defer c.waitersMu.Unlock()
+	if waiter, ok := c.waiters[state]; ok {
+		waiter.redirectURI = redirectURI
+	}
+}
+
+// RedirectFor is the redirect URI registered for state. A sign-in that did
+// not record one falls back to the server's current public callback, then to
+// the loopback listener.
+func (c *CallbackServer) RedirectFor(state string) string {
+	c.waitersMu.Lock()
+	defer c.waitersMu.Unlock()
+	if waiter, ok := c.waiters[state]; ok && waiter.redirectURI != "" {
+		return waiter.redirectURI
+	}
+	if c.remoteCallbackURL != "" {
+		return c.remoteCallbackURL
+	}
+	return c.RedirectURI
 }
 
 // EffectiveRedirectURI is the exact URI registered with the provider, which
@@ -34,8 +62,7 @@ func (c *CallbackServer) EffectiveRedirectURI() string {
 }
 
 // RemoteCallbackHandler accepts provider callbacks without dashboard sessions.
-// The unpredictable, single-use state authenticates
-// the callback, and only explicitly configured remote flows can receive it.
+// The unpredictable, single-use state authenticates the callback.
 func (m *CallbackServerManager) RemoteCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
@@ -53,14 +80,6 @@ func (m *CallbackServerManager) RemoteCallbackHandler(w http.ResponseWriter, r *
 	}
 	c, exists := m.GetCallbackServer(serverName)
 	if !exists {
-		http.NotFound(w, r)
-		return
-	}
-	c.waitersMu.Lock()
-	callbackURL := c.remoteCallbackURL
-	c.waitersMu.Unlock()
-	expected, err := url.Parse(callbackURL)
-	if err != nil || callbackURL == "" || expected.EscapedPath() != r.URL.EscapedPath() {
 		http.NotFound(w, r)
 		return
 	}

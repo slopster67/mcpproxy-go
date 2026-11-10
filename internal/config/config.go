@@ -207,20 +207,6 @@ type Config struct {
 	// Logging configuration
 	Logging *LogConfig `env:",init" mode:"both" json:"logging,omitempty"`
 
-	// Security settings
-	// TrustedHosts lists non-loopback Host header values accepted on loopback
-	// listeners. DNS-rebinding protection rejects requests whose Host
-	// header is not a loopback address when mcpproxy listens on loopback; a
-	// reverse proxy (nginx → 127.0.0.1) forwarding the public domain in Host
-	// trips it. Entries are hostnames, case-insensitive; an entry without a
-	// port matches any port, with a port it must match exactly; a leading dot
-	// (".example.com") is a subdomain wildcard. The single entry "*" disables
-	// Host and Origin validation entirely. The same list also validates the
-	// Origin header when present (MCP spec DNS-rebinding defense). Empty
-	// (default) keeps full protection. Env override: MCPPROXY_TRUSTED_HOSTS
-	// (comma-separated).
-	TrustedHosts []string `env:"MCPPROXY_TRUSTED_HOSTS" file:"true" json:"trusted_hosts,omitempty"`
-
 	// Code execution settings
 	CodeExecutionTimeoutMs    int `env:"MCPPROXY_CODE_EXECUTION_TIMEOUT_MS" json:"code_execution_timeout_ms,omitempty"`         // Timeout in milliseconds (default: 120000, max: 600000)
 	CodeExecutionMaxToolCalls int `env:"MCPPROXY_CODE_EXECUTION_MAX_TOOL_CALLS" json:"code_execution_max_tool_calls,omitempty"` // Max tool calls per execution (0 = unlimited, default: 0)
@@ -365,12 +351,11 @@ type OAuthConfig struct {
 	// (detect: use OAuth when the upstream requires it).
 	Mode string `json:"mode,omitempty"`
 
-	ClientID        string            `json:"client_id,omitempty"`
-	ClientSecret    string            `json:"client_secret,omitempty"`
-	RedirectURI     string            `json:"redirect_uri,omitempty"`
-	CallbackBaseURL string            `json:"callback_base_url,omitempty"`
-	Scopes          []string          `json:"scopes,omitempty"`
-	ExtraParams     map[string]string `json:"extra_params,omitempty"` // Additional OAuth parameters (e.g., RFC 8707 resource)
+	ClientID     string            `json:"client_id,omitempty"`
+	ClientSecret string            `json:"client_secret,omitempty"`
+	RedirectURI  string            `json:"redirect_uri,omitempty"`
+	Scopes       []string          `json:"scopes,omitempty"`
+	ExtraParams  map[string]string `json:"extra_params,omitempty"` // Additional OAuth parameters (e.g., RFC 8707 resource)
 
 	// Optional per-server discovery overrides. Each is an absolute
 	// https URL (http only on a loopback host) with no query, fragment or
@@ -661,11 +646,6 @@ func (c *Config) oauthRedirectURIErrors() []ValidationError {
 	for i, server := range c.Servers {
 		if server == nil || server.OAuth == nil {
 			continue
-		}
-		if err := ValidateOAuthCallbackBaseURL(server.OAuth.CallbackBaseURL); err != nil {
-			errors = append(errors, ValidationError{
-				Field: fmt.Sprintf("servers[%d].oauth.callback_base_url", i), Message: err.Error(),
-			})
 		}
 		if strings.TrimSpace(server.OAuth.RedirectURI) == "" {
 			continue
@@ -1003,7 +983,6 @@ func OAuthConfigChanged(old, new *OAuthConfig) bool {
 		old.ClientID != new.ClientID ||
 		old.ClientSecret != new.ClientSecret ||
 		old.RedirectURI != new.RedirectURI ||
-		old.CallbackBaseURL != new.CallbackBaseURL ||
 		old.AuthorizationEndpoint != new.AuthorizationEndpoint ||
 		old.TokenEndpoint != new.TokenEndpoint ||
 		old.RegistrationEndpoint != new.RegistrationEndpoint ||

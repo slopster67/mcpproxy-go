@@ -17,6 +17,7 @@ import (
 
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
+	"github.com/slopster67/mcpproxy-go/internal/httpx"
 	"github.com/slopster67/mcpproxy-go/internal/storage"
 
 	"github.com/mark3labs/mcp-go/v2/client"
@@ -113,8 +114,9 @@ func (m *CallbackServerManager) subjectLoggerLocked(logger *zap.Logger) *zap.Log
 // with an explicit failure page instead of being handed to whichever flow
 // happened to be listening.
 type callbackWaiter struct {
-	channel   chan map[string]string
-	delivered bool
+	channel     chan map[string]string
+	delivered   bool
+	redirectURI string
 }
 
 // CallbackServer represents an active OAuth callback server.
@@ -740,14 +742,6 @@ func createOAuthConfigInternal(env Env, serverConfig *config.ServerConfig, stora
 	// It is never obtained from — nor refreshable by — Dynamic Client Registration,
 	// so the DCR "clear and re-register" recovery paths below must never wipe it.
 	hasStaticClientID := serverConfig.OAuth != nil && serverConfig.OAuth.ClientID != ""
-	var remoteRedirectURI string
-	if serverConfig.OAuth != nil {
-		var err error
-		remoteRedirectURI, err = config.OAuthRemoteCallbackURL(serverConfig.OAuth.CallbackBaseURL, serverConfig.Name)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	// An explicit `oauth.redirect_uri` pins the loopback callback port. Providers
 	// such as GitHub OAuth Apps match the callback URL exactly and reject
@@ -798,6 +792,20 @@ func createOAuthConfigInternal(env Env, serverConfig *config.ServerConfig, stora
 		if storedErr != nil {
 			storedClientID, storedPort, storedRedirectURI, storedRev = "", 0, "", 0
 		}
+	}
+
+	// A browser sign-in registers the origin of that request. A later refresh
+	// has no request, so it keeps a public callback already stored with the
+	// client. A loopback pin still wins when nobody is browsing in.
+	var remoteRedirectURI string
+	if origin := httpx.PublicOriginFrom(env.Ctx); origin != "" {
+		var err error
+		remoteRedirectURI, err = config.OAuthRemoteCallbackURL(origin, serverConfig.Name)
+		if err != nil {
+			return nil, err
+		}
+	} else if pinnedPort == 0 && config.PublicOAuthCallbackURI(storedRedirectURI) {
+		remoteRedirectURI = storedRedirectURI
 	}
 
 	switch {
@@ -920,9 +928,7 @@ func createOAuthConfigInternal(env Env, serverConfig *config.ServerConfig, stora
 	if remoteRedirectURI != "" {
 		redirectURI = remoteRedirectURI
 	}
-	if err := callbackServer.configureRemoteCallback(remoteRedirectURI); err != nil {
-		return nil, err
-	}
+	callbackServer.configureRemoteCallback(remoteRedirectURI)
 
 	logger.Info("Using exact redirect URI from allocated callback server",
 		zap.String("server", serverConfig.Name),

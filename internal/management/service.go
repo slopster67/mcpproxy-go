@@ -42,7 +42,7 @@ type RuntimeOperations interface {
 	RestartServer(serverName string) error
 	GetServerTools(serverName string) ([]map[string]interface{}, error)
 	GetToolApproval(serverName, toolName string) (*storage.ToolApprovalRecord, error)
-	TriggerOAuthLoginQuick(serverName string) (*core.OAuthStartResult, error)
+	TriggerOAuthLoginQuick(ctx context.Context, serverName string) (*core.OAuthStartResult, error)
 	TriggerOAuthLogout(serverName string) error
 }
 
@@ -94,7 +94,7 @@ func (s *service) TriggerOAuthLoginQuick(ctx context.Context, name string) (*cor
 	if name == "" {
 		return nil, fmt.Errorf("server name required")
 	}
-	result, err := s.runtime.TriggerOAuthLoginQuick(name)
+	result, err := s.runtime.TriggerOAuthLoginQuick(ctx, name)
 	if err != nil {
 		return result, fmt.Errorf("failed to start OAuth: %w", err)
 	}

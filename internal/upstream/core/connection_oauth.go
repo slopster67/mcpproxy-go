@@ -1050,6 +1050,7 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 		return fmt.Errorf("callback server not found for %s", c.config.Name)
 	}
 	callbackCh := callbackServer.RegisterState(state)
+	callbackServer.NoteRedirect(state, oauthConfig.RedirectURI)
 	defer callbackServer.UnregisterState(state)
 
 	// Check if OAuth credentials are available (either from config or persisted DCR)
@@ -1408,6 +1409,7 @@ func (c *Client) handleOAuthAuthorizationWithResult(ctx context.Context, authErr
 		return result, fmt.Errorf("callback server not found for %s", c.config.Name)
 	}
 	callbackCh := callbackServer.RegisterState(state)
+	callbackServer.NoteRedirect(state, oauthConfig.RedirectURI)
 	defer callbackServer.UnregisterState(state)
 
 	// Check for existing credentials or attempt DCR
@@ -1591,10 +1593,10 @@ func (c *Client) handleOAuthAuthorizationWithResult(ctx context.Context, authErr
 // storage transaction (oauth.WithLoginClient): saving the token alone kept
 // whatever client was stored, so a login whose save was delayed past another
 // login's completion paired its refresh token with that login's client_id.
-// The callback port and the EFFECTIVE redirect URI (the HTTPS one under
-// oauth.callback_base_url) come from cb, the callback server this
-// login registered its state on (not whichever one the registry holds by the
-// time the exchange runs); with no cb the stored values are kept.
+// The callback port and the redirect URI registered for this state come from
+// cb, the callback server this login registered its state on (not whichever
+// one the registry holds by the time the exchange runs); with no cb the stored
+// values are kept.
 // With oauth.extra_params.client_id the token request is sent with that id
 // (OAuthTransportWrapper overrides the handler's), so the handler's client is
 // not recorded and the stored one is kept, as before.
@@ -1608,7 +1610,7 @@ func (c *Client) exchangeAuthorizationCode(ctx context.Context, h *uptransport.O
 		login = oauth.LoginClient{ClientID: h.GetClientID(), ClientSecret: h.GetClientSecret()}
 		if cb != nil && cb.Port > 0 {
 			login.CallbackPort = cb.Port
-			login.RedirectURI = cb.EffectiveRedirectURI()
+			login.RedirectURI = cb.RedirectFor(state)
 		}
 		ctx = oauth.WithLoginClient(ctx, login)
 	}
@@ -2165,6 +2167,7 @@ func (c *Client) getAuthorizationURLQuick(ctx context.Context, oauthConfig *clie
 	// failed flow from leaving a dangling waiter behind.
 	if callbackServer, exists := oauth.GetCallbackServer(c.config.Name); exists {
 		callbackServer.RegisterState(state)
+		callbackServer.NoteRedirect(state, oauthConfig.RedirectURI)
 	}
 
 	return authURL, oauthHandler, codeVerifier, state, nil

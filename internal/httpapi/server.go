@@ -241,33 +241,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.router.ServeHTTP(w, r)
 }
 
-// trustedHostsProvider yields the LIVE trusted_hosts list through the
-// controller's config, evaluated per request so hot-reload takes effect
-// without a restart.
-func (s *Server) trustedHostsProvider() func() []string {
-	return func() []string {
-		if s.controller == nil {
-			return nil
-		}
-		if cfg, err := s.controller.GetConfig(); err == nil && cfg != nil {
-			return cfg.TrustedHosts
-		}
-		return nil
-	}
-}
-
-// corsMiddleware echoes the request Origin only
-// when that origin passes the same allowlist the MCP surface uses
-// (httpx.OriginAllowed: loopback on any port, or a host in config
-// trusted_hosts) and emits nothing at all otherwise - including when there is
-// no Origin header, which is every non-browser client. The embedded Web UI is
-// same-origin under /ui/, so nothing legitimate needs the wildcard.
+// corsMiddleware echoes the request Origin when that origin is loopback or
+// the same host and scheme the client used to reach this request. It emits
+// nothing otherwise, including when there is no Origin header, which is every
+// non-browser client. The embedded Web UI is same-origin under /ui/.
 //
 // The OPTIONS short-circuit stays ahead of dashboard session middleware: browsers
 // never send credentials on a preflight, so gating it behind the API key would
 // break legitimate cross-origin use.
 func (s *Server) corsMiddleware() func(http.Handler) http.Handler {
-	trustedHosts := s.trustedHostsProvider()
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Add, never Set: another layer may already have written a Vary
@@ -275,13 +257,7 @@ func (s *Server) corsMiddleware() func(http.Handler) http.Handler {
 			w.Header().Add("Vary", "Origin")
 
 			origin := r.Header.Get("Origin")
-			if origin != "" && httpx.OriginAllowed(origin, trustedHosts()) {
-				// Echo the concrete origin rather than "*", even when
-				// trusted_hosts is ["*"]: a reflected origin is what lets a
-				// browser cache the response per origin alongside Vary, and
-				// "*" is illegal on a credentialed response. (Reflecting an
-				// arbitrary origin is NOT itself a substitute for the
-				// allowlist — trusted_hosts ["*"] deliberately disables it.)
+			if origin != "" && httpx.OriginMatchesRequest(origin, r) {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-CSRF-Token")

@@ -940,7 +940,7 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	// Create a logging wrapper for debugging client connections
 	loggingHandler := s.mcpLoggingHandler
 
-	mcpHandler := s.streamingNoDeadline(s.hostValidationMiddleware(s.mcpAuthMiddleware(loggingHandler(streamableServer))))
+	mcpHandler := s.streamingNoDeadline(s.mcpAuthMiddleware(loggingHandler(streamableServer)))
 	registerMCPHandler(mux, mcpHandler)
 
 	s.logger.Info("Registered MCP endpoint",
@@ -1013,7 +1013,7 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	s.mu.Lock()
 	s.httpServer = &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           mux,
+		Handler:           publicOriginHandler(mux),
 		ReadHeaderTimeout: 60 * time.Second, // Slowloris guard — deliberately not configurable
 		ReadTimeout:       readTimeout,      // Full request read timeout (http_read_timeout)
 		WriteTimeout:      writeTimeout,     // Response write timeout (http_write_timeout; 0 = none; streaming routes opt out)

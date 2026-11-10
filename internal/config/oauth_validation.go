@@ -150,9 +150,6 @@ func (o *OAuthConfig) Validate() error {
 	if o.Mode != "" && o.Mode != OAuthModeOn && o.Mode != OAuthModeOff {
 		return fmt.Errorf("oauth config validation failed: mode must be %q or %q (omit it for automatic detection)", OAuthModeOn, OAuthModeOff)
 	}
-	if err := ValidateOAuthCallbackBaseURL(o.CallbackBaseURL); err != nil {
-		return err
-	}
 
 	// Validate extra params
 	if err := ValidateOAuthExtraParams(o.ExtraParams); err != nil {

@@ -194,7 +194,7 @@ func (r *Runtime) oauthAllowed(name string) error {
 }
 
 func (r *Runtime) peerOAuthLogin(name string) error {
-	_, err := r.TriggerOAuthLoginQuick(name)
+	_, err := r.TriggerOAuthLoginQuick(context.Background(), name)
 	return err
 }
 

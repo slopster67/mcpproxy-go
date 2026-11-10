@@ -33,7 +33,6 @@ const fields = [
   { key: 'token_endpoint', label: 'Token URL', placeholder: 'Automatic discovery' },
   { key: 'registration_endpoint', label: 'Registration URL', placeholder: 'Automatic discovery' },
   { key: 'redirect_uri', label: 'Redirect URI', placeholder: 'Allocated when signing in' },
-  { key: 'callback_base_url', label: 'Callback base URL', placeholder: 'Local callback' },
 ] as const
 
 function display(value: unknown): string {

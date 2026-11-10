@@ -77,9 +77,6 @@ func (a *Agent) configure(ctx context.Context, desired peering.Connection) (*man
 	cfg := config.CopyServerConfig(desired.Config)
 	cfg.HostID = nil
 	cfg.AvailableToPeers = nil
-	if cfg.OAuth != nil && cfg.OAuth.CallbackBaseURL == "" && a.url.Scheme == "https" {
-		cfg.OAuth.CallbackBaseURL = a.cfg.PeerPrimaryURL
-	}
 	a.mu.Lock()
 	current, previous, token := a.servers[name], a.settings[name], a.tokens[name]
 	version := a.versions[name]

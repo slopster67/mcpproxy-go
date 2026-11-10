@@ -7,9 +7,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/slopster67/mcpproxy-go/internal/config"
+	"github.com/slopster67/mcpproxy-go/internal/httpx"
 	"github.com/slopster67/mcpproxy-go/internal/logs"
 	"github.com/slopster67/mcpproxy-go/internal/oauth"
 	"github.com/slopster67/mcpproxy-go/internal/peering"
@@ -44,8 +46,13 @@ func (a *Agent) manage(ctx context.Context, f peering.Frame) (any, error) {
 		if cfg.OAuth == nil {
 			cfg.OAuth = &config.OAuthConfig{}
 		}
-		if a.url.Scheme == "https" && cfg.OAuth.CallbackBaseURL == "" {
-			cfg.OAuth.CallbackBaseURL = a.cfg.PeerPrimaryURL
+		var request struct {
+			Origin string `json:"origin"`
+		}
+		_ = json.Unmarshal(f.Data, &request)
+		origin := strings.TrimRight(strings.TrimSpace(request.Origin), "/")
+		if origin == "" && a.url.Scheme == "https" {
+			origin = strings.TrimRight(a.cfg.PeerPrimaryURL, "/")
 		}
 		client, err := core.NewClient(cfg.Name, cfg, a.logger, a.global.Logging, a.global, token, resolver)
 		if err != nil {
@@ -55,6 +62,9 @@ func (a *Agent) manage(ctx context.Context, f peering.Frame) (any, error) {
 		client.SetGate(instance.Gate())
 		client.SetCredentialBinding(instance.CredentialBinding())
 		flowCtx, cancel := context.WithTimeout(instance.Gate().Context(), 30*time.Minute)
+		if origin != "" {
+			flowCtx = httpx.WithPublicOrigin(flowCtx, origin)
+		}
 		result, err := client.StartOAuthFlowQuick(flowCtx)
 		if err != nil {
 			cancel()

@@ -5,7 +5,6 @@ export interface OAuthOverrides {
   scopes?: string[]
   extra_params?: Record<string, string>
   redirect_uri?: string
-  callback_base_url?: string
   authorization_endpoint?: string
   token_endpoint?: string
   registration_endpoint?: string

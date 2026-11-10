@@ -19,6 +19,7 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/slopster67/mcpproxy-go/internal/auth"
+	"github.com/slopster67/mcpproxy-go/internal/httpx"
 	"golang.org/x/oauth2"
 )
 
@@ -42,6 +43,7 @@ type session struct {
 type loginFlow struct {
 	State                     string
 	Nonce, Verifier, ReturnTo string
+	RedirectURL               string
 	Expires                   time.Time
 }
 type Manager struct {
@@ -99,20 +101,40 @@ func randomToken() string {
 }
 func digest(value string) [32]byte { return sha256.Sum256([]byte(value)) }
 
-func (m *Manager) secure() bool {
-	return m.cfg != nil && strings.HasPrefix(m.cfg.RedirectURL, "https://")
+func (m *Manager) secure(r *http.Request) bool {
+	return strings.HasPrefix(httpx.PublicOrigin(r), "https://")
 }
-func (m *Manager) cookieName(name string) string {
-	if m.secure() {
+func (m *Manager) cookieName(r *http.Request, name string) string {
+	if m.secure(r) {
 		return "__Host-" + name
 	}
 	return name
 }
-func (m *Manager) cookie(w http.ResponseWriter, name, value, path string, maxAge int) {
-	if m.secure() {
+func (m *Manager) cookie(w http.ResponseWriter, r *http.Request, name, value, path string, maxAge int) {
+	if m.secure(r) {
 		path = "/"
 	}
-	http.SetCookie(w, &http.Cookie{Name: m.cookieName(name), Value: value, Path: path, HttpOnly: true, Secure: m.secure(), SameSite: http.SameSiteLaxMode, MaxAge: maxAge})
+	http.SetCookie(w, &http.Cookie{Name: m.cookieName(r, name), Value: value, Path: path, HttpOnly: true, Secure: m.secure(r), SameSite: http.SameSiteLaxMode, MaxAge: maxAge})
+}
+func dashboardRedirect(r *http.Request) (string, error) {
+	origin := httpx.PublicOrigin(r)
+	if origin == "" {
+		return "", fmt.Errorf("sign-in needs a request host")
+	}
+	return origin + "/auth/callback", nil
+}
+func (m *Manager) requestOAuth(r *http.Request) (*oauth2.Config, *oidc.IDTokenVerifier, string, error) {
+	conf, verifier, err := m.provider(r.Context())
+	if err != nil {
+		return nil, nil, "", err
+	}
+	redirect, err := dashboardRedirect(r)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	copied := *conf
+	copied.RedirectURL = redirect
+	return &copied, verifier, redirect, nil
 }
 func (m *Manager) provider(ctx context.Context) (*oauth2.Config, *oidc.IDTokenVerifier, error) {
 	m.providerMu.Lock()
@@ -142,7 +164,7 @@ func (m *Manager) provider(ctx context.Context) (*oauth2.Config, *oidc.IDTokenVe
 		return nil, nil, fmt.Errorf("identity provider must use an HTTPS introspection endpoint")
 	}
 	m.metadata = metadata
-	m.oauth = &oauth2.Config{ClientID: m.cfg.ClientID, ClientSecret: m.cfg.ClientSecret, RedirectURL: m.cfg.RedirectURL, Endpoint: provider.Endpoint(), Scopes: []string{oidc.ScopeOpenID, "profile", "email"}}
+	m.oauth = &oauth2.Config{ClientID: m.cfg.ClientID, ClientSecret: m.cfg.ClientSecret, Endpoint: provider.Endpoint(), Scopes: []string{oidc.ScopeOpenID, "profile", "email"}}
 	m.verifier = provider.VerifierContext(oidc.ClientContext(context.Background(), m.client), &oidc.Config{ClientID: m.cfg.ClientID})
 	return m.oauth, m.verifier, nil
 }
@@ -184,27 +206,27 @@ func returnPath(raw string) string {
 }
 func (m *Manager) Login(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	conf, _, err := m.provider(r.Context())
+	conf, _, redirect, err := m.requestOAuth(r)
 	if err != nil {
 		failure(w, 503, err.Error())
 		return
 	}
 	state, nonce, verifier := randomToken(), randomToken(), oauth2.GenerateVerifier()
-	flow := loginFlow{State: state, Nonce: nonce, Verifier: verifier, ReturnTo: returnPath(r.URL.Query().Get("return_to")), Expires: time.Now().Add(flowLifetime)}
+	flow := loginFlow{State: state, Nonce: nonce, Verifier: verifier, ReturnTo: returnPath(r.URL.Query().Get("return_to")), RedirectURL: redirect, Expires: time.Now().Add(flowLifetime)}
 	payload, err := json.Marshal(flow)
 	if err != nil {
 		failure(w, 500, "Could not start sign-in")
 		return
 	}
-	sealed := m.flowCipher.Seal(nil, nil, payload, []byte(m.cookieName(flowCookie)))
-	m.cookie(w, flowCookie, base64.RawURLEncoding.EncodeToString(sealed), "/auth/", int(flowLifetime.Seconds()))
+	sealed := m.flowCipher.Seal(nil, nil, payload, []byte(m.cookieName(r, flowCookie)))
+	m.cookie(w, r, flowCookie, base64.RawURLEncoding.EncodeToString(sealed), "/auth/", int(flowLifetime.Seconds()))
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, conf.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
 }
 func (m *Manager) Callback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	state := r.URL.Query().Get("state")
-	cookie, err := r.Cookie(m.cookieName(flowCookie))
+	cookie, err := r.Cookie(m.cookieName(r, flowCookie))
 	if err != nil || state == "" || len(state) > 256 || len(cookie.Value) > 4096 {
 		failure(w, 400, "Invalid or expired sign-in")
 		return
@@ -215,7 +237,7 @@ func (m *Manager) Callback(w http.ResponseWriter, r *http.Request) {
 		failure(w, 400, "Invalid or expired sign-in")
 		return
 	}
-	payload, err := m.flowCipher.Open(nil, nil, sealed, []byte(m.cookieName(flowCookie)))
+	payload, err := m.flowCipher.Open(nil, nil, sealed, []byte(m.cookieName(r, flowCookie)))
 	if err != nil || json.Unmarshal(payload, &flow) != nil || !time.Now().Before(flow.Expires) || !auth.ConstantTimeEqual(state, flow.State) {
 		failure(w, 400, "Invalid or expired sign-in")
 		return
@@ -227,16 +249,20 @@ func (m *Manager) Callback(w http.ResponseWriter, r *http.Request) {
 		failure(w, 400, "Invalid or expired sign-in")
 		return
 	}
-	m.cookie(w, flowCookie, "", "/auth/", -1)
+	m.cookie(w, r, flowCookie, "", "/auth/", -1)
 	if r.URL.Query().Get("error") != "" || r.URL.Query().Get("code") == "" {
 		failure(w, 403, "Sign-in was cancelled or denied")
 		return
 	}
-	conf, verifier, err := m.provider(r.Context())
+	conf, verifier, redirect, err := m.requestOAuth(r)
 	if err != nil {
 		failure(w, 503, err.Error())
 		return
 	}
+	if flow.RedirectURL != "" {
+		redirect = flow.RedirectURL
+	}
+	conf.RedirectURL = redirect
 	token, err := conf.Exchange(oidc.ClientContext(r.Context(), m.client), r.URL.Query().Get("code"), oauth2.VerifierOption(flow.Verifier))
 	if err != nil {
 		failure(w, 401, "Sign-in failed")
@@ -288,18 +314,18 @@ func (m *Manager) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A new sign-in replaces the existing browser session rather than leaving it usable.
-	if previous, e := r.Cookie(m.cookieName(sessionCookie)); e == nil {
+	if previous, e := r.Cookie(m.cookieName(r, sessionCookie)); e == nil {
 		m.deleteSessionLocked(digest(previous.Value))
 	}
 	saved.ctx, saved.cancel = context.WithDeadline(context.Background(), saved.Expires)
 	m.sessions[digest(value)] = saved
 	m.mu.Unlock()
-	m.cookie(w, sessionCookie, value, "/", int(sessionLifetime.Seconds()))
+	m.cookie(w, r, sessionCookie, value, "/", int(sessionLifetime.Seconds()))
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, flow.ReturnTo, http.StatusSeeOther)
 }
 func (m *Manager) lookup(r *http.Request) (session, bool) {
-	c, err := r.Cookie(m.cookieName(sessionCookie))
+	c, err := r.Cookie(m.cookieName(r, sessionCookie))
 	if err != nil || c.Value == "" {
 		return session{}, false
 	}
@@ -324,11 +350,8 @@ func (m *Manager) allowedWrite(r *http.Request, s session) bool {
 	if !auth.ConstantTimeEqual(r.Header.Get("X-CSRF-Token"), s.CSRF) {
 		return false
 	}
-	if origin := r.Header.Get("Origin"); origin != "" {
-		u, _ := url.Parse(m.cfg.RedirectURL)
-		if origin != u.Scheme+"://"+u.Host {
-			return false
-		}
+	if origin := r.Header.Get("Origin"); origin != "" && origin != httpx.PublicOrigin(r) {
+		return false
 	}
 	return true
 }
@@ -362,12 +385,12 @@ func (m *Manager) Logout(w http.ResponseWriter, r *http.Request) {
 		failure(w, 403, "Invalid CSRF token or request origin")
 		return
 	}
-	if c, err := r.Cookie(m.cookieName(sessionCookie)); err == nil {
+	if c, err := r.Cookie(m.cookieName(r, sessionCookie)); err == nil {
 		m.mu.Lock()
 		m.deleteSessionLocked(digest(c.Value))
 		m.mu.Unlock()
 	}
-	m.cookie(w, sessionCookie, "", "/", -1)
+	m.cookie(w, r, sessionCookie, "", "/", -1)
 	reply(w, 200, map[string]bool{"success": true})
 }
 

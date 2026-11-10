@@ -48,7 +48,6 @@ func RedactServerSecretFields(server *contracts.Server) {
 		masked.ClientID = LiveRedaction.Leaf("client_id", masked.ClientID)
 		masked.ClientSecret = LiveRedaction.Leaf("client_secret", masked.ClientSecret)
 		masked.RedirectURI = LiveRedaction.URLValue(masked.RedirectURI)
-		masked.CallbackBaseURL = LiveRedaction.URLValue(masked.CallbackBaseURL)
 		masked.AuthorizationEndpoint = LiveRedaction.URLValue(masked.AuthorizationEndpoint)
 		masked.TokenEndpoint = LiveRedaction.URLValue(masked.TokenEndpoint)
 		masked.RegistrationEndpoint = LiveRedaction.URLValue(masked.RegistrationEndpoint)

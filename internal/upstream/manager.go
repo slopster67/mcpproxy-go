@@ -19,6 +19,7 @@ import (
 
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
+	"github.com/slopster67/mcpproxy-go/internal/httpx"
 	"github.com/slopster67/mcpproxy-go/internal/oauth"
 	"github.com/slopster67/mcpproxy-go/internal/peering"
 	"github.com/slopster67/mcpproxy-go/internal/secret"
@@ -1275,7 +1276,7 @@ func (m *Manager) StartManualOAuth(serverName string, force bool) error {
 // this returns browser status quickly but continues the OAuth callback handling in background.
 //
 // This is the recommended method for API endpoints that need to return browser_opened status.
-func (m *Manager) StartManualOAuthQuick(serverName string) (*core.OAuthStartResult, error) {
+func (m *Manager) StartManualOAuthQuick(parent context.Context, serverName string) (*core.OAuthStartResult, error) {
 	m.mu.RLock()
 	client, exists := m.clients[serverName]
 	m.mu.RUnlock()
@@ -1302,8 +1303,13 @@ func (m *Manager) StartManualOAuthQuick(serverName string) (*core.OAuthStartResu
 	coreClient.SetGate(client.Gate())
 	coreClient.SetCredentialBinding(client.CredentialBinding())
 
-	// Use a long-running context for the OAuth callback (30 minutes)
+	// Use a long-running context for the OAuth callback (30 minutes). The HTTP
+	// request is over as soon as the auth URL is returned, so only its origin
+	// is kept: that origin is the callback the provider must redirect to.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	if origin := httpx.PublicOriginFrom(parent); origin != "" {
+		ctx = httpx.WithPublicOrigin(ctx, origin)
+	}
 
 	// Clear OAuth state for fresh flow
 	coreClient.ClearOAuthState()

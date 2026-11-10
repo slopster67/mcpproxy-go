@@ -20,6 +20,7 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/contracts"
 	"github.com/slopster67/mcpproxy-go/internal/diagnostics"
 	"github.com/slopster67/mcpproxy-go/internal/health"
+	"github.com/slopster67/mcpproxy-go/internal/httpx"
 	"github.com/slopster67/mcpproxy-go/internal/index"
 	"github.com/slopster67/mcpproxy-go/internal/management"
 	"github.com/slopster67/mcpproxy-go/internal/oauth"
@@ -1252,15 +1253,18 @@ func (r *Runtime) TriggerOAuthLogin(serverName string) error {
 // TriggerOAuthLoginQuick implements RuntimeOperations interface for management service.
 // Returns OAuthStartResult with actual browser status, auth URL, and any errors.
 // This is the synchronous version that provides immediate feedback about browser opening.
-func (r *Runtime) TriggerOAuthLoginQuick(serverName string) (*core.OAuthStartResult, error) {
+func (r *Runtime) TriggerOAuthLoginQuick(ctx context.Context, serverName string) (*core.OAuthStartResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := r.oauthAllowed(serverName); err != nil {
 		return nil, err
 	}
 	if host := r.ServerHost(serverName); host != "" {
 		var result core.OAuthStartResult
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		callCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err := r.peers.Call(ctx, host, "oauth/login", serverName, nil, &result)
+		err := r.peers.Call(callCtx, host, "oauth/login", serverName, map[string]string{"origin": httpx.PublicOriginFrom(ctx)}, &result)
 		if err == nil && result.AuthURL != "" {
 			err = r.registerPeerOAuthCallback(serverName, host, result.AuthURL)
 		}
@@ -1284,7 +1288,7 @@ func (r *Runtime) TriggerOAuthLoginQuick(serverName string) (*core.OAuthStartRes
 	}
 
 	// StartManualOAuthQuick returns immediately with browser status
-	result, err := r.upstreamManager.StartManualOAuthQuick(serverName)
+	result, err := r.upstreamManager.StartManualOAuthQuick(ctx, serverName)
 	if err != nil {
 		return result, fmt.Errorf("failed to start OAuth flow: %w", err)
 	}

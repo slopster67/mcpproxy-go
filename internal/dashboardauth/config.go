@@ -12,7 +12,6 @@ type Config struct {
 	Issuer       string `env:"MCPPROXY_OIDC_ISSUER" file:"true"`
 	ClientID     string `env:"MCPPROXY_OIDC_CLIENT_ID" file:"true"`
 	ClientSecret string `env:"MCPPROXY_OIDC_CLIENT_SECRET" file:"true"`
-	RedirectURL  string `env:"MCPPROXY_OIDC_REDIRECT_URL" file:"true"`
 }
 
 func (c *Config) Validate() error {
@@ -22,14 +21,9 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.ClientID) == "" {
 		return fmt.Errorf("MCPPROXY_OIDC_CLIENT_ID is required")
 	}
-	for field, raw := range map[string]string{"MCPPROXY_OIDC_ISSUER": c.Issuer, "MCPPROXY_OIDC_REDIRECT_URL": c.RedirectURL} {
-		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1"))) {
-			return fmt.Errorf("%s must be an HTTPS URL (HTTP is allowed on loopback)", field)
-		}
-		if field == "MCPPROXY_OIDC_REDIRECT_URL" && u.Path != "/auth/callback" {
-			return fmt.Errorf("MCPPROXY_OIDC_REDIRECT_URL must end with /auth/callback")
-		}
+	u, err := url.Parse(c.Issuer)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1"))) {
+		return fmt.Errorf("MCPPROXY_OIDC_ISSUER must be an HTTPS URL (HTTP is allowed on loopback)")
 	}
 	return nil
 }
