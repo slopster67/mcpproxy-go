@@ -1,0 +1,136 @@
+package storage
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/slopster67/mcpproxy-go/internal/database"
+)
+
+// Persistence for the actor-owned usage aggregate.
+//
+// The aggregate itself lives in the runtime layer (it folds in domain events);
+// storage only provides byte-blob persistence under a fixed key plus
+// a single full-scan helper used to rebuild the aggregate on a cold start with
+// no persisted snapshot. Keeping these byte-oriented avoids a storage->runtime
+// import cycle: the runtime owns encoding/decoding of the snapshot shape.
+
+const (
+	// ActivityStatsBucket holds derived activity statistics (usage aggregate
+	// snapshot). Separate from the raw ActivityRecordsBucket.
+	ActivityStatsBucket = "activity_stats"
+
+	// UsageSnapshotKey is the key of the persisted usage aggregate.
+	UsageSnapshotKey = "usage_aggregate"
+)
+
+// SaveUsageSnapshot persists the encoded usage aggregate under
+// UsageSnapshotKey, overwriting any previous snapshot.
+func (m *Manager) SaveUsageSnapshot(data []byte) error {
+	return m.db.db.Update(func(tx *database.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte(ActivityStatsBucket))
+		if err != nil {
+			return fmt.Errorf("create activity_stats bucket: %w", err)
+		}
+		// Copy: database requires the value to remain valid for the put only;
+		// callers may reuse their buffer afterwards.
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		return bucket.Put([]byte(UsageSnapshotKey), buf)
+	})
+}
+
+// LoadUsageSnapshot returns the persisted usage aggregate bytes, or (nil, nil)
+// when no snapshot has been written yet (cold start). The returned slice is a
+// copy safe to use outside the transaction.
+func (m *Manager) LoadUsageSnapshot() ([]byte, error) {
+	var out []byte
+	err := m.db.db.View(func(tx *database.Tx) error {
+		bucket := tx.Bucket([]byte(ActivityStatsBucket))
+		if bucket == nil {
+			return nil
+		}
+		v := bucket.Get([]byte(UsageSnapshotKey))
+		if v == nil {
+			return nil
+		}
+		out = make([]byte, len(v))
+		copy(out, v)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ScanAllActivities performs a single pass over every activity record and calls
+// visit for each. Used to rebuild the usage aggregate on a cold start (reuses
+// the same cursor pattern as AggregateToolUsage). An empty/absent bucket yields
+// zero visits and no error. Filtering by record type is the caller's job.
+func (m *Manager) ScanAllActivities(visit func(*ActivityRecord)) error {
+	return m.db.db.View(func(tx *database.Tx) error {
+		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
+		if bucket == nil {
+			return nil
+		}
+		cursor := bucket.Cursor()
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			var record ActivityRecord
+			if err := record.UnmarshalBinary(v); err != nil {
+				m.logger.Warnw("Failed to unmarshal activity record during usage rebuild",
+					"key", string(k), "error", err)
+				continue
+			}
+			visit(&record)
+		}
+		return nil
+	})
+}
+
+// ScanActivitiesAfter visits every activity record STRICTLY newer than `since`,
+// oldest first. It is the catch-up replay behind a persisted usage snapshot: a
+// snapshot is flushed every 30s, so an unclean shutdown leaves a tail of
+// records that were saved but never folded in.
+//
+// The bound is real work avoided, not a convenience: activity keys are
+// "<20-digit unix nanos>_<id>", so seeking to the nanosecond after `since`
+// skips the entire history in one cursor move instead of unmarshalling it.
+//
+// Strictly-greater is what makes the replay safe to run every start: records
+// are persisted BEFORE they are folded into the aggregate, so anything at or
+// before the snapshot's stamp is already counted and re-applying it would
+// double it.
+//
+// A zero `since` is rejected rather than treated as "everything": the caller
+// that cannot date its snapshot must rebuild from a full scan, not replay a
+// history it may already contain.
+func (m *Manager) ScanActivitiesAfter(since time.Time, visit func(*ActivityRecord)) error {
+	if since.IsZero() {
+		return fmt.Errorf("ScanActivitiesAfter requires a non-zero lower bound")
+	}
+	seek := []byte(fmt.Sprintf("%020d_", since.UnixNano()+1))
+
+	return m.db.db.View(func(tx *database.Tx) error {
+		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
+		if bucket == nil {
+			return nil
+		}
+		cursor := bucket.Cursor()
+		for k, v := cursor.Seek(seek); k != nil; k, v = cursor.Next() {
+			var record ActivityRecord
+			if err := record.UnmarshalBinary(v); err != nil {
+				m.logger.Warnw("Failed to unmarshal activity record during usage catch-up",
+					"key", string(k), "error", err)
+				continue
+			}
+			// Belt and braces: the key encodes record.Timestamp, but a record
+			// written with a mismatched key must never be applied twice.
+			if !record.Timestamp.After(since) {
+				continue
+			}
+			visit(&record)
+		}
+		return nil
+	})
+}

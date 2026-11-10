@@ -1,0 +1,631 @@
+---
+title: "Code Execution Overview"
+sidebar_label: "Overview"
+description: "How the sandboxed JavaScript/TypeScript runtime orchestrates multiple upstream MCP tools in one request."
+---
+
+# Code Execution - Overview
+
+## What is Code Execution?
+
+The `code_execution` tool enables LLM agents to orchestrate multiple upstream MCP tools in a single request using JavaScript or TypeScript. Instead of making multiple round-trips to the model, you can execute complex multi-step workflows with conditional logic, loops, and data transformations—all within a single execution context.
+
+**TypeScript support**: Set `language: "typescript"` to write code with type annotations, interfaces, enums, and generics. Types are automatically stripped before execution with near-zero overhead (<5ms).
+
+**Stored scripts**: Instead of sending the source inline on every call, keep the workflow in `<data-dir>/scripts/<name>.js` and invoke it with `script: "<name>"`. See [Stored Scripts](#stored-scripts).
+
+## When to Use Code Execution
+
+✅ **Use code_execution when:**
+- You need to call 2+ tools and combine their results
+- You need conditional logic based on tool responses
+- You need to transform or aggregate data from multiple sources
+- You need to iterate over data and call tools for each item
+- You need to handle errors gracefully with fallbacks
+
+❌ **Don't use code_execution when:**
+- You're calling a single tool (use `call_tool` directly)
+- The workflow is simple and linear (use sequential tool calls)
+- You need long-running operations (>2 minutes)
+- You need access to filesystem, network, or Node.js modules
+
+## Key Benefits
+
+### 1. Reduced Latency
+Execute multiple tool calls in a single request, eliminating the network round-trips between agent and model.
+
+**Before (3 round-trips):**
+```
+Agent → Model: "Get user data"
+Model → Agent: call_tool(github, get_user, {username: "octocat"})
+Agent → Model: "Here's the user data"
+Model → Agent: call_tool(github, list_repos, {user: "octocat"})
+Agent → Model: "Here are the repos"
+Model → Agent: call_tool(github, get_repo, {repo: "Hello-World"})
+```
+
+**After (1 round-trip):**
+```
+Agent → Model: "Get user and their repos"
+Model → Agent: code_execution({code: "...", input: {...}})
+```
+
+### 2. Complex Logic
+Implement conditional branching, loops, and error handling that would require multiple model invocations.
+
+```javascript
+// Wrap the body in an IIFE so early-exit `return`s are legal — a bare
+// top-level `return` is a SyntaxError. The IIFE's value is the result.
+(() => {
+  // Conditional logic
+  const user = call_tool('github', 'get_user', {username: input.username});
+  if (!user.ok) {
+    return {error: 'User not found'};
+  }
+
+  // Loop with accumulation
+  const results = [];
+  for (const repoName of input.repos) {
+    const repo = call_tool('github', 'get_repo', {name: repoName});
+    if (repo.ok) {
+      results.push(repo.result);
+    }
+  }
+  return {repos: results, count: results.length};
+})();
+```
+
+### 3. Data Transformation
+Transform, filter, and aggregate data from multiple tool calls before returning results.
+
+```javascript
+(() => {
+  const repos = call_tool('github', 'list_repos', {user: input.username});
+  if (!repos.ok) return repos;
+
+  // Filter and transform
+  const activeRepos = repos.result
+    .filter(r => !r.archived && r.pushed_at > input.since)
+    .map(r => ({name: r.name, stars: r.stargazers_count, language: r.language}));
+
+  return {repos: activeRepos, total: activeRepos.length};
+})();
+```
+
+## How It Works
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│  LLM Agent                                   │
+│  - Receives code_execution tool description │
+│  - Writes JavaScript to orchestrate tools   │
+└────────────┬────────────────────────────────┘
+             │
+             │ code_execution request
+             │ {code, input, options}
+             ▼
+┌─────────────────────────────────────────────┐
+│  MCPProxy Server                             │
+│  - Validates request and options            │
+│  - Checks if feature is enabled             │
+└────────────┬────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────┐
+│  JavaScript Runtime Pool                     │
+│  - Acquires VM from pool (blocks if full)   │
+│  - Creates isolated sandbox                 │
+│  - Binds input, call_tool(), call_tools()   │
+└────────────┬────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────┐
+│  JavaScript Execution                        │
+│  - Runs code with timeout watchdog          │
+│  - Enforces max_tool_calls limit            │
+│  - Restricts to allowed_servers             │
+│  - Returns JSON-serializable result         │
+└────────────┬────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────┐
+│  Upstream Tool Calls                         │
+│  - Forwards call_tool() to upstream servers │
+│  - Respects quarantine and security rules   │
+│  - Returns {ok, result} or {ok, error}      │
+└─────────────────────────────────────────────┘
+```
+
+### Execution Flow
+
+1. **Request Parsing**: Extract `code` (or `script`), `input`, and `options` from the request
+2. **Source Resolution**: Enforce exactly-one-of `code` / `script`; for a `script`, read the stored file and derive its language (see [Stored Scripts](#stored-scripts))
+3. **Validation**: Verify timeout (1-600000ms) and max_tool_calls (>= 0)
+4. **Pool Acquisition**: Acquire a JavaScript VM from the pool (blocks if all VMs are in use)
+5. **Sandbox Setup**: Create isolated environment with `input` global and the `call_tool()` / `call_tools()` functions
+6. **Execution**: Run JavaScript with timeout enforcement and tool call tracking
+7. **Result Extraction**: Validate result is JSON-serializable and return structured response
+8. **Pool Release**: Return VM to pool for reuse
+9. **Response**: Return `{ok: true, value: <result>}` or `{ok: false, error: {...}}`
+
+## Security Model
+
+### Sandbox Restrictions
+
+The JavaScript execution environment is **heavily sandboxed** to prevent security issues:
+
+❌ **Not Available:**
+- `require()` - No module loading
+- `setTimeout()` / `setInterval()` - No timers
+- Filesystem access - No `fs` module
+- Network access - No `http` or `fetch`
+- Environment variables - No `process.env`
+- Node.js built-ins - JavaScript standard library only
+
+✅ **Available:**
+- `input` - Global variable with request input data
+- `call_tool(serverName, toolName, args)` - Function to call upstream MCP tools
+- `call_tools(requests, options)` - Function to call independent upstream tools in parallel (see [Pattern 5](#pattern-5-parallel-fan-out-with-call_tools))
+- Modern JavaScript (ES2020+) standard library including Array, Object, String, Math, Date, JSON, Map, Set, Symbol, Promise, Proxy, Reflect
+
+### Configuration & Limits
+
+```json
+{
+  "code_execution_timeout_ms": 120000,      // Default: 2 minutes, max: 10 minutes
+  "code_execution_max_tool_calls": 0,       // Default: unlimited
+  "code_execution_pool_size": 10,           // Default: 10 concurrent VMs
+  "code_execution_max_parallel": 8          // Default: 8 concurrent calls per call_tools() batch (1-32)
+}
+```
+
+`code_execution_max_parallel` is hot-reloaded and applies to executions that start after the change. It is not a request-level option: a script overrides it per batch with `call_tools(requests, {max_parallel})`, so precedence is per-batch override > `code_execution_max_parallel` > built-in 8.
+
+**Per-Request Overrides:**
+```javascript
+{
+  "code": "...",
+  "input": {...},
+  "options": {
+    "timeout_ms": 60000,              // Override timeout for this request
+    "max_tool_calls": 20,             // Limit tool calls for this request
+    "allowed_servers": ["github"]     // Restrict to specific servers
+  }
+}
+```
+
+### Quarantine Integration
+
+Code execution **respects existing MCPProxy security features**:
+- Quarantined servers cannot be called via `call_tool()`
+- Server enable/disable settings are enforced
+- Authentication requirements are preserved
+
+## Getting Started
+
+### 1. Enable the Feature
+
+Enable **Allow code execution** for the client on **Clients**. Configure upstream
+servers through the dashboard, and review their tools before calling them.
+Deployment limits use `MCPPROXY_CODE_EXECUTION_*` environment settings and require
+a restart when changed. See [Settings](../../SETTINGS.md).
+
+### 4. Use from LLM Agent
+
+The `code_execution` tool will appear in the tools list when an LLM agent connects to MCPProxy:
+
+```json
+{
+  "name": "code_execution",
+  "description": "Execute JavaScript or TypeScript code that orchestrates multiple upstream MCP tools...",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "code": {"type": "string", "description": "JavaScript or TypeScript source code..."},
+      "script": {"type": "string", "description": "Name of a STORED script to execute instead of sending code inline..."},
+      "language": {"type": "string", "enum": ["javascript", "typescript"], "description": "Source language; defaults to javascript. TypeScript types are stripped before execution (GA, Spec 033 FR-001)."},
+      "input": {"type": "object", "description": "Input data accessible as global input variable..."},
+      "options": {"type": "object", "description": "Execution options..."}
+    }
+  }
+}
+```
+
+Neither `code` nor `script` is schema-`required`: JSON Schema cannot express
+"exactly one of", so the tool enforces it and rejects a call that supplies both
+or neither.
+
+## Stored Scripts
+
+Sending a long workflow inline costs its full token count on every run, retry,
+and parameter tweak. A **stored script** is that workflow kept on the server —
+a `<name>.js` / `<name>.ts` file in the `scripts/` directory inside the data
+directory — invoked by name:
+
+```json
+{
+  "name": "code_execution",
+  "arguments": {
+    "script": "fetch-prs",
+    "input": {"owner": "acme", "repo": "api"}
+  }
+}
+```
+
+Everything else is identical to an inline call: same sandbox, same
+`allowed_servers` / `max_tool_calls` / `timeout_ms` handling, same quarantine and
+permission enforcement, same activity and history records (which store the
+executed source exactly as they do for inline code, plus the script name).
+`script` changes only where the source text comes from.
+
+### 1. Author a script
+
+```bash
+mkdir -p "$MCPPROXY_DATA_DIR/scripts"
+cat > "$MCPPROXY_DATA_DIR/scripts/fetch-prs.js <<'JS'
+var rs = call_tools([1, 2, 3].map(function (n) {
+  return {server: "github", tool: "get_pull_request",
+          args: {owner: input.owner, repo: input.repo, pullNumber: n}};
+}));
+({titles: rs.map(function (r) { return r.ok ? JSON.parse(r.result.content[0].text).title : "ERR"; })});
+JS
+```
+
+Stored scripts live in `<data-dir>/scripts`, where `MCPPROXY_DATA_DIR` selects
+the primary data directory. An absent directory means no stored scripts.
+
+### 2. Run it
+
+
+`script` is mutually exclusive with `code`.
+
+### Naming and file rules
+
+| Rule | Value |
+|------|-------|
+| Name | 1-64 characters of `A-Za-z0-9_-`, case-sensitive |
+| Path | never — a name with a separator, `..`, or a dot is rejected before any filesystem access |
+| Extension | lowercase `.js` or `.ts` only (`.JS`, `.mjs`, `.jsx` are not scripts) |
+| Language | derived from the extension; an explicit `language` that contradicts it is an error |
+| Size | 1 byte to 256 KB — empty and oversized files are rejected |
+| File type | regular files only; a symlink at the script path is rejected |
+| Ambiguity | `name.js` **and** `name.ts` both present → the call fails |
+
+Files that break the name or extension rules are unreachable by invocation — they are not scripts.
+
+> **Confinement**: the name is validated *before* the filesystem is touched, so
+> a valid name cannot traverse out of the scripts directory by construction. On
+> top of that, the file is opened with symlink-following disabled (atomically on
+> Unix via `O_NOFOLLOW`; a checked policy on Windows, where creating symlinks
+> requires elevation). The scripts directory itself may be a symlink — it is
+> operator-controlled.
+
+### Editing without a restart
+
+Each invocation performs exactly one open and one bounded read; there is no
+cache and no file watcher, so there is nothing to invalidate. Edit by **atomic
+replace** — write a temporary file and `rename` it over the script — and the
+next invocation runs the new content:
+
+```bash
+tmp=$(mktemp "$MCPPROXY_DATA_DIR/scripts/.fetch-prs.XXXXXX")
+cat > "$tmp" <<'JS'
+({updated: true});
+JS
+mv "$tmp" "$MCPPROXY_DATA_DIR/scripts/fetch-prs.js"   # atomic within the same filesystem
+```
+
+Adding or deleting a file is reflected on the next invocation. A script added
+or renamed within the last couple of seconds may be refused until the directory
+index has refreshed and settled; retry the call.
+Editing a script **in place** while it is being invoked is the one unsupported
+case: the run gets whatever the read returned (validated, but unspecified).
+
+### Discovering script names
+
+There is no listing. An MCP client must already know the script name, so give it
+the names in its custom instructions. The not-found error names neither the
+other stored scripts, nor how many there are, nor the directory, and it is
+identical whether the directory is empty or full, so a failed call cannot be used
+to probe what is stored. The proxy does not list the directory on a caller's
+behalf: it checks only the requested name's two candidate files against an
+exact-name index that fails closed — a hit is accepted only while the index
+matches the directory's current, settled state, and every step of the check is
+bound to the same retained directory descriptor, so a symlink or bind mount
+retargeted mid-request cannot make different steps see different directories.
+The other refusals follow the same rule: an ambiguous, empty, oversized or
+unreadable script is reported by name and reason only — no host path, no raw OS
+error.
+
+Stored scripts are operator-published content: any client allowed to run
+`code_execution` can run a script it knows the name of and receive whatever the
+script returns without an upstream call, while every `call_tool()` the script
+makes is still checked against the caller's server scope and permission tier.
+Do not put server names, credentials or other secrets in a script's source or
+its constant return values.
+
+### No write path
+
+Nothing in mcpproxy creates, edits, or deletes a stored script. The filesystem is the sole authoring interface, so
+sandboxed code that can *run* a stored workflow can never author one.
+
+## Common Patterns
+
+### Pattern 1: Sequential Tool Calls
+
+```javascript
+// Wrap the body in an IIFE so early-exit `return`s are legal — a bare
+// top-level `return` is a SyntaxError. The IIFE's value is the result.
+(() => {
+  // Fetch user, then fetch their repos
+  const userRes = call_tool('github', 'get_user', {username: input.username});
+  if (!userRes.ok) {
+    return {error: userRes.error.message};
+  }
+
+  const reposRes = call_tool('github', 'list_repos', {user: input.username});
+  if (!reposRes.ok) {
+    return {error: reposRes.error.message};
+  }
+
+  return {
+    user: userRes.result,
+    repos: reposRes.result,
+    repo_count: reposRes.result.length
+  };
+})();
+```
+
+### Pattern 2: Conditional Logic
+
+```javascript
+(() => {
+  // Try primary server, fallback to secondary
+  let result = call_tool('primary-db', 'query', {sql: input.query});
+
+  if (!result.ok) {
+    // Primary failed, try backup
+    result = call_tool('backup-db', 'query', {sql: input.query});
+  }
+
+  return result.ok ? result.result : {error: 'Both databases unavailable'};
+})();
+```
+
+### Pattern 3: Loop with Aggregation
+
+```javascript
+(() => {
+  // Fetch details for multiple items
+  const results = [];
+  const errors = [];
+
+  for (const id of input.ids) {
+    const res = call_tool('api-server', 'get_item', {id});
+
+    if (res.ok) {
+      results.push(res.result);
+    } else {
+      errors.push({id, error: res.error});
+    }
+  }
+
+  return {
+    success: results,
+    failed: errors,
+    success_count: results.length,
+    error_count: errors.length
+  };
+})();
+```
+
+### Pattern 4: Data Transformation
+
+```javascript
+(() => {
+  // Get repos and compute statistics
+  const reposRes = call_tool('github', 'list_repos', {user: input.username});
+  if (!reposRes.ok) return reposRes;
+
+  const repos = reposRes.result;
+  const totalStars = repos.reduce((sum, r) => sum + (r.stargazers_count ?? 0), 0);
+  const languages = {};
+
+  for (const repo of repos) {
+    const lang = repo.language ?? 'Unknown';
+    languages[lang] = (languages[lang] ?? 0) + 1;
+  }
+
+  return {
+    total_repos: repos.length,
+    total_stars: totalStars,
+    avg_stars: Math.round(totalStars / repos.length),
+    languages
+  };
+})();
+```
+
+### Pattern 5: Parallel Fan-out with call_tools
+
+```javascript
+// Independent calls — no element depends on another's result
+var prs = call_tools(
+  [1, 2, 3, 4, 5].map(function (n) {
+    return {server: 'github', tool: 'get_pull_request',
+            args: {owner: 'acme', repo: 'api', pullNumber: n}};
+  }),
+  {max_parallel: 5}
+);
+
+var titles = prs.map(function (r) {
+  if (!r.ok) { return 'ERR: ' + r.error.code; }
+  return JSON.parse(r.result.content[0].text).title;
+});
+({titles: titles});
+```
+
+`call_tools(requests, options)` dispatches up to `max_parallel` elements at a
+time and returns one slot per request, in input order — so the batch takes about
+as long as its slowest element instead of the sum of all of them. Rules:
+
+- `requests`: array of `{server, tool, args?}`, at most 100 elements; `args`
+  defaults to `{}`.
+- `options.max_parallel`: integer 1-32. Defaults to `code_execution_max_parallel`
+  (8). Unknown option keys are ignored.
+- Each slot is the same envelope `call_tool()` returns, so a failing element
+  never poisons its siblings.
+- Malformed arguments (not an array, bad element shape, sparse hole, bad
+  `max_parallel`, more than 100 elements) return a **single**
+  `{ok: false, error: {code: "INVALID_ARGS", ...}}` envelope naming the first
+  offending index, and nothing is dispatched.
+- Every element costs one unit of `max_tool_calls`, checked in input order, and
+  the whole batch runs inside the execution timeout.
+- Use it only for **independent** calls — chained steps still belong in a
+  sequential pipeline (Pattern 1).
+
+## Error Handling
+
+### JavaScript Errors
+
+```javascript
+// Syntax error - caught before execution
+code_execution({code: "invalid javascript {"})
+// Returns: {ok: false, error: {code: "SYNTAX_ERROR", message: "...", stack: "..."}}
+
+// Runtime error - caught during execution
+code_execution({code: "throw new Error('Something went wrong')"})
+// Returns: {ok: false, error: {code: "RUNTIME_ERROR", message: "Something went wrong", stack: "..."}}
+```
+
+### Tool Call Errors
+
+```javascript
+(() => {
+  // Tool returns error - handled in JavaScript
+  var res = call_tool('github', 'get_user', {username: 'nonexistent-user-12345'});
+  if (!res.ok) {
+    return {error: 'User not found: ' + res.error.message};
+  }
+  return res.result;
+})();
+```
+
+### Timeout Errors
+
+```javascript
+// Execution exceeds timeout (default: 2 minutes)
+code_execution({
+  code: "while(true) {}",  // Infinite loop
+  options: {timeout_ms: 1000}
+})
+// Returns: {ok: false, error: {code: "TIMEOUT", message: "JavaScript execution timed out"}}
+```
+
+### Max Tool Calls Exceeded
+
+```javascript
+// Exceeds max_tool_calls limit
+code_execution({
+  code: "for (var i = 0; i < 100; i++) { call_tool('api', 'ping', {}); }",
+  options: {max_tool_calls: 10}
+})
+// Returns: {ok: false, error: {code: "MAX_TOOL_CALLS_EXCEEDED", message: "..."}}
+```
+
+## TypeScript Support
+
+You can write code execution scripts in TypeScript by setting the `language` parameter to `"typescript"`. TypeScript types are automatically stripped before execution using esbuild, with near-zero transpilation overhead.
+
+### Supported TypeScript Features
+
+- Type annotations: `const x: number = 42`
+- Interfaces: `interface User { name: string; age: number; }`
+- Type aliases: `type StringOrNumber = string | number`
+- Generics: `function identity<T>(arg: T): T { return arg; }`
+- Enums: `enum Direction { Up = "UP", Down = "DOWN" }`
+- Namespaces: `namespace MyLib { export const value = 42; }`
+- Type assertions: `const x = value as string`
+
+### TypeScript via MCP Tool
+
+```json
+{
+  "name": "code_execution",
+  "arguments": {
+    "code": "interface User { name: string; }\nconst user: User = { name: input.username };\n({ greeting: 'Hello ' + user.name })",
+    "language": "typescript",
+    "input": {"username": "Alice"}
+  }
+}
+```
+
+### Important Notes
+
+- TypeScript support uses type-stripping only (no type checking or semantic validation)
+- Valid JavaScript is also valid TypeScript, so you can always use `language: "typescript"` even for plain JS
+- The transpiled output runs in the same ES2020+ goja sandbox with all existing capabilities
+- Transpilation errors return the `TRANSPILE_ERROR` error code with line/column information
+
+## Best Practices
+
+### 1. Keep Code Simple
+- Use modern JavaScript syntax (arrow functions, const/let, template literals, destructuring are all supported)
+- Avoid deeply nested logic
+- Prefer explicit error handling over implicit failures
+
+### 2. Handle Errors Gracefully
+```javascript
+// Bad: Assumes success (and a bare top-level `return` is itself a SyntaxError)
+(() => {
+  var user = call_tool('github', 'get_user', {username: input.username});
+  return user.result.name;  // Crashes if user.ok is false
+})();
+
+// Good: Checks response, early-exit returns kept legal inside the IIFE
+(() => {
+  var user = call_tool('github', 'get_user', {username: input.username});
+  if (!user.ok) {
+    return {error: user.error.message};
+  }
+  return {name: user.result.name};
+})();
+```
+
+### 3. Set Appropriate Timeouts
+```javascript
+// Quick operations: 30 seconds
+{options: {timeout_ms: 30000}}
+
+// Multiple tool calls: 2 minutes (default)
+{options: {timeout_ms: 120000}}
+
+// Heavy processing: 5 minutes
+{options: {timeout_ms: 300000}}
+```
+
+### 4. Limit Tool Calls
+```javascript
+// Protect against runaway loops
+{
+  code: "for (var i = 0; i < input.items.length; i++) { ... }",
+  options: {max_tool_calls: 100}
+}
+```
+
+### 5. Use Allowed Servers
+```javascript
+// Restrict to specific servers for sensitive operations
+{
+  code: "call_tool('production-db', 'delete', {id: input.id})",
+  options: {allowed_servers: ["production-db"]}
+}
+```
+
+## Next Steps
+
+- **Cookbook**: See [cookbook.md](cookbook.md) for 10 TypeScript orchestration recipes (batch, fan-out, retry, pagination, rate-limit) with token/latency benchmarks
+- **Examples**: See [examples.md](examples.md) for 10+ working code samples
+- **API Reference**: See [api-reference.md](api-reference.md) for complete schema documentation
+- **Troubleshooting**: See [troubleshooting.md](troubleshooting.md) for common issues and solutions

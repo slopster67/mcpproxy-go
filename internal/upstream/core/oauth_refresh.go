@@ -1,0 +1,232 @@
+package core
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/mark3labs/mcp-go/v2/client"
+	"github.com/mark3labs/mcp-go/v2/client/transport"
+	"go.uber.org/zap"
+
+	"github.com/slopster67/mcpproxy-go/internal/oauth"
+	"github.com/slopster67/mcpproxy-go/internal/storage"
+	"github.com/slopster67/mcpproxy-go/internal/upstream/dialgate"
+)
+
+// OAuth refresh serialization. The reactive path (the token
+// store mcp-go reads before every request) and the proactive path
+// (RefreshOAuthTokenDirect) both run their refreshes as flights of
+// oauth.DefaultRefreshCoordinator, with the same refresh function.
+
+// isStaticOAuthClient reports whether the client id comes from oauth.client_id.
+func (c *Client) isStaticOAuthClient() bool {
+	return c.config != nil && c.config.OAuth != nil && c.config.OAuth.ClientID != ""
+}
+
+// staticClientSecret is oauth.client_secret (redacted from refresh errors).
+func (c *Client) staticClientSecret() string {
+	if c.config == nil || c.config.OAuth == nil {
+		return ""
+	}
+	return c.config.OAuth.ClientSecret
+}
+
+// extraParamsClientID reports whether oauth.extra_params carries a client_id
+// (injected into every token request by oauth.OAuthTransportWrapper).
+func (c *Client) extraParamsClientID() bool {
+	return c.extraParamValue("client_id") != ""
+}
+
+// extraParamValue returns oauth.extra_params[key] (case-insensitive key).
+// OAuthTransportWrapper injects extra params into every token request, so a
+// client_secret given there is a sent credential too.
+func (c *Client) extraParamValue(key string) string {
+	if c.config == nil || c.config.OAuth == nil {
+		return ""
+	}
+	for k, v := range c.config.OAuth.ExtraParams {
+		if strings.EqualFold(k, key) {
+			return v
+		}
+	}
+	return ""
+}
+
+// oauthRefreshFunc returns the one refresh function both triggers use:
+// mcp-go's handler.RefreshToken when the live handler has a client id (static
+// clients, and DCR clients whose stored registration matches or is unknown),
+// otherwise the stored DCR credentials. A refresh is never sent with an empty
+// client_id.
+func (c *Client) oauthRefreshFunc(handler *transport.OAuthHandler) oauth.RefreshFunc {
+	return func(ctx context.Context, rec *storage.OAuthTokenRecord) (*client.Token, error) {
+		// Early exit for a retired instance. The token request itself runs on the instance's gated transport, which
+		// refuses it too.
+		if c.Gate().Retired() {
+			return nil, dialgate.ErrRetired
+		}
+		handlerClientID := handler.GetClientID()
+		switch {
+		case handlerClientID != "" && (c.isStaticOAuthClient() || rec.ClientID == "" || rec.ClientID == handlerClientID),
+			handlerClientID == "" && rec.ClientID == "" && c.extraParamsClientID():
+			// The second case: a client id configured only through
+			// oauth.extra_params is injected into the token request by
+			// oauth.OAuthTransportWrapper, so the request is not sent with
+			// an empty client_id.
+			// Persists through the handler's token store, whose SaveToken
+			// compare-and-swaps against the flight generation in ctx.
+			tok, err := handler.RefreshToken(ctx, rec.RefreshToken)
+			// mcp-go embeds the provider's error_description or raw body
+			// in the error text; scrub it before it reaches logs/events.
+			return tok, oauth.ScrubRefreshError(err, rec.RefreshToken, rec.ClientSecret, handler.GetClientSecret(),
+				c.staticClientSecret(), c.extraParamValue("client_secret"))
+		case rec.ClientID != "" && c.storage != nil:
+			return c.refreshWithStoredCredentials(ctx, handler, rec)
+		default:
+			return nil, oauth.ErrNoClientCredentials
+		}
+	}
+}
+
+// refreshWithStoredCredentials refreshes with the DCR client stored on the
+// record and persists the result through one read-modify-write transaction
+// that only applies while the stored grant is still the flight's generation
+// It never writes back a record read before the network call.
+func (c *Client) refreshWithStoredCredentials(ctx context.Context, handler *transport.OAuthHandler, rec *storage.OAuthTokenRecord) (*client.Token, error) {
+	c.logger.Info("Using stored DCR credentials for token refresh",
+		zap.String("server", c.config.Name),
+		zap.String("client_id", rec.ClientID[:min(8, len(rec.ClientID))]+"..."))
+
+	metadata, err := handler.GetServerMetadata(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get server metadata for %s: %w", c.config.Name, err)
+	}
+	if metadata.TokenEndpoint == "" {
+		return nil, fmt.Errorf("token endpoint not found in server metadata for %s", c.config.Name)
+	}
+
+	newToken, err := c.refreshTokenWithStoredCredentials(ctx, metadata.TokenEndpoint, rec)
+	if err != nil {
+		return nil, err
+	}
+
+	serverKey := oauth.GenerateServerKey(c.config.Name, c.config.URL)
+	gen, inFlight := oauth.FlightGeneration(ctx)
+	discarded := false
+	// Bound to the instance's credential binding, so a refresh of an
+	// instance a commit superseded persists nothing.
+	binding := c.CredentialBinding()
+	var savedRec *storage.OAuthTokenRecord
+	written, err := c.storage.UpdateOAuthTokenIfBound(serverKey, c.config.Name, binding, func(cur *storage.OAuthTokenRecord) error {
+		savedRec = cur
+		if inFlight && !oauth.GenerationMatches(cur, gen) {
+			discarded = true
+			return storage.ErrSkipOAuthTokenUpdate
+		}
+		cur.AccessToken = newToken.AccessToken
+		if newToken.RefreshToken != "" {
+			cur.RefreshToken = newToken.RefreshToken
+		}
+		if newToken.TokenType != "" {
+			cur.TokenType = newToken.TokenType
+		}
+		cur.ExpiresAt = newToken.ExpiresAt
+		if cur.DisplayName == "" {
+			cur.DisplayName = c.config.Name
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to save refreshed token for %s: %w", c.config.Name, err)
+	}
+
+	refreshToken := newToken.RefreshToken
+	if refreshToken == "" {
+		refreshToken = rec.RefreshToken
+	}
+	tok := &client.Token{
+		AccessToken:  newToken.AccessToken,
+		RefreshToken: refreshToken,
+		TokenType:    newToken.TokenType,
+		ExpiresAt:    newToken.ExpiresAt,
+	}
+	if discarded {
+		c.logger.Info("Discarded a refresh result superseded by a newer grant",
+			zap.String("server", c.config.Name))
+		return tok, nil
+	}
+	if !written {
+		c.logger.Info("Discarded a refreshed OAuth token for a server instance that was removed, replaced or reconfigured",
+			zap.String("server", c.config.Name),
+			zap.String("binding", binding.String()))
+		return nil, fmt.Errorf("failed to save refreshed token for %s: %w", c.config.Name, oauth.ErrCredentialBindingStale)
+	}
+
+	// Report the revision this persist wrote (the record
+	// passed to mutate carries it once written), so the flight serves this
+	// record and a later same-access-token rewrite is not adopted.
+	if savedRec != nil {
+		oauth.NoteFlightSavedRevision(ctx, savedRec.Revision)
+	}
+	oauth.DefaultRefreshCoordinator().NoteTokenSavedFor(serverKey, binding)
+	oauth.GetTokenStoreManager().NotifyTokenSavedFor(c.config.Name, newToken.ExpiresAt, binding)
+	c.logger.Info("OAuth token refreshed via stored DCR credentials",
+		zap.String("server", c.config.Name),
+		zap.Time("new_expiry", newToken.ExpiresAt))
+	return tok, nil
+}
+
+// oauthRefreshRequest builds the coordinator request for this server; the
+// caller sets ObservedRefreshToken and Trigger.
+//
+// The request carries the instance's credential binding, so
+// it joins only flights of the same binding, loads only records written
+// under it, and clears only the exact record the flight read.
+func (c *Client) oauthRefreshRequest(serverKey string, handler *transport.OAuthHandler) oauth.RefreshRequest {
+	binding := c.CredentialBinding()
+	return oauth.RefreshRequest{
+		Key:          serverKey,
+		Binding:      binding,
+		ServerName:   c.config.Name,
+		Load:         func() (*storage.OAuthTokenRecord, error) { return c.storage.GetOAuthTokenBound(serverKey, binding) },
+		Refresh:      c.oauthRefreshFunc(handler),
+		StaticClient: c.isStaticOAuthClient(),
+		ClearClientAt: func(rec *storage.OAuthTokenRecord) (bool, error) {
+			return oauth.ClearClientIfBound(c.storage, serverKey, c.config.Name, binding, rec)
+		},
+	}
+}
+
+// bindOAuthRefresher binds the live mcp-go OAuth handler's refresh function to
+// the token store handed to mcp-go, so the store refreshes
+// through the coordinator and mcp-go never runs its own unserialized refresh.
+// It reads c.client without locking: callers hold c.mu (Connect paths) or own
+// the client they just assigned.
+func (c *Client) bindOAuthRefresher(oauthConfig *client.OAuthConfig) {
+	if oauthConfig == nil || oauthConfig.TokenStore == nil {
+		return
+	}
+	handler := extractOAuthHandler(c.client)
+	if handler == nil {
+		return
+	}
+	oauth.BindRefresher(oauthConfig.TokenStore, oauth.RefreshBinding{
+		Refresh:      c.oauthRefreshFunc(handler),
+		StaticClient: c.isStaticOAuthClient(),
+	})
+}
+
+// annotateCodeExchangeError applies the one-re-registration rule to an
+// authorization-code exchange failure of the login flow.
+// handler is the OAuth handler that ran the exchange (its client id).
+func (c *Client) annotateCodeExchangeError(handler *transport.OAuthHandler, err error) error {
+	if err == nil {
+		return nil
+	}
+	clientID := ""
+	if handler != nil {
+		clientID = handler.GetClientID()
+	}
+	return oauth.DefaultRefreshCoordinator().AnnotateCodeExchangeErrorFor(
+		oauth.GenerateServerKey(c.config.Name, c.config.URL), c.CredentialBinding(), c.isStaticOAuthClient(), clientID, err)
+}

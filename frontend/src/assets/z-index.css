@@ -1,0 +1,7 @@
+/* Sidebar/drawer < dropdown < modal < toast. Native dialogs use the top layer. */
+:root {
+  --z-sidebar: 40;
+  --z-dropdown: 50;
+  --z-modal: 60;
+  --z-toast: 70;
+}

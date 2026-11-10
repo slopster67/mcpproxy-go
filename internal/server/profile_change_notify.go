@@ -1,0 +1,333 @@
+package server
+
+import (
+	"reflect"
+	"sort"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/slopster67/mcpproxy-go/internal/config"
+	"github.com/slopster67/mcpproxy-go/internal/profile"
+)
+
+// When a profile's policy or servers change - by a
+// profiles-service write or by a hand edit of the config file - every live MCP
+// session it governs is sent notifications/tools/list_changed so its client
+// re-lists tools, and one profiles.changed event per changed profile is
+// published for UIs to refetch.
+//
+// One observer covers both origins: the config service's pre-publish observer
+// sees every snapshot (service writes, file-watcher reloads), computes the
+// delta against the snapshot it replaces and ENQUEUES it. A single worker
+// goroutine sends only after currentConfig() is the new snapshot, so a client
+// that re-lists tools on the notification can never read the OLD tool set, and
+// nothing is ever sent from inside the config update mutex.
+
+// profilesChange is one changed profile, for the profiles.changed event.
+type profilesChange struct {
+	name   string
+	change string // create | update | delete | anonymous
+}
+
+// profileDelta is what changed between two config snapshots.
+type profileDelta struct {
+	// notify holds the profiles whose policy (fingerprint), effective servers or
+	// existence changed: the sessions they govern need tools/list_changed.
+	notify map[string]bool
+	// events is the profiles.changed stream (any stored-field change, incl.
+	// display-only ones, invalidates a UI).
+	events []profilesChange
+}
+
+func (d profileDelta) empty() bool {
+	return len(d.notify) == 0 && len(d.events) == 0
+}
+
+func (d *profileDelta) merge(o profileDelta) {
+	if d.notify == nil {
+		d.notify = map[string]bool{}
+	}
+	for n := range o.notify {
+		d.notify[n] = true
+	}
+	d.events = append(d.events, o.events...)
+}
+
+// computeProfileDelta compares two published snapshots.
+func computeProfileDelta(oldCfg, newCfg *config.Config) profileDelta {
+	d := profileDelta{notify: map[string]bool{}}
+	if oldCfg == nil || newCfg == nil {
+		return d
+	}
+	oldBy := map[string]*config.ProfileConfig{}
+	for i := range oldCfg.Profiles {
+		if _, dup := oldBy[oldCfg.Profiles[i].ID]; !dup {
+			oldBy[oldCfg.Profiles[i].ID] = &oldCfg.Profiles[i]
+		}
+	}
+	seen := map[string]bool{}
+	for i := range newCfg.Profiles {
+		p := &newCfg.Profiles[i]
+		if seen[p.ID] {
+			continue
+		}
+		seen[p.ID] = true
+		o, existed := oldBy[p.ID]
+		switch {
+		case !existed:
+			d.notify[p.ID] = true
+			d.events = append(d.events, profilesChange{name: p.ID, change: "create"})
+		case policyOrServersChanged(o, p, oldCfg, newCfg):
+			d.notify[p.ID] = true
+			d.events = append(d.events, profilesChange{name: p.ID, change: "update"})
+		case !reflect.DeepEqual(*o, *p):
+			d.events = append(d.events, profilesChange{name: p.ID, change: "update"}) // display-only edit
+		}
+	}
+	var gone []string
+	for n := range oldBy {
+		if !seen[n] {
+			gone = append(gone, n)
+		}
+	}
+	sort.Strings(gone)
+	for _, n := range gone {
+		d.notify[n] = true
+		d.events = append(d.events, profilesChange{name: n, change: "delete"})
+	}
+
+	return d
+}
+
+func policyOrServersChanged(o, n *config.ProfileConfig, oldCfg, newCfg *config.Config) bool {
+	if profile.Compile(o).Fingerprint != profile.Compile(n).Fingerprint {
+		return true
+	}
+	oldServers, newServers := o.EffectiveServers(oldCfg), n.EffectiveServers(newCfg)
+	sort.Strings(oldServers)
+	sort.Strings(newServers)
+	return !reflect.DeepEqual(oldServers, newServers)
+}
+
+// profileChangeNotifier owns the queue and the single worker.
+type profileChangeNotifier struct {
+	p       *MCPProxyServer
+	publish func(name, change string)
+
+	mu      sync.Mutex
+	pending *pendingProfileDelta
+	// seq numbers every observed snapshot and recent remembers the newest few,
+	// EVEN those whose delta is empty: a batch is delivered once the runtime's
+	// current snapshot is the batch's or any LATER one, so an unrelated
+	// publication racing a profile edit cannot strand the batch (F5.1).
+	seq    uint64
+	recent []seqSnapshot
+	wake   chan struct{}
+	stop   chan struct{}
+	done   chan struct{}
+	// waitFor bounds how long the worker waits for a snapshot to be published
+	// before dropping its delta (the write that produced it failed to publish).
+	waitFor time.Duration
+}
+
+// recentSnapshotCap bounds the remembered snapshots. A batch older than this
+// many publications is accepted on the next poll by falling back to "anything
+// newer than its own sequence number".
+const recentSnapshotCap = 64
+
+type seqSnapshot struct {
+	seq uint64
+	cfg *config.Config
+}
+
+type pendingProfileDelta struct {
+	cfg   *config.Config // the newest snapshot this batch is waiting for
+	seq   uint64         // its sequence number
+	delta profileDelta
+}
+
+func newProfileChangeNotifier(p *MCPProxyServer, publish func(name, change string)) *profileChangeNotifier {
+	n := &profileChangeNotifier{
+		p: p, publish: publish,
+		wake: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}),
+		waitFor: 5 * time.Second,
+	}
+	return n
+}
+
+// start runs the worker. It stops with close().
+func (n *profileChangeNotifier) start() {
+	go n.run()
+}
+
+// close stops the worker and waits for it.
+func (n *profileChangeNotifier) close() {
+	select {
+	case <-n.stop:
+		return
+	default:
+		close(n.stop)
+	}
+	<-n.done
+}
+
+// enqueue records the delta between two snapshots. It never blocks: it runs
+// under the config update mutex.
+func (n *profileChangeNotifier) enqueue(oldCfg, newCfg *config.Config) {
+	d := computeProfileDelta(oldCfg, newCfg)
+	n.mu.Lock()
+	n.seq++
+	seq := n.seq
+	n.recent = append(n.recent, seqSnapshot{seq: seq, cfg: newCfg})
+	if len(n.recent) > recentSnapshotCap {
+		n.recent = n.recent[len(n.recent)-recentSnapshotCap:]
+	}
+	if d.empty() {
+		n.mu.Unlock()
+		return // nothing to deliver; the snapshot is remembered for batches in flight
+	}
+	if n.pending == nil {
+		n.pending = &pendingProfileDelta{cfg: newCfg, seq: seq}
+	}
+	n.pending.cfg, n.pending.seq = newCfg, seq // a newer snapshot merges into the batch
+	n.pending.delta.merge(d)
+	n.mu.Unlock()
+	select {
+	case n.wake <- struct{}{}:
+	default:
+	}
+}
+
+// publishedAtOrAfter reports the runtime's current snapshot when it is the
+// batch's snapshot or one observed after it.
+func (n *profileChangeNotifier) publishedAtOrAfter(batch *pendingProfileDelta) (*config.Config, bool) {
+	cur := n.p.currentConfig()
+	if cur == batch.cfg {
+		return cur, true
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, s := range n.recent {
+		if s.seq > batch.seq && s.cfg == cur {
+			return cur, true
+		}
+	}
+	return nil, false
+}
+
+func (n *profileChangeNotifier) take() *pendingProfileDelta {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	b := n.pending
+	n.pending = nil
+	return b
+}
+
+func (n *profileChangeNotifier) run() {
+	defer close(n.done)
+	for {
+		select {
+		case <-n.stop:
+			return
+		case <-n.wake:
+		}
+		batch := n.take()
+		if batch == nil {
+			continue
+		}
+		if !n.awaitPublished(batch) {
+			continue
+		}
+		n.deliver(batch)
+	}
+}
+
+// awaitPublished waits for the latest snapshot, merging queued changes.
+func (n *profileChangeNotifier) awaitPublished(batch *pendingProfileDelta) bool {
+	deadline := time.Now().Add(n.waitFor)
+	for {
+		if more := n.take(); more != nil {
+			batch.cfg, batch.seq = more.cfg, more.seq
+			batch.delta.merge(more.delta)
+		}
+		if cur, ok := n.publishedAtOrAfter(batch); ok {
+			batch.cfg = cur
+			return true
+		}
+		if time.Now().After(deadline) {
+			if n.p.logger != nil {
+				n.p.logger.Warn("profile change was never published; its notifications are dropped")
+			}
+			return false
+		}
+		select {
+		case <-n.stop:
+			return false
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// deliver publishes the profiles.changed events and notifies the sessions.
+func (n *profileChangeNotifier) deliver(batch *pendingProfileDelta) {
+	if n.publish != nil {
+		for _, e := range batch.delta.events {
+			n.publish(e.name, e.change)
+		}
+	}
+	n.p.notifyProfileDelta(batch.cfg, batch.delta)
+}
+
+func (p *MCPProxyServer) notifyProfileDelta(cfg *config.Config, d profileDelta) {
+	if p.sessionStore == nil || (len(d.notify) == 0) {
+		return
+	}
+	pins := map[string]string{}
+	pinsKnown := false
+	if p.storage != nil {
+		if tokens, err := p.storage.ListClientCredentials(); err == nil {
+			pinsKnown = true
+			for i := range tokens {
+				pins[tokens[i].Name] = tokens[i].ProfilePin
+			}
+		} else if p.logger != nil {
+			p.logger.Warn("cannot read token pins for a profile change notification; notifying every token session", zap.Error(err))
+		}
+	}
+
+	for _, target := range p.sessionStore.SessionsMatching(func(info *SessionInfo) bool {
+		if info.Profile != "" && d.notify[info.Profile] {
+			return true
+		}
+		switch {
+		case info.TokenName != "":
+			if !pinsKnown {
+				return true // fail toward notifying
+			}
+			pin := pins[info.TokenName]
+			return pin != "" && d.notify[pin]
+		}
+		return false
+	}) {
+		p.sendToolsListChanged(target)
+	}
+}
+
+// ProfileTokensMoved implements runtime.ProfileSessionHook: the sessions of a
+// token whose pin a delete-with-reassign moved get the treatment (their
+// stored selection is cleared and each is re-listed).
+func (p *MCPProxyServer) ProfileTokensMoved(tokenNames []string) {
+	for _, name := range tokenNames {
+		p.NotifyBindingChanged(name)
+	}
+}
+
+// ProfileDeleted implements runtime.ProfileSessionHook: a selection of a
+// deleted profile is cleared (the session falls back to its base).
+func (p *MCPProxyServer) ProfileDeleted(name string) {
+	if p.sessionStore != nil {
+		p.sessionStore.ClearSelection(name)
+	}
+}

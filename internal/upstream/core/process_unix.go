@@ -1,0 +1,182 @@
+//go:build unix
+
+package core
+
+import (
+	"context"
+	"os/exec"
+	"syscall"
+	"time"
+
+	"go.uber.org/zap"
+)
+
+// createProcessGroupCommandFunc creates a custom CommandFunc that sets process groups for Unix systems
+// This ensures that child processes can be properly cleaned up when the parent exits
+func createProcessGroupCommandFunc(client *Client, workingDir string, logger *zap.Logger) func(ctx context.Context, command string, env []string, args []string) (*exec.Cmd, error) {
+	return func(ctx context.Context, command string, env []string, args []string) (*exec.Cmd, error) {
+		cmd := exec.CommandContext(ctx, command, args...)
+		cmd.Env = env
+
+		// Set working directory if specified
+		if workingDir != "" {
+			cmd.Dir = workingDir
+		}
+
+		// Run the child in its own process group so it and its descendants
+		// can be terminated together.
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			// Create a new process group for this command and its children
+			Setpgid: true,
+			// Make this process the group leader
+			Pgid: 0,
+		}
+
+		logger.Debug("Process group configuration applied",
+			zap.String("command", command),
+			zap.Strings("args", logSafeArgs(args)),
+			zap.String("working_dir", workingDir))
+
+		if client != nil {
+			client.processCmd = cmd
+			if pgid := extractProcessGroupID(cmd, logger, client.config.Name); pgid > 0 {
+				client.processGroupID = pgid
+				logger.Info("Process group ID tracked for cleanup",
+					zap.String("server", client.config.Name),
+					zap.Int("pgid", pgid))
+			}
+		}
+
+		return cmd, nil
+	}
+}
+
+func killProcessGroup(pgid int, logger *zap.Logger, serverName string) error {
+	if pgid <= 0 {
+		return nil
+	}
+
+	logger.Info("Terminating process group",
+		zap.String("server", serverName),
+		zap.Int("pgid", pgid))
+
+	// Step 1: Check if process group is already dead
+	if err := syscall.Kill(-pgid, 0); err != nil {
+		logger.Debug("Process group already terminated",
+			zap.String("server", serverName),
+			zap.Int("pgid", pgid))
+		return nil
+	}
+
+	// Step 2: Send SIGTERM to the entire process group
+	err := syscall.Kill(-pgid, syscall.SIGTERM)
+	if err != nil {
+		logger.Warn("Failed to send SIGTERM to process group",
+			zap.String("server", serverName),
+			zap.Int("pgid", pgid),
+			zap.Error(err))
+		// Process might have exited between check and kill, that's ok
+		return nil
+	}
+
+	logger.Debug("SIGTERM sent to process group",
+		zap.String("server", serverName),
+		zap.Int("pgid", pgid))
+
+	// Step 3: Poll for graceful termination (up to processGracefulTimeout)
+	// This allows fast exit if process terminates quickly
+	deadline := time.Now().Add(processGracefulTimeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(-pgid, 0); err != nil {
+			// Process group is dead
+			logger.Info("Process group terminated gracefully after SIGTERM",
+				zap.String("server", serverName),
+				zap.Int("pgid", pgid))
+			return nil
+		}
+		time.Sleep(processTerminationPollInterval)
+	}
+
+	// Step 4: Process still running, send SIGKILL
+	logger.Warn("Process group still running after SIGTERM timeout, sending SIGKILL",
+		zap.String("server", serverName),
+		zap.Int("pgid", pgid),
+		zap.Duration("timeout", processGracefulTimeout))
+
+	if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr != nil {
+		// Check if it died between our check and kill
+		if syscall.Kill(-pgid, 0) != nil {
+			logger.Debug("Process group exited just before SIGKILL",
+				zap.String("server", serverName),
+				zap.Int("pgid", pgid))
+			return nil
+		}
+		logger.Error("Failed to send SIGKILL to process group",
+			zap.String("server", serverName),
+			zap.Int("pgid", pgid),
+			zap.Error(killErr))
+		return killErr
+	}
+
+	logger.Info("SIGKILL sent to process group",
+		zap.String("server", serverName),
+		zap.Int("pgid", pgid))
+
+	return nil
+}
+
+// extractProcessGroupID extracts the process group ID from a running command
+func extractProcessGroupID(cmd *exec.Cmd, logger *zap.Logger, serverName string) int {
+	if cmd == nil || cmd.Process == nil {
+		return 0
+	}
+
+	// Get the process group ID from the process
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		logger.Warn("Failed to get process group ID",
+			zap.String("server", serverName),
+			zap.Int("pid", cmd.Process.Pid),
+			zap.Error(err))
+		return 0
+	}
+
+	logger.Debug("Process group ID extracted",
+		zap.String("server", serverName),
+		zap.Int("pid", cmd.Process.Pid),
+		zap.Int("pgid", pgid))
+
+	return pgid
+}
+
+// killProcessTreeNow is the retirement kill: SIGKILL
+// to the whole process group, at once and without waiting, so a retired
+// instance's child executes nothing further. Falls back to the immediate
+// process when no group was recorded. Safe to call more than once; it does
+// not reap (the transport's Close owns the child's exit status).
+func killProcessTreeNow(pgid int, cmd *exec.Cmd) {
+	if pgid > 0 {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		return
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+}
+
+// startedProcessGroupID is the process group a child started with
+// Setpgid (and Pgid 0) leads: its own pid. It stands in when
+// extractProcessGroupID cannot read the group because the child already
+// died, e.g. retirement cancelled the gate context, and so killed the
+// immediate child, while its launch section was still open. The pid is not reused before the child is reaped, so signalling
+// the group still reaches the descendants it left behind. 0 when the child
+// was not started as a group leader.
+func startedProcessGroupID(cmd *exec.Cmd) int {
+	if cmd == nil || cmd.Process == nil || cmd.SysProcAttr == nil {
+		return 0
+	}
+	if cmd.SysProcAttr.Setpgid && cmd.SysProcAttr.Pgid == 0 {
+		return cmd.Process.Pid
+	}
+	return 0
+}

@@ -1,0 +1,825 @@
+// Package health provides unified health status calculation for upstream MCP servers.
+package health
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/slopster67/mcpproxy-go/internal/contracts"
+	"github.com/slopster67/mcpproxy-go/internal/diagnostics"
+	"github.com/slopster67/mcpproxy-go/internal/stringutil"
+)
+
+// RefreshState represents the current state of token refresh for health reporting.
+// Mirrors oauth.RefreshState value-for-value (callers convert by ordinal), so
+// the constant order must match.
+type RefreshState int
+
+const (
+	// RefreshStateIdle means no refresh is pending or in progress.
+	RefreshStateIdle RefreshState = iota
+	// RefreshStateScheduled means a proactive refresh is scheduled.
+	RefreshStateScheduled
+	// RefreshStateRetrying means refresh failed and is retrying with exponential backoff.
+	RefreshStateRetrying
+	// RefreshStateFailed means refresh permanently failed (e.g., invalid_grant).
+	RefreshStateFailed
+)
+
+// HealthCalculatorInput contains all fields needed to calculate health status.
+// This struct normalizes data from different sources (StateView, storage, config).
+type HealthCalculatorInput struct {
+	// Server identification
+	Name string
+
+	// Admin state
+	Enabled bool
+
+	// Connection state
+	State     string // "connected", "connecting", "error", "idle", "disconnected"
+	Connected bool
+	LastError string
+
+	// HasEndpointURL reports whether this server is addressed by a configured
+	// URL (an HTTP/SSE server) rather than by a spawned command (stdio). It
+	// gates ActionEditURL: a stdio server can perfectly well emit "no such
+	// host" — an npx/uvx install failing to reach its package registry does
+	// exactly that — and offering "Edit URL" for it would point the user at a
+	// field that does not exist.
+	HasEndpointURL bool
+
+	// OAuth state (only for OAuth-enabled servers)
+	OAuthRequired   bool
+	OAuthStatus     string     // "authenticated", "expired", "error", "none"
+	TokenExpiresAt  *time.Time // When token expires
+	HasRefreshToken bool       // True if refresh token exists
+	UserLoggedOut   bool       // True if user explicitly logged out
+
+	// CallTimeOAuthRequired is set when a server connected anonymously (no config
+	// OAuth) and listed tools successfully, but a tool call returned an
+	// "authorization required" / 401 — i.e. the endpoint enforces OAuth only at
+	// tools/call time (e.g. Google's sqladmin MCP). The managed client records
+	// this on a call-time auth failure so we can surface a proactive Sign-in CTA
+	// instead of reporting the server as fully healthy.
+	CallTimeOAuthRequired bool
+
+	// Secret/config detection
+	MissingSecret  string // Secret name if unresolved (e.g., "GITHUB_TOKEN")
+	OAuthConfigErr string // OAuth config error (e.g., "requires 'resource' parameter")
+
+	// Tool info
+	ToolCount int
+
+	// RetryStopped reports that automatic reconnection has been permanently
+	// given up because the classifier proved the failure deterministic. It is
+	// checked ahead of the generic connection-state branches: a
+	// parked server IS in "error", but reporting it as an ordinary error hides
+	// the one thing the user needs to know — that nothing will retry on its own.
+	RetryStopped bool
+	// RetryStoppedCode is the stable MCPX_* code that justified stopping.
+	RetryStoppedCode string
+	// RetryStoppedReason is the human-readable cause from the diagnostics catalog.
+	RetryStoppedReason string
+	// RetryCount is the number of consecutive failed connection attempts, used
+	// only to say how many were made before giving up.
+	RetryCount int
+
+	// Refresh state
+	RefreshState       RefreshState // Current refresh state from RefreshManager
+	RefreshRetryCount  int          // Number of retry attempts
+	RefreshLastError   string       // Human-readable error message
+	RefreshNextAttempt *time.Time   // When next retry will occur
+
+	// Rolling tool-call failure rate. CallsInWindow counts only
+	// calls that say something about the upstream (successes and transport/
+	// HTTP/JSON-RPC/timeout failures); isError tool results and proxy-side
+	// refusals are excluded by the recorder. DominantCallFailureKind is a short
+	// label ("timeout", "network", ...) used only in the detail text.
+	CallsInWindow           int
+	CallFailuresInWindow    int
+	DominantCallFailureKind string
+}
+
+// Call failure rate thresholds. Constants, not config.
+const (
+	// CallFailureWindow is the rolling window the recorder keeps.
+	CallFailureWindow = 5 * time.Minute
+	// CallFailureMinSamples is the minimum counted calls before the rate applies.
+	CallFailureMinSamples = 5
+	// CallFailureRatio is the failure ratio that must be exceeded (strictly).
+	CallFailureRatio = 0.5
+)
+
+// HealthCalculatorConfig contains configurable thresholds for health calculation.
+type HealthCalculatorConfig struct {
+	// ExpiryWarningDuration is the duration before token expiry to show degraded status.
+	// Default: 1 hour
+	ExpiryWarningDuration time.Duration
+}
+
+// DefaultHealthConfig returns the default health calculator configuration.
+func DefaultHealthConfig() *HealthCalculatorConfig {
+	return &HealthCalculatorConfig{
+		ExpiryWarningDuration: time.Hour,
+	}
+}
+
+// CalculateHealth calculates the unified health status for a server.
+// The algorithm uses a priority-based approach where admin state is checked first,
+// followed by connection state, then OAuth state.
+//
+// A server that would otherwise report ready/healthy is downgraded to degraded
+// when its rolling tool-call failure rate is high. Every other
+// outcome (disabled, quarantined, connecting, unhealthy, OAuth, refresh) takes
+// precedence and is returned untouched.
+func CalculateHealth(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *contracts.HealthStatus {
+	return applyCallFailureRate(calculateHealthBase(input, cfg), input)
+}
+
+// applyCallFailureRate downgrades a ready, enabled, healthy result to degraded
+// when failures/total over the window exceeds CallFailureRatio with at least
+// CallFailureMinSamples counted calls. Applied to every healthy return,
+// including the early one for an auto-refreshable OAuth token inside the
+// expiry-warning window.
+func applyCallFailureRate(status *contracts.HealthStatus, input HealthCalculatorInput) *contracts.HealthStatus {
+	if status == nil || status.Level != LevelHealthy || status.AdminState != StateEnabled || status.Status != StatusReady {
+		return status
+	}
+	if input.CallsInWindow < CallFailureMinSamples ||
+		float64(input.CallFailuresInWindow)/float64(input.CallsInWindow) <= CallFailureRatio {
+		return status
+	}
+	detail := "The server is connected but most recent tool calls failed."
+	if input.DominantCallFailureKind != "" {
+		detail = fmt.Sprintf("The server is connected but most recent tool calls failed; the most common failure is %s.", input.DominantCallFailureKind)
+	}
+	status.Level = LevelDegraded
+	status.Summary = fmt.Sprintf("%d of %d tool calls failed in the last %d min",
+		input.CallFailuresInWindow, input.CallsInWindow, int(CallFailureWindow/time.Minute))
+	status.Detail = detail
+	status.Action = ActionViewLogs
+	status.Actions = []string{ActionViewLogs}
+	return status
+}
+
+func calculateHealthBase(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *contracts.HealthStatus {
+	if cfg == nil {
+		cfg = DefaultHealthConfig()
+	}
+
+	// 1. Admin state checks - these short-circuit health calculation
+	if !input.Enabled {
+		return &contracts.HealthStatus{
+			Level:      LevelHealthy, // Disabled is intentional, not broken
+			AdminState: StateDisabled,
+			Summary:    "Disabled",
+			Action:     ActionEnable,
+			Status:     StatusDisabled,
+			Usable:     false,
+			Actions:    []string{ActionEnable},
+		}
+	}
+
+	// 2. Missing secret check
+	if input.MissingSecret != "" {
+		return &contracts.HealthStatus{
+			Level:      LevelUnhealthy,
+			AdminState: StateEnabled,
+			Summary:    "Missing secret",
+			Detail:     input.MissingSecret,
+			Action:     ActionSetSecret,
+			Status:     StatusNeedsSecret,
+			Usable:     false,
+			Actions:    []string{ActionSetSecret},
+		}
+	}
+
+	// 3. OAuth config error check
+	if input.OAuthConfigErr != "" {
+		return &contracts.HealthStatus{
+			Level:      LevelUnhealthy,
+			AdminState: StateEnabled,
+			Summary:    "OAuth configuration error",
+			Detail:     input.OAuthConfigErr,
+			Action:     ActionConfigure,
+			Status:     StatusNeedsConfig,
+			Usable:     false,
+			Actions:    []string{ActionConfigure},
+		}
+	}
+
+	// 3b. Automatic reconnection permanently given up. Checked before
+	// the connection-state switch because a parked server sits in "error" and
+	// would otherwise render as a generic "Connection error" that looks like it
+	// is still retrying. Restart is the correct CTA: once the config is fixed it
+	// is the explicit user action that un-parks the server.
+	if input.RetryStopped {
+		summary := input.RetryStoppedReason
+		if summary == "" {
+			summary = formatErrorSummary(input.LastError)
+		}
+		detail := fmt.Sprintf("Automatic reconnection stopped after %s because this failure cannot be fixed by retrying.",
+			pluralAttempts(input.RetryCount))
+		if input.RetryStoppedCode != "" {
+			// The stable code is what the user pastes into a bug report and what
+			// docs.mcpproxy.app/errors/<CODE> is keyed on.
+			detail += " Diagnostic code: " + input.RetryStoppedCode + "."
+		}
+		if input.LastError != "" {
+			detail += " Last error: " + input.LastError
+		}
+		return &contracts.HealthStatus{
+			Level:      LevelUnhealthy,
+			AdminState: StateEnabled,
+			Summary:    summary,
+			Detail:     detail,
+			Action:     ActionRestart,
+			Status:     StatusError,
+			Usable:     false,
+			Actions:    []string{ActionRestart, ActionViewLogs},
+		}
+	}
+
+	// 4. Connection state checks
+	// Normalize state to lowercase for consistent matching
+	// (ConnectionState.String() returns "Error", "Disconnected", etc.)
+	state := strings.ToLower(input.State)
+	switch state {
+	case "error":
+		// For OAuth-required servers with OAuth-related errors, suggest login instead of restart
+		level := LevelUnhealthy
+		action := ActionRestart
+		summary := formatErrorSummary(input.LastError)
+		if input.HasEndpointURL && isEndpointAddressError(input.LastError) {
+			action = ActionEditURL
+		}
+		if oauthActionApplies(input) {
+			level, action, summary = oauthAttentionState(input.LastError)
+		}
+		statusVal, usable, actions := connectionErrorStatus(action)
+		return &contracts.HealthStatus{
+			Level:      level,
+			AdminState: StateEnabled,
+			Summary:    summary,
+			Detail:     input.LastError,
+			Action:     action,
+			Status:     statusVal,
+			Usable:     usable,
+			Actions:    actions,
+		}
+	case "disconnected":
+		level := LevelUnhealthy
+		summary := "Disconnected"
+		action := ActionRestart
+		if input.LastError != "" {
+			summary = formatErrorSummary(input.LastError)
+			if input.HasEndpointURL && isEndpointAddressError(input.LastError) {
+				action = ActionEditURL
+			}
+			// For OAuth-required servers with OAuth-related errors, suggest login
+			if oauthActionApplies(input) {
+				level, action, summary = oauthAttentionState(input.LastError)
+			}
+		}
+		statusVal, usable, actions := connectionErrorStatus(action)
+		return &contracts.HealthStatus{
+			Level:      level,
+			AdminState: StateEnabled,
+			Summary:    summary,
+			Detail:     input.LastError,
+			Action:     action,
+			Status:     statusVal,
+			Usable:     usable,
+			Actions:    actions,
+		}
+	case "pending auth", "pending_auth":
+		// Parked awaiting user login: the client stopped redialing on
+		// purpose, so this never "resolves on its own" — it is always an
+		// attention item with a Sign-in CTA, regardless of OAuthRequired (a
+		// header-auth server whose token expired is parked the same way).
+		level, action, summary := oauthAttentionState(input.LastError)
+		return &contracts.HealthStatus{
+			Level:      level,
+			AdminState: StateEnabled,
+			Summary:    summary,
+			Detail:     input.LastError,
+			Action:     action,
+			Status:     StatusSignInRequired,
+			Usable:     false,
+			Actions:    []string{ActionLogin},
+		}
+	case "connecting", "idle":
+		return &contracts.HealthStatus{
+			Level:      LevelHealthy,
+			AdminState: StateEnabled,
+			Summary:    "Connecting...",
+			Action:     ActionNone, // Will resolve on its own — not an attention item
+			Status:     StatusConnecting,
+			Usable:     false,
+			Actions:    []string{},
+		}
+	}
+
+	// 4b. Call-time OAuth requirement. A server that connects
+	// anonymously and lists tools fine, but whose tools/call returns
+	// "authorization required", never sets OAuthRequired (no config OAuth) or a
+	// connection LastError, so it would otherwise fall through to the healthy
+	// branch below and look fully Ready. Surface a proactive amber Sign-in CTA
+	// instead. Placed after the connection-state switch so genuine error/
+	// disconnected/connecting states (which return above) always take priority.
+	if input.CallTimeOAuthRequired {
+		return &contracts.HealthStatus{
+			Level:      LevelDegraded,
+			AdminState: StateEnabled,
+			Summary:    "Sign-in required",
+			Detail:     "This server requires sign-in before its tools can be called.",
+			Action:     ActionLogin,
+			Status:     StatusSignInRequired,
+			Usable:     false,
+			Actions:    []string{ActionLogin},
+		}
+	}
+
+	// 5. OAuth state checks (only for servers that require OAuth)
+	if input.OAuthRequired {
+		// User explicitly logged out - needs re-authentication
+		if input.UserLoggedOut {
+			return &contracts.HealthStatus{
+				Level:      LevelUnhealthy,
+				AdminState: StateEnabled,
+				Summary:    "Logged out",
+				Action:     ActionLogin,
+				Status:     StatusSignInRequired,
+				Usable:     false,
+				Actions:    []string{ActionLogin},
+			}
+		}
+
+		// Token expired
+		if input.OAuthStatus == "expired" {
+			return &contracts.HealthStatus{
+				Level:      LevelUnhealthy,
+				AdminState: StateEnabled,
+				Summary:    "Token expired",
+				Action:     ActionLogin,
+				Status:     StatusSignInRequired,
+				Usable:     false,
+				Actions:    []string{ActionLogin},
+			}
+		}
+
+		// OAuth error (but not expired)
+		if input.OAuthStatus == "error" {
+			return &contracts.HealthStatus{
+				Level:      LevelUnhealthy,
+				AdminState: StateEnabled,
+				Summary:    "Authentication error",
+				Detail:     input.LastError,
+				Action:     ActionLogin,
+				Status:     StatusSignInRequired,
+				Usable:     false,
+				Actions:    []string{ActionLogin},
+			}
+		}
+
+		// Token expiring soon (only degraded if no refresh token for auto-refresh)
+		if input.TokenExpiresAt != nil && !input.TokenExpiresAt.IsZero() {
+			timeUntilExpiry := time.Until(*input.TokenExpiresAt)
+			if timeUntilExpiry > 0 && timeUntilExpiry <= cfg.ExpiryWarningDuration {
+				// If we have a refresh token, the system can auto-refresh - stay healthy
+				if input.HasRefreshToken {
+					// Token will be auto-refreshed, show healthy with tool count
+					return &contracts.HealthStatus{
+						Level:      LevelHealthy,
+						AdminState: StateEnabled,
+						Summary:    formatConnectedSummary(input.ToolCount),
+						Action:     ActionNone,
+						Status:     StatusReady,
+						Usable:     true,
+						Actions:    []string{},
+					}
+				}
+				return &contracts.HealthStatus{
+					Level:      LevelDegraded,
+					AdminState: StateEnabled,
+					Summary:    formatExpiringTokenSummary(timeUntilExpiry),
+					Detail:     fmt.Sprintf("Token expires at %s", input.TokenExpiresAt.Format(time.RFC3339)),
+					Action:     ActionLogin,
+					Status:     StatusReady,
+					Usable:     true,
+					Actions:    []string{ActionLogin},
+				}
+			}
+		}
+
+		// Token is not authenticated yet (none status)
+		if input.OAuthStatus == "none" || input.OAuthStatus == "" {
+			// Server requires OAuth but no token - needs login
+			return &contracts.HealthStatus{
+				Level:      LevelUnhealthy,
+				AdminState: StateEnabled,
+				Summary:    "Authentication required",
+				Action:     ActionLogin,
+				Status:     StatusSignInRequired,
+				Usable:     false,
+				Actions:    []string{ActionLogin},
+			}
+		}
+	}
+
+	// 6. Refresh state checks
+	// Check if refresh is in a degraded or failed state
+	switch input.RefreshState {
+	case RefreshStateRetrying:
+		// Refresh failed but retrying - degraded status. Still `ready`/usable:
+		// the connection is up on the current token, so this is not an
+		// attention item — only View logs is offered, as a diagnostic, not a
+		// blocking remedy.
+		detail := formatRefreshRetryDetail(input.RefreshRetryCount, input.RefreshNextAttempt, input.RefreshLastError)
+		return &contracts.HealthStatus{
+			Level:      LevelDegraded,
+			AdminState: StateEnabled,
+			Summary:    "Token refresh pending",
+			Detail:     detail,
+			Action:     ActionViewLogs,
+			Status:     StatusReady,
+			Usable:     true,
+			Actions:    []string{ActionViewLogs},
+		}
+	case RefreshStateFailed:
+		// Refresh permanently failed - unhealthy status
+		detail := "Re-authentication required"
+		if input.RefreshLastError != "" {
+			detail = fmt.Sprintf("Re-authentication required: %s", input.RefreshLastError)
+		}
+		return &contracts.HealthStatus{
+			Level:      LevelUnhealthy,
+			AdminState: StateEnabled,
+			Summary:    "Refresh token expired",
+			Detail:     detail,
+			Action:     ActionLogin,
+			Status:     StatusSignInRequired,
+			Usable:     false,
+			Actions:    []string{ActionLogin},
+		}
+	}
+
+	// 7. Healthy state - connected with valid authentication (if required)
+	return &contracts.HealthStatus{
+		Level:      LevelHealthy,
+		AdminState: StateEnabled,
+		Summary:    formatConnectedSummary(input.ToolCount),
+		Action:     ActionNone,
+		Status:     StatusReady,
+		Usable:     true,
+		Actions:    []string{},
+	}
+}
+
+// connectionErrorStatus derives the `status`/`usable`/`actions` triple from
+// the final `action` a connection-state branch (error/disconnected) settled
+// on, after its EditURL/OAuth overrides. Deriving from the final action
+// (rather than re-testing the same conditions) keeps this in lockstep with
+// whichever override wins when more than one applies.
+//
+// Both call sites only pass ActionRestart, ActionEditURL or ActionLogin, so
+// `default` is the generic restart-and-view-logs case. It does not panic on an
+// unexpected action because this runs on every health render for every server.
+func connectionErrorStatus(action string) (status string, usable bool, actions []string) {
+	switch action {
+	case ActionEditURL:
+		return StatusNeedsConfig, false, []string{ActionEditURL}
+	case ActionLogin:
+		return StatusSignInRequired, false, []string{ActionLogin}
+	default:
+		return StatusError, false, []string{ActionRestart, ActionViewLogs}
+	}
+}
+
+// formatConnectedSummary formats the summary for a healthy connected server.
+func formatConnectedSummary(toolCount int) string {
+	if toolCount == 0 {
+		return "Connected"
+	}
+	if toolCount == 1 {
+		return "Connected (1 tool)"
+	}
+	return fmt.Sprintf("Connected (%d tools)", toolCount)
+}
+
+// formatErrorSummary formats an error message for the summary field.
+// It truncates long errors and makes them more user-friendly.
+func formatErrorSummary(lastError string) string {
+	if lastError == "" {
+		return "Connection error"
+	}
+
+	// Common error patterns to friendly messages.
+	// Order matters: more specific patterns must come before generic ones.
+	// For example, "no such host" must be checked before "dial tcp" since
+	// DNS errors often appear as "dial tcp: no such host".
+	errorMappings := []struct {
+		pattern  string
+		friendly string
+	}{
+		// Specific patterns first
+		{"no such host", "Host not found"},
+		{"connection refused", "Connection refused"},
+		{"connection reset", "Connection reset"},
+		{"timeout", "Connection timeout"},
+		{"EOF", "Connection closed"},
+		{"authentication failed", "Authentication failed"},
+		{"unauthorized", "Unauthorized"},
+		{"forbidden", "Access forbidden"},
+		{"oauth", "OAuth error"},
+		{"certificate", "Certificate error"},
+		// Generic patterns last
+		{"dial tcp", "Cannot connect"},
+	}
+
+	// Check for known patterns (in order)
+	for _, mapping := range errorMappings {
+		if stringutil.ContainsIgnoreCase(lastError, mapping.pattern) {
+			return mapping.friendly
+		}
+	}
+
+	// Truncate if too long (max 50 chars for summary)
+	if len(lastError) > 50 {
+		return lastError[:47] + "..."
+	}
+	return lastError
+}
+
+// formatExpiringTokenSummary formats the summary for an expiring token.
+func formatExpiringTokenSummary(timeUntilExpiry time.Duration) string {
+	if timeUntilExpiry < time.Minute {
+		return "Token expiring now"
+	}
+	if timeUntilExpiry < time.Hour {
+		minutes := int(timeUntilExpiry.Minutes())
+		if minutes == 1 {
+			return "Token expiring in 1m"
+		}
+		return fmt.Sprintf("Token expiring in %dm", minutes)
+	}
+	hours := int(timeUntilExpiry.Hours())
+	if hours == 1 {
+		return "Token expiring in 1h"
+	}
+	return fmt.Sprintf("Token expiring in %dh", hours)
+}
+
+// formatRefreshRetryDetail formats the detail message for a refresh retry state.
+func formatRefreshRetryDetail(retryCount int, nextAttempt *time.Time, lastError string) string {
+	var detail string
+
+	// Start with retry count and next attempt time
+	if nextAttempt != nil && !nextAttempt.IsZero() {
+		detail = fmt.Sprintf("Refresh retry %d scheduled for %s", retryCount, nextAttempt.Format(time.RFC3339))
+	} else {
+		detail = fmt.Sprintf("Refresh retry %d pending", retryCount)
+	}
+
+	// Add last error if available
+	if lastError != "" {
+		// Truncate error if too long
+		errorMsg := lastError
+		if len(errorMsg) > 100 {
+			errorMsg = errorMsg[:97] + "..."
+		}
+		detail = fmt.Sprintf("%s: %s", detail, errorMsg)
+	}
+
+	return detail
+}
+
+// isEndpointAddressError reports whether a connection failure is caused by the
+// configured address itself rather than by a transient outage. DNS resolution
+// failures, unsupported/absent schemes and unparseable URLs cannot be fixed by
+// restarting the server — offering "Restart" for them sends the user in a loop.
+// "connection refused" is deliberately NOT in this set: the host
+// resolved, so the address is plausibly right and the peer merely down.
+//
+// Callers MUST gate this behind HasEndpointURL: the same phrases appear in the
+// output of a stdio server's own failed network calls, and a stdio server has
+// no URL field to send the user to.
+func isEndpointAddressError(err string) bool {
+	if err == "" {
+		return false
+	}
+	addressPatterns := []string{
+		"no such host",
+		"unsupported protocol scheme",
+		"missing protocol scheme",
+		"invalid url",
+		"invalid uri",
+		"first path segment in url",
+	}
+	for _, pattern := range addressPatterns {
+		if stringutil.ContainsIgnoreCase(err, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// isOAuthRelatedError checks if the error message indicates an OAuth issue.
+// Connection errors take precedence — when a server is simply offline,
+// the mcp-go client wraps the connection error inside "authentication strategies failed",
+// which would incorrectly trigger OAuth-related detection.
+func isOAuthRelatedError(err string) bool {
+	if err == "" {
+		return false
+	}
+	// Connection errors take precedence - these are NOT OAuth issues
+	// even if the error message also contains OAuth-related text
+	connectionPatterns := []string{
+		"connection refused",
+		"connection reset",
+		"no such host",
+		"network is unreachable",
+		"dial tcp",
+		"i/o timeout",
+		"context deadline exceeded",
+		"no route to host",
+	}
+	for _, pattern := range connectionPatterns {
+		if stringutil.ContainsIgnoreCase(err, pattern) {
+			return false
+		}
+	}
+	// Check for common OAuth-related error patterns
+	oauthPatterns := []string{
+		"oauth",
+		"authentication required",
+		"authentication strategies failed",
+		"unauthorized",
+		"login required",
+		"token expired",
+		"invalid_grant",
+		"access_denied",
+	}
+	for _, pattern := range oauthPatterns {
+		if stringutil.ContainsIgnoreCase(err, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// oauthAttentionState maps an OAuth-related error into the health level, action,
+// and summary the user should see. A first-time sign-in (ErrOAuthPending) is an
+// expected setup step, so it surfaces as degraded/amber with "Sign-in required".
+// A previously-working token that broke (re-auth) stays unhealthy/red because it
+// is a regression from a working state. Both suggest the login action.
+//
+// Callers MUST gate this behind isOAuthRelatedError so genuine connection
+// failures (which mcp-go wraps in "authentication strategies failed" noise) are
+// not downgraded to amber.
+func oauthAttentionState(lastError string) (level, action, summary string) {
+	// Only a first-time deferred sign-in (ErrOAuthPending) is amber. Re-auth and
+	// every other genuine OAuth error (revoked token, invalid_grant, …) stays red
+	// because the server was — or should have been — working.
+	if isOAuthLoginRequiredError(lastError) {
+		return LevelDegraded, ActionLogin, "Sign-in required"
+	}
+	return LevelUnhealthy, ActionLogin, "Authentication required"
+}
+
+// isOAuthLoginRequiredError reports whether an OAuth-related error is a
+// first-time deferred sign-in (ErrOAuthPending). The user has never signed in,
+// so it is an expected setup step (amber) rather than a broken state (red).
+// Re-auth ("stored token broke") is explicitly excluded so it stays red. The
+// markers mirror diagnostics.classifyOAuth's login backstops.
+func isOAuthLoginRequiredError(err string) bool {
+	if isOAuthReauthError(err) {
+		return false
+	}
+	loginPatterns := []string{
+		"oauth authentication required",
+		"login available",
+		"mcpproxy auth login",
+	}
+	for _, pattern := range loginPatterns {
+		if stringutil.ContainsIgnoreCase(err, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// isOAuthReauthError reports whether an OAuth-related error indicates that a
+// previously-working stored token broke and must be refreshed by signing in
+// again (as opposed to a first-time sign-in). Matched against the ErrOAuthPending
+// "stored token" / "re-login available" message text.
+func isOAuthReauthError(err string) bool {
+	reauthPatterns := []string{
+		"re-login available",
+		"re-authentication required",
+		"server error with stored token",
+		"stored token may be invalid",
+	}
+	for _, pattern := range reauthPatterns {
+		if stringutil.ContainsIgnoreCase(err, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// oauthActionApplies reports whether an enabled (non-quarantined) server's
+// "error"/"disconnected" last error should surface the OAuth Login CTA
+// instead of the generic Restart. Configured OAuth (OAuthRequired) trusts any
+// OAuth-related error. Autodetected OAuth (OAuthRequired=false) trusts only
+// the two specific, unambiguous markers — first-time login-required and
+// re-auth (a previously-working stored token that broke) — whose text is
+// specific enough on its own. A looser generic OAuth-related match (e.g.
+// mcp-go's "authentication strategies failed" transport-fault wrapper) is NOT
+// promoted without OAuthRequired, since that text can also mean an unrelated
+// transport failure.
+//
+// This keeps health.action consistent with diagnostics.classifyOAuth, which
+// assigns MCPX_OAUTH_REAUTH_REQUIRED / MCPX_OAUTH_LOGIN_REQUIRED from the same
+// error text, so the UI never offers Login and Restart for the same failure.
+func oauthActionApplies(input HealthCalculatorInput) bool {
+	// Explicit credential acquisition failures remain actionable even if refresh
+	// timed out, and even for an automatically discovered OAuth server.
+	if strings.Contains(input.LastError, diagnostics.OAuthCredentialsUnavailableMessage) {
+		return true
+	}
+	// isOAuthRelatedError is the general gate: it excludes connection-fault
+	// text (e.g. mcp-go's "authentication strategies failed" wrapper around a
+	// plain "dial tcp ... connection refused") BEFORE the OAuth patterns are
+	// checked. Both branches below rely on that exclusion having already run.
+	if !isOAuthRelatedError(input.LastError) {
+		return false
+	}
+	if input.OAuthRequired {
+		return true
+	}
+	return isOAuthLoginRequiredError(input.LastError) || isOAuthReauthError(input.LastError)
+}
+
+// ExtractMissingSecret extracts the secret name from an error message if the error
+// indicates a missing secret reference (e.g., unresolved environment variable).
+// Returns the secret name or empty string if the error is not about missing secrets.
+func ExtractMissingSecret(lastError string) string {
+	if lastError == "" {
+		return ""
+	}
+
+	// Pattern: "environment variable VARNAME not found or empty"
+	const prefix = "environment variable "
+	const suffix = " not found or empty"
+	if idx := strings.Index(lastError, prefix); idx >= 0 {
+		start := idx + len(prefix)
+		if endIdx := strings.Index(lastError[start:], suffix); endIdx > 0 {
+			return lastError[start : start+endIdx]
+		}
+	}
+
+	// Pattern: "${env:VARNAME}" unresolved
+	const envPrefix = "${env:"
+	if idx := strings.Index(lastError, envPrefix); idx >= 0 {
+		start := idx + len(envPrefix)
+		if endIdx := strings.IndexByte(lastError[start:], '}'); endIdx > 0 {
+			return lastError[start : start+endIdx]
+		}
+	}
+
+	return ""
+}
+
+// ExtractOAuthConfigError extracts an OAuth configuration error from the error message.
+// Returns the config error description or empty string if not an OAuth config issue.
+func ExtractOAuthConfigError(lastError string) string {
+	if lastError == "" {
+		return ""
+	}
+
+	// OAuth config issues typically mention "resource" parameter or config validation
+	configPatterns := []string{
+		"requires 'resource' parameter",
+		"missing client_id",
+		"oauth config validation failed",
+		"invalid oauth configuration",
+	}
+
+	for _, pattern := range configPatterns {
+		if stringutil.ContainsIgnoreCase(lastError, pattern) {
+			return lastError
+		}
+	}
+
+	return ""
+}
+
+// pluralAttempts renders the attempt count for the retry-stopped detail line.
+func pluralAttempts(n int) string {
+	if n == 1 {
+		return "1 attempt"
+	}
+	return fmt.Sprintf("%d attempts", n)
+}

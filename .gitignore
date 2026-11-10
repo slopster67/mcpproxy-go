@@ -1,0 +1,76 @@
+# Build output
+/mcpproxy
+/mcpproxy-dev
+__debug_bin*
+build/
+dist/
+bin/
+
+# Go workspace and build cache
+go.work
+go.work.sum
+.gocache/
+
+# Profiling files
+*.prof
+*.pprof
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Local configuration and secrets
+*.env
+.env
+.env.local
+.env.*.local
+
+# Logs, temporary files and local databases
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+*.db
+*.sqlite
+*.sqlite3
+data/
+.cache/
+*.cache
+
+# Frontend dependencies and build artifacts
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Package manager files (npm's package-lock.json is tracked)
+pnpm-lock.yaml
+yarn.lock
+
+# Embedded frontend assets, rebuilt from frontend/ by `make frontend-build`.
+# The tracked .gitkeep lets the //go:embed all:frontend/dist directive in
+# web/web.go compile before the UI has been built. The re-includes are needed
+# because the generic `dist/` rule above would otherwise mask the directory.
+!web/frontend/dist/
+web/frontend/dist/*
+!web/frontend/dist/.gitkeep
+
+# Agent and editor tooling
+.claude/
+.agents/
+.codex/
+.cursor/
+.worktrees/
