@@ -8,15 +8,14 @@ or reloads. Unset or empty variables use built-in defaults. Restart to apply cha
 either mode. Unknown `MCPPROXY_*` variables and nonempty variables for the wrong
 mode fail startup. General help/version controls are not settings.
 
-Only the encryption key, OIDC client secret, peer token, trusted hosts and peer
-primary URL accept `_FILE` inputs (the last two so a deployment can keep its
+Only the encryption key, the OIDC settings, peer token, trusted hosts and peer
+primary URL accept `_FILE` inputs (so a deployment can keep secrets and its own
 hostnames out of public configuration). All other settings accept direct
 environment values only.
 Set only one nonempty source. Files must be regular, nonempty and at most 1 MiB.
-Trailing CR/LF characters are removed; other whitespace is preserved. Credential
-files (encryption key, OIDC client secret, peer token) must not be world-readable;
-secrets-manager group-readable files are supported. File contents are never exported back
-into the process environment.
+Trailing CR/LF characters are removed; other whitespace is preserved. Files must
+not be world-readable; secrets-manager group-readable files are supported. File
+contents are never exported back into the process environment.
 
 Booleans accept `true` / `false`; integers and decimals use plain numbers;
 durations use Go notation such as `30s`, `2m` or `0s`. Lists are comma-separated.
@@ -76,10 +75,10 @@ variables are separate from this configuration schema.
 | `MCPPROXY_INSTRUCTIONS` | primary |
 | `MCPPROXY_ADVERTISE_UPSTREAM_SERVERS` | primary |
 | `MCPPROXY_ENCRYPTION_KEY`, `MCPPROXY_ENCRYPTION_KEY_FILE` | primary |
-| `MCPPROXY_OIDC_ISSUER` | primary |
-| `MCPPROXY_OIDC_CLIENT_ID` | primary |
+| `MCPPROXY_OIDC_ISSUER`, `MCPPROXY_OIDC_ISSUER_FILE` | primary |
+| `MCPPROXY_OIDC_CLIENT_ID`, `MCPPROXY_OIDC_CLIENT_ID_FILE` | primary |
 | `MCPPROXY_OIDC_CLIENT_SECRET`, `MCPPROXY_OIDC_CLIENT_SECRET_FILE` | primary |
-| `MCPPROXY_OIDC_REDIRECT_URL` | primary |
+| `MCPPROXY_OIDC_REDIRECT_URL`, `MCPPROXY_OIDC_REDIRECT_URL_FILE` | primary |
 | `MCPPROXY_PEER_PRIMARY_URL`, `MCPPROXY_PEER_PRIMARY_URL_FILE` | peer |
 | `MCPPROXY_PEER_TOKEN`, `MCPPROXY_PEER_TOKEN_FILE` | peer |
 

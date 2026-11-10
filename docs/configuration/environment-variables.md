@@ -12,7 +12,7 @@ All settings come from environment variables and built-in defaults. There are no
 configuration flags or JSON files. Settings are fixed at startup; restart after
 changing them. See [the complete settings inventory](../../SETTINGS.md).
 
-Only the encryption key, OIDC client secret, peer token, trusted hosts and peer
+Only the encryption key, the OIDC settings, peer token, trusted hosts and peer
 primary URL accept `_FILE` inputs. Other settings are direct environment values only. Use one nonempty source
 per setting. File values are read at startup, without exporting their contents
 into the environment. Trailing line endings are removed. Credential files must

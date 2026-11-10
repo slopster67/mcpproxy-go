@@ -9,10 +9,10 @@ import (
 // Config authenticates dashboard administrators. The identity provider
 // controls who may use this application; every admitted user is an administrator.
 type Config struct {
-	Issuer       string `env:"MCPPROXY_OIDC_ISSUER"`
-	ClientID     string `env:"MCPPROXY_OIDC_CLIENT_ID"`
+	Issuer       string `env:"MCPPROXY_OIDC_ISSUER" file:"true"`
+	ClientID     string `env:"MCPPROXY_OIDC_CLIENT_ID" file:"true"`
 	ClientSecret string `env:"MCPPROXY_OIDC_CLIENT_SECRET" file:"true"`
-	RedirectURL  string `env:"MCPPROXY_OIDC_REDIRECT_URL"`
+	RedirectURL  string `env:"MCPPROXY_OIDC_REDIRECT_URL" file:"true"`
 }
 
 func (c *Config) Validate() error {
