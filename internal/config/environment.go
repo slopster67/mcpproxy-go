@@ -42,7 +42,7 @@ type Setting struct {
 	Name, Mode string
 	Field      string
 	Type       reflect.Type
-	Secret     bool
+	File       bool
 }
 
 // Settings enumerates the schema without reading the process environment.
@@ -68,7 +68,7 @@ func Settings() []Setting {
 			}
 			name := strings.Split(tag, ",")[0]
 			if name != "" {
-				out = append(out, Setting{Name: name, Mode: fieldMode, Field: f.Name, Type: f.Type, Secret: f.Tag.Get("secret") == "true"})
+				out = append(out, Setting{Name: name, Mode: fieldMode, Field: f.Name, Type: f.Type, File: f.Tag.Get("file") == "true"})
 				continue
 			}
 			walk(f.Type, fieldMode)
@@ -94,7 +94,7 @@ func loadEnvironment(mode Mode, input map[string]string) (*Config, error) {
 	values := make(map[string]string)
 	for _, s := range schema {
 		known[s.Name] = s
-		if s.Secret {
+		if s.File {
 			known[s.Name+"_FILE"] = s
 		}
 	}
@@ -124,7 +124,7 @@ func loadEnvironment(mode Mode, input map[string]string) (*Config, error) {
 		}
 		value := input[s.Name]
 		path := ""
-		if s.Secret {
+		if s.File {
 			path = input[s.Name+"_FILE"]
 		}
 		if value != "" && path != "" {

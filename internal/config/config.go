@@ -219,7 +219,7 @@ type Config struct {
 	// Origin header when present (MCP spec DNS-rebinding defense). Empty
 	// (default) keeps full protection. Env override: MCPPROXY_TRUSTED_HOSTS
 	// (comma-separated).
-	TrustedHosts []string `env:"MCPPROXY_TRUSTED_HOSTS" json:"trusted_hosts,omitempty"`
+	TrustedHosts []string `env:"MCPPROXY_TRUSTED_HOSTS" file:"true" json:"trusted_hosts,omitempty"`
 
 	// Code execution settings
 	CodeExecutionTimeoutMs    int `env:"MCPPROXY_CODE_EXECUTION_TIMEOUT_MS" json:"code_execution_timeout_ms,omitempty"`         // Timeout in milliseconds (default: 120000, max: 600000)
@@ -288,10 +288,10 @@ type Config struct {
 	// Security scanner settings
 
 	// Deployment credentials are never serialized or included in activity records.
-	EncryptionKey  EncryptionKey         `env:"MCPPROXY_ENCRYPTION_KEY" secret:"true" json:"-"`
+	EncryptionKey  EncryptionKey         `env:"MCPPROXY_ENCRYPTION_KEY" file:"true" json:"-"`
 	OIDC           *dashboardauth.Config `env:",init" json:"-"`
-	PeerPrimaryURL string                `env:"MCPPROXY_PEER_PRIMARY_URL" mode:"peer" json:"-"`
-	PeerToken      string                `env:"MCPPROXY_PEER_TOKEN" secret:"true" mode:"peer" json:"-"`
+	PeerPrimaryURL string                `env:"MCPPROXY_PEER_PRIMARY_URL" file:"true" mode:"peer" json:"-"`
+	PeerToken      string                `env:"MCPPROXY_PEER_TOKEN" file:"true" mode:"peer" json:"-"`
 }
 
 // LogConfig represents logging configuration

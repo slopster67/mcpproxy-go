@@ -1,7 +1,7 @@
 # Configuration
 
 Deployment settings use environment variables only, with built-in defaults.
-Secret fields have `_FILE` inputs for runtime secret files such as agenix.
+A few settings have `_FILE` inputs for runtime files such as agenix secrets.
 There are no deployment flags or JSON configuration files. Settings are read
 once at startup; restart to apply changes.
 

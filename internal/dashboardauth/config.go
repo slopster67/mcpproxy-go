@@ -11,7 +11,7 @@ import (
 type Config struct {
 	Issuer       string `env:"MCPPROXY_OIDC_ISSUER"`
 	ClientID     string `env:"MCPPROXY_OIDC_CLIENT_ID"`
-	ClientSecret string `env:"MCPPROXY_OIDC_CLIENT_SECRET" secret:"true"`
+	ClientSecret string `env:"MCPPROXY_OIDC_CLIENT_SECRET" file:"true"`
 	RedirectURL  string `env:"MCPPROXY_OIDC_REDIRECT_URL"`
 }
 
