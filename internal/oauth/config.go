@@ -794,18 +794,21 @@ func createOAuthConfigInternal(env Env, serverConfig *config.ServerConfig, stora
 		}
 	}
 
-	// A browser sign-in registers the origin of that request. A later refresh
-	// has no request, so it keeps a public callback already stored with the
-	// client. A loopback pin still wins when nobody is browsing in.
+	// A browser sign-in uses the origin of that request. An explicit
+	// oauth.redirect_uri is the redirect the provider sees instead, including
+	// the token request. A later refresh has no request, so an unpinned client
+	// keeps a public callback already stored with it.
 	var remoteRedirectURI string
-	if origin := httpx.PublicOriginFrom(env.Ctx); origin != "" {
-		var err error
-		remoteRedirectURI, err = config.OAuthRemoteCallbackURL(origin, serverConfig.Name)
-		if err != nil {
-			return nil, err
+	if pinnedPort == 0 {
+		if origin := httpx.PublicOriginFrom(env.Ctx); origin != "" {
+			var err error
+			remoteRedirectURI, err = config.OAuthRemoteCallbackURL(origin, serverConfig.Name)
+			if err != nil {
+				return nil, err
+			}
+		} else if config.PublicOAuthCallbackURI(storedRedirectURI) {
+			remoteRedirectURI = storedRedirectURI
 		}
-	} else if pinnedPort == 0 && config.PublicOAuthCallbackURI(storedRedirectURI) {
-		remoteRedirectURI = storedRedirectURI
 	}
 
 	switch {
@@ -921,14 +924,19 @@ func createOAuthConfigInternal(env Env, serverConfig *config.ServerConfig, stora
 
 	// The pinned URI is sent to the provider verbatim so the string matches the
 	// one registered there (host spelling included: localhost vs 127.0.0.1).
+	// A public callback left by an earlier login must not stay on the server:
+	// persistence reads EffectiveRedirectURI and would record that URL while
+	// the provider was given the pin.
 	redirectURI := callbackServer.RedirectURI
 	if pinnedRedirectURI != "" {
 		redirectURI = pinnedRedirectURI
+		callbackServer.clearRemoteCallback()
+	} else {
+		if remoteRedirectURI != "" {
+			redirectURI = remoteRedirectURI
+		}
+		callbackServer.configureRemoteCallback(remoteRedirectURI)
 	}
-	if remoteRedirectURI != "" {
-		redirectURI = remoteRedirectURI
-	}
-	callbackServer.configureRemoteCallback(remoteRedirectURI)
 
 	logger.Info("Using exact redirect URI from allocated callback server",
 		zap.String("server", serverConfig.Name),

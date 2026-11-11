@@ -22,6 +22,15 @@ func (c *CallbackServer) configureRemoteCallback(callbackURL string) {
 	c.remoteCallbackURL = callbackURL
 }
 
+// clearRemoteCallback drops a public callback so the loopback listener URI is
+// the one persisted. An operator pin must win over a callback recorded by an
+// earlier browser login.
+func (c *CallbackServer) clearRemoteCallback() {
+	c.waitersMu.Lock()
+	defer c.waitersMu.Unlock()
+	c.remoteCallbackURL = ""
+}
+
 // NoteRedirect records the redirect URI this state was registered with.
 // Token exchange uses that exact string.
 func (c *CallbackServer) NoteRedirect(state, redirectURI string) {
