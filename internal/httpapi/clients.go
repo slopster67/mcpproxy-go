@@ -88,7 +88,7 @@ func (s *Server) handleGetClients(w http.ResponseWriter, r *http.Request) {
 
 // clientsListResponse is the data of GET /clients: the rows (filtered by the
 // current binding) and the warnings computed over the full
-// set. It is shared by the route and the MCP `profiles` tool's list_clients.
+// set. It is shared by the route and manage_clients list.
 func (s *Server) clientsListResponse(ctx context.Context, profileFilter, clientFilter string) (clientsResponse, error) {
 
 	// An exact ?client= filter also shows that client's REVOKED custom row

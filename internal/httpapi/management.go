@@ -18,9 +18,9 @@ import (
 // ManagementToolSpec describes a transport adapter, not a second implementation
 // of the operation. Inputs use the same Go request types as the dashboard.
 type ManagementToolSpec struct {
-	Name, Description string
-	Input             any
-	Operations        []string
+	Name, Title, Description string
+	Input                    any
+	Operations               []string
 }
 type ServerManagementRequest struct {
 	Operation string                `json:"operation"`
@@ -80,12 +80,13 @@ type ActivityManagementRequest struct {
 
 func ManagementToolSpecs() []ManagementToolSpec {
 	return []ManagementToolSpec{
-		{"manage_servers", "Manage server configuration, icons, execution hosts, connections, OAuth and logs. create/patch take a server object; patch merges env/headers and null removes a key. server.icon is raw SVG markup (<svg>…</svg>, not a data URI) or a PNG data URI (data:image/png;base64,…), at most 64 KB; an empty string removes the custom icon. OAuth overrides use server.oauth; null resets an OAuth field to automatic. oauth_settings reads the discovered OAuth values. sign_in returns the authorization URL.", ServerManagementRequest{}, []string{"list", "get", "create", "patch", "delete", "set_enabled", "restart", "sign_in", "sign_out", "oauth_settings", "logs", "convert_secret"}},
-		{"manage_clients", "Manage clients and their single access token. create/rotate return the newly applied token. allow_managing grants full MCPProxy administration, independently of the upstream profile. update takes a binding object with profile (empty = All servers).", ClientManagementRequest{}, []string{"list", "get", "create", "update", "rotate", "delete"}},
-		{"manage_peers", "Manage execution peers. create/rotate return the connection token. A peer with servers or clients must be emptied before deletion.", PeerManagementRequest{}, []string{"list", "create", "rotate", "delete"}},
-		{"manage_secrets", "List secret references and their users, or set/delete a secret. Values are never included in activity records.", SecretManagementRequest{}, []string{"list", "set", "delete"}},
-		{"manage_tools", "Inspect tools and review definitions, approve the definitions you reviewed, enable/disable tools, and classify unannotated tools. Approval requires expected_hashes and the expected_incarnation from the review. classify requires expected_hash; tier is read, write, destructive or empty to clear.", ToolManagementRequest{}, []string{"list", "review", "approve", "set_enabled", "classify"}},
-		{"manage_activity", "Read activity, call details and usage. list supports server/tool/client/profile/status/time filters and pagination. usage window is 24h, 7d or all.", ActivityManagementRequest{}, []string{"list", "get", "sessions", "usage"}},
+		{"manage_servers", "Manage servers", "Manage server configuration, icons, execution hosts, connections, OAuth and logs. create/patch take a server object; patch merges env/headers and null removes a key. server.icon is raw SVG markup (<svg>…</svg>, not a data URI) or a PNG data URI (data:image/png;base64,…), at most 64 KB; an empty string removes the custom icon. OAuth overrides use server.oauth; null resets an OAuth field to automatic. oauth_settings reads the discovered OAuth values. sign_in returns the authorization URL.", ServerManagementRequest{}, []string{"list", "get", "create", "patch", "delete", "set_enabled", "restart", "sign_in", "sign_out", "oauth_settings", "logs", "convert_secret"}},
+		{"manage_clients", "Manage clients", "Manage clients and their single access token. create/rotate return the newly applied token. allow_managing grants full MCPProxy administration, independently of the upstream profile. update takes a binding object with profile (empty = All servers).", ClientManagementRequest{}, []string{"list", "get", "create", "update", "rotate", "delete"}},
+		{"manage_profiles", "Manage profiles", "Manage profiles: which servers and tools a client reaches. create and update take a profile object; update replaces the whole profile named by id. rename takes new_name. delete takes reassign_to (a profile that takes over its clients) or force. effective_tools lists the access verdict of every tool under profile id, optionally narrowed by client, server or reason. explain says why tool (server:tool) is or is not reachable for client, or for profile id. move_clients rebinds every client of profile from to profile to (\"\" = All servers), optionally setting mode locked or switchable; bind one client with manage_clients update. Errors carry the REST error body.", ProfileManagementRequest{}, []string{"list", "get", "create", "update", "delete", "rename", "effective_tools", "explain", "move_clients"}},
+		{"manage_peers", "Manage peers", "Manage execution peers. create/rotate return the connection token. A peer with servers or clients must be emptied before deletion.", PeerManagementRequest{}, []string{"list", "create", "rotate", "delete"}},
+		{"manage_secrets", "Manage secrets", "List secret references and their users, or set/delete a secret. Values are never included in activity records.", SecretManagementRequest{}, []string{"list", "set", "delete"}},
+		{"manage_tools", "Manage tools", "Inspect tools and review definitions, approve the definitions you reviewed, enable/disable tools, and classify unannotated tools. Approval requires expected_hashes and the expected_incarnation from the review. classify takes server, tool, tier (read, write, destructive, or empty to clear), expected_hash (the classification_hash from list) and expected_incarnation (the server_incarnation from list).", ToolManagementRequest{}, []string{"list", "review", "approve", "set_enabled", "classify"}},
+		{"manage_activity", "Read activity", "Read activity, call details and usage. list supports server/tool/client/profile/status/time filters and pagination. usage window is 24h, 7d or all.", ActivityManagementRequest{}, []string{"list", "get", "sessions", "usage"}},
 	}
 }
 func managementDecode(raw json.RawMessage, target any) error {
@@ -211,6 +212,12 @@ func (s *Server) ManagementOperation(ctx context.Context, name string, raw json.
 		case "delete":
 			return managementOK(svc.Delete(ctx, managementActor(ctx), q.ID))
 		}
+	case "manage_profiles":
+		var q ProfileManagementRequest
+		if err := managementDecode(raw, &q); err != nil {
+			return nil, err
+		}
+		return s.manageProfiles(ctx, q)
 	case "manage_peers":
 		var q PeerManagementRequest
 		if err := managementDecode(raw, &q); err != nil {

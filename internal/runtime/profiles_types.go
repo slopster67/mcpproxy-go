@@ -7,8 +7,8 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/profile"
 )
 
-// The wire types of the profiles REST surface. REST, the CLI
-// (-o json), the MCP `profiles` tool, the Web UI and the macOS app all read
+// The wire types of the profiles REST surface. REST, the MCP
+// manage_profiles tool and the Web UI all read
 // these shapes; the field names here are the contract (contracts/rest-api.md).
 
 // ToolCounts is the number of a profile's VISIBLE tools by the tier the profile

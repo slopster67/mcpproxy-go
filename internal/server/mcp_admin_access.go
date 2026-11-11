@@ -34,10 +34,6 @@ func (p *MCPProxyServer) managementContext(ctx context.Context) (context.Context
 	current.AllowManaging, current.AllowCodeExecution = manage, execute
 	return auth.WithAuthContext(ctx, &current), true
 }
-func (p *MCPProxyServer) adminToolAccess(ctx context.Context) (admin, visible bool) {
-	_, allowed := p.managementContext(ctx)
-	return allowed, allowed
-}
 func (p *MCPProxyServer) clientAllowsCodeExecution(ctx context.Context) bool {
 	_, execute := p.clientPermissions(ctx)
 	return execute

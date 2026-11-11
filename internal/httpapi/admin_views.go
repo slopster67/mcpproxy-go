@@ -8,7 +8,7 @@ import (
 	internalRuntime "github.com/slopster67/mcpproxy-go/internal/runtime"
 )
 
-// The admin read views the REST handlers and the MCP `profiles` tool share. Each returns the REST `data` object for an administrator
+// The admin read views the REST handlers and the MCP management tools share. Each returns the REST `data` object for an administrator
 // caller, so one implementation answers both surfaces and a field added to a
 // REST response reaches MCP without a second edit. Errors map through
 // ProfilesErrorBody.

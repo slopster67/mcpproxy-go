@@ -101,10 +101,10 @@ type MCPProxyServer struct {
 	// every request recompiles.
 	sigCache *toolsig.Cache
 
-	// profilesViews is the REST server's admin views behind the `profiles`
-	// tool, installed by SetAdminViews. While nil every operation answers 503.
-	profilesViewsMu sync.RWMutex
-	profilesViews   profilesAdminViews
+	// adminOps is the REST server's management operations behind the
+	// management tools, installed by SetAdminViews.
+	adminOpsMu sync.RWMutex
+	adminOps   managementOperations
 
 	// preflightStateSource overrides the connection-state snapshot the
 	// preflight glue reads. When nil, preflightSnapshot resolves it from the

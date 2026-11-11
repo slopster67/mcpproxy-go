@@ -7,8 +7,7 @@ import (
 )
 
 // ClientsListData is the `data` of GET /clients?profile=&client= as a generic
-// JSON object ({clients, routing, warnings}). The MCP `profiles` tool's
-// list_clients returns it without routing and the config paths.
+// JSON object ({clients, routing, warnings}). manage_clients list returns it.
 func (s *Server) ClientsListData(ctx context.Context, profileFilter, clientFilter string) (map[string]any, error) {
 	resp, err := s.clientsListResponse(ctx, profileFilter, clientFilter)
 	if err != nil {

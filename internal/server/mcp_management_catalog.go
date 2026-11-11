@@ -17,7 +17,7 @@ import (
 // Management tools share discovery and dispatch contracts with upstream tools,
 // but authorization comes from the live client capability, never its profile.
 func (p *MCPProxyServer) managementTools() []mcpserver.ServerTool {
-	return append(p.buildManagementTools(), p.buildProfilesServerTool())
+	return p.buildManagementTools()
 }
 
 func isDirectManagementTool(name string) bool {
@@ -135,8 +135,5 @@ func (p *MCPProxyServer) callManagementTool(ctx context.Context, name string, ar
 	}
 	request := mcp.CallToolRequest{}
 	request.Params.Name, request.Params.Arguments = name, args
-	if name == profilesToolName {
-		return p.handleProfiles(ctx, request)
-	}
 	return p.handleManagement(ctx, request)
 }

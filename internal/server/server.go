@@ -971,8 +971,7 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	httpAPIServer.SetProfilesService(s.runtime.ProfilesService())
 	httpAPIServer.SetOAuthConsent(s.oauth)
 	httpAPIServer.RegisterChangeHydrators(s.runtime.Changes())
-	// the `profiles` admin MCP tool reads the same admin views the
-	// REST routes do (one implementation,).
+	// The MCP management tools run the same operations as the REST routes.
 	s.mcpProxy.SetAdminViews(httpAPIServer)
 	// Wire the sensitive-data masker so an activity record the detector flagged
 	// never serves the credential it flagged. Same config as the

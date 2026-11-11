@@ -16,10 +16,21 @@ type managementOperations interface {
 	ManagementOperation(context.Context, string, json.RawMessage) (any, error)
 }
 
+// SetAdminViews installs the REST server's management operations behind the
+// management tools (called where the REST server is wired in server.go).
+func (p *MCPProxyServer) SetAdminViews(v managementOperations) {
+	p.adminOpsMu.Lock()
+	p.adminOps = v
+	p.adminOpsMu.Unlock()
+}
+
+func (p *MCPProxyServer) adminViews() managementOperations {
+	p.adminOpsMu.RLock()
+	defer p.adminOpsMu.RUnlock()
+	return p.adminOps
+}
+
 func isManagementTool(name string) bool {
-	if name == profilesToolName {
-		return true
-	}
 	for _, spec := range httpapi.ManagementToolSpecs() {
 		if name == spec.Name {
 			return true
@@ -34,7 +45,7 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 		schema := jsonSchemaForType(reflect.TypeOf(spec.Input))
 		properties := schema["properties"].(map[string]any)
 		properties["operation"].(map[string]any)["enum"] = spec.Operations
-		tool := newProxyTool(spec.Name, mcp.WithDescription(spec.Description), mcp.WithDestructiveHintAnnotation(true), mcp.WithReadOnlyHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(false), func(t *mcp.Tool) {
+		tool := newProxyTool(spec.Name, mcp.WithDescription(spec.Description), mcp.WithTitleAnnotation(spec.Title), mcp.WithToolTitle(spec.Title), mcp.WithDestructiveHintAnnotation(true), mcp.WithReadOnlyHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(false), func(t *mcp.Tool) {
 			t.InputSchema.Properties = properties
 			t.InputSchema.Required = []string{"operation"}
 			t.InputSchema.AdditionalProperties = false
@@ -56,7 +67,7 @@ func (p *MCPProxyServer) handleManagement(ctx context.Context, request mcp.CallT
 	var data any
 	var err error
 	var result *mcp.CallToolResult
-	if service, ok := p.adminViews().(managementOperations); ok {
+	if service := p.adminViews(); service != nil {
 		var raw json.RawMessage
 		raw, err = json.Marshal(args)
 		if err == nil {

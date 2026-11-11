@@ -14,7 +14,7 @@ Rotating a token replaces it immediately and retains the client's permission.
 | --- | --- |
 | `manage_servers` | List/read, create, patch, delete, enable/disable, restart, OAuth sign-in/out, logs, convert environment/header values to secrets |
 | `manage_clients` | List/read, create, update profile/host/switching/client permissions, rotate token, delete |
-| `profiles` | List/read, create, update, rename, delete, assign clients, inspect effective tools, explain access |
+| `manage_profiles` | List/read, create, update, rename, delete, inspect effective tools, explain access, move every client of one profile to another |
 | `manage_peers` | List, create, rotate token, delete |
 | `manage_secrets` | List references and usage, set a secret store value, delete |
 | `manage_tools` | List full definitions and usage, inspect reviews/diffs, approve reviewed definitions, enable/disable, classify unannotated tools |

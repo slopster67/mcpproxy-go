@@ -11,7 +11,7 @@ import (
 
 // requestError is a refusal of a shared admin operation that carries its own
 // HTTP status (a malformed request the service never sees). REST writes it with
-// that status and the MCP `profiles` tool reports only its message.
+// that status and the MCP management tools report only its message.
 type requestError struct {
 	status int
 	msg    string
@@ -23,7 +23,7 @@ func (e *requestError) Error() string { return e.msg }
 // or an admin view to the REST error status and the error body WITHOUT the REST
 // envelope (`success` and `request_id`). It is the single mapping behind every
 // profile and client-binding refusal: the REST writers add the envelope, and the
-// MCP `profiles` tool returns the body as its error text, so the two
+// MCP manage_profiles tool returns the body as its error text, so the two
 // surfaces cannot drift.
 //
 // The keys are {error, code?, field?, used_by?, bindings?, fixes?}. An error the
