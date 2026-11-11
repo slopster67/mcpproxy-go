@@ -261,6 +261,42 @@
         </Button>
       </div>
 
+      <!-- With peers, servers are grouped by the host they run on. -->
+      <div v-else-if="peers.hasPeers" class="flex flex-col gap-8">
+        <section
+          v-for="group in hostGroups"
+          :key="group.id"
+          class="flex min-w-0 flex-col gap-3"
+          :data-host-id="group.id"
+        >
+          <header class="flex min-w-0 items-center gap-2">
+            <span
+              v-if="group.peer"
+              class="size-2 shrink-0 rounded-full"
+              :class="group.peer.online ? 'bg-[var(--server-status-green)]' : 'bg-white'"
+              :title="group.peer.online ? 'Online' : 'Offline'"
+            />
+            <h2 class="truncate text-base font-medium">{{ group.name }}</h2>
+            <span
+              v-if="group.peer && !group.peer.online && group.peer.last_seen"
+              class="text-xs text-muted-foreground"
+              >last seen {{ formatRelative(group.peer.last_seen) }}</span
+            >
+          </header>
+          <TransitionGroup
+            name="server-list"
+            tag="div"
+            class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3"
+          >
+            <ServerCard
+              v-for="server in group.servers"
+              :key="server.name"
+              :server="server"
+            />
+          </TransitionGroup>
+        </section>
+      </div>
+
       <!-- Servers Grid with Smooth Transitions -->
       <TransitionGroup
         v-else
@@ -295,6 +331,9 @@ import { useScopeQuery } from "@/composables/useScopeQuery";
 import { useServersStore } from "@/stores/servers";
 import { useSystemStore } from "@/stores/system";
 import { useProfilesStore } from "@/stores/profiles";
+import { usePeersStore } from "@/stores/peers";
+import { formatRelative } from "@/utils/datetime";
+import type { Peer } from "@/types/api";
 import api from "@/services/api";
 import { onLive } from "@/services/events";
 import type { Server } from "@/types";
@@ -306,6 +345,7 @@ import { serverDisplayName } from "@/utils/serverRoute";
 const serversStore = useServersStore();
 const systemStore = useSystemStore();
 const profilesStore = useProfilesStore();
+const peers = usePeersStore();
 const route = useRoute();
 const router = useRouter();
 const addServerOpen = computed({
@@ -432,6 +472,7 @@ onMounted(async () => {
   applySearchQuery();
   void serversStore.ensureLoaded();
   void profilesStore.ensureLoaded();
+  void peers.ensureLoaded();
   if (profileActive.value) await loadScoped(false);
 });
 watch(() => [route.query.status, route.query.q], applySearchQuery);
@@ -471,4 +512,21 @@ const filteredServers = computed(() => {
   );
 });
 
+
+// The filtered servers by host (Primary first, then each peer), only used when
+// peers exist. Hosts without a matching server are left out.
+const hostGroups = computed(() => {
+  const hosts: { id: string; name: string; peer?: Peer }[] = [
+    { id: "", name: "Primary" },
+    ...peers.items.map((peer) => ({ id: peer.id, name: peer.name, peer })),
+  ];
+  return hosts
+    .map((host) => ({
+      ...host,
+      servers: filteredServers.value.filter(
+        (server) => (server.host_id || "") === host.id,
+      ),
+    }))
+    .filter((group) => group.servers.length > 0);
+});
 </script>

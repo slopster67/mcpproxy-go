@@ -69,7 +69,6 @@
           >{{ lastUsedText }}</span
         >
 
-        <span v-if="server.host_id" class="min-w-0 truncate text-[11px] text-muted-foreground" :title="server.host_online === false ? 'Offline' : undefined">{{server.host_name}}{{server.host_online === false ? ' · offline':''}}</span>
         <span
           v-if="cardStatus.error"
           class="ml-auto min-w-0 truncate text-xs text-destructive"

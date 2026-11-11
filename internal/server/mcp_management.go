@@ -50,19 +50,9 @@ func (p *MCPProxyServer) handleManagement(ctx context.Context, request mcp.CallT
 	}
 	start := time.Now()
 	args := request.GetArguments()
-	// Arguments and results can contain secrets and newly minted tokens. The
-	// audit entry records the operation and outcome, never either payload.
-	operation := "unknown"
-	for _, spec := range httpapi.ManagementToolSpecs() {
-		if spec.Name == request.Params.Name {
-			for _, op := range spec.Operations {
-				if request.GetString("operation", "") == op {
-					operation = op
-				}
-			}
-		}
-	}
-	safeArgs := map[string]any{"operation": operation}
+	// Arguments and results can contain secrets and newly minted tokens, so the
+	// audit entry records them with every credential redacted.
+	safeArgs := redactedManagementMap(args)
 	var data any
 	var err error
 	var result *mcp.CallToolResult
@@ -92,6 +82,12 @@ func (p *MCPProxyServer) handleManagement(ctx context.Context, request mcp.CallT
 		status = "error"
 		errText = "Management operation failed"
 	}
-	p.emitActivityInternalToolCall(ctx, request.Params.Name, "", "", "", sessionIDFromContext(ctx), mintCorrelationID(request.Params.Name), status, errText, time.Since(start).Milliseconds(), safeArgs, nil, nil, "")
+	if !isSubCallActivity(ctx) {
+		var safeResult any
+		if err == nil {
+			safeResult = redactManagementJSON(data)
+		}
+		p.emitActivityInternalToolCall(ctx, request.Params.Name, "", "", "", sessionIDFromContext(ctx), mintCorrelationID(request.Params.Name), status, errText, time.Since(start).Milliseconds(), safeArgs, safeResult, nil, "")
+	}
 	return result, nil
 }

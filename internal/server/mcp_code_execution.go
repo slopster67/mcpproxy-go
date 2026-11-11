@@ -16,6 +16,7 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/contracts"
 	"github.com/slopster67/mcpproxy-go/internal/jsruntime"
+	"github.com/slopster67/mcpproxy-go/internal/oauth"
 	"github.com/slopster67/mcpproxy-go/internal/profile"
 	"github.com/slopster67/mcpproxy-go/internal/reqcontext"
 	"github.com/slopster67/mcpproxy-go/internal/storage"
@@ -1209,28 +1210,46 @@ func (u *upstreamToolCaller) callManagement(ctx context.Context, name string, ar
 	if !u.proxy.clientAllowsCodeExecution(ctx) {
 		return nil, fmt.Errorf("code execution is not allowed")
 	}
-	result, err := u.proxy.callManagementTool(ctx, name, args, contracts.ToolVariantDestructive)
-	if err != nil {
-		return nil, err
-	}
-	if result.IsError {
+	start := time.Now()
+	result, err := u.proxy.callManagementTool(withSubCallActivity(ctx), name, args, contracts.ToolVariantDestructive)
+	if err == nil && result.IsError {
+		err = fmt.Errorf("management operation failed")
 		for _, content := range result.Content {
 			if text, ok := content.(mcp.TextContent); ok {
-				return nil, fmt.Errorf("%s", text.Text)
+				err = fmt.Errorf("%s", text.Text)
+				break
 			}
 		}
-		return nil, fmt.Errorf("management operation failed")
+	}
+	// Recorded as a sub-call of the script, with credentials redacted.
+	var recorded any
+	if err == nil {
+		recorded = redactManagementJSON(result.Content)
+	}
+	duration := time.Since(start)
+	u.emitSubCallActivity(ctx, config.ManagementServerName, name, mintCorrelationID(config.ManagementServerName, name), redactedManagementMap(args), recorded, err, start, duration)
+	u.recordToolCall(config.ManagementServerName, name, start, duration, err == nil, errorText(err))
+	if err != nil {
+		return nil, err
 	}
 	return result, nil
 }
 
-// A script can embed a secret in its source/input or return a new client token.
-// Keep the actual result for its caller, but omit these payloads from history.
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// A script that used administration tools can pass a secret in its input or
+// return a newly minted client token, so its history entry is recorded with
+// credentials redacted. The caller still gets the actual result.
 func (u *upstreamToolCaller) executionRecord(code, script, language string, input map[string]interface{}, response interface{}) (map[string]interface{}, interface{}) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.managementUsed {
-		return map[string]interface{}{"management": true}, "Management execution payload omitted"
+		return codeExecRecordArguments(oauth.MaskDetectedSecrets(code), script, language, redactedManagementMap(input)), redactManagementJSON(response)
 	}
 	return codeExecRecordArguments(code, script, language, input), response
 }
@@ -1245,7 +1264,7 @@ func (u *upstreamToolCaller) markManagementUsed() {
 func (u *upstreamToolCaller) ObserveRefusal(report jsruntime.CallRefusal) {
 	if report.ServerName == config.ManagementServerName {
 		u.markManagementUsed()
-		report.Arguments = nil
+		report.Arguments = redactedManagementMap(report.Arguments)
 		report.Message = "Management call denied"
 	}
 	startedAt := time.Now()

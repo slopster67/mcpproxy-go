@@ -29,13 +29,7 @@
           scopeQuery.set({ client: String($event) || undefined })
         "
         ><option value="">All clients</option>
-        <option
-          v-for="client in clientsStore.items"
-          :key="client.id"
-          :value="client.id"
-        >
-          {{ client.display_name }}
-        </option></NativeSelect
+        <HostGroupedOptions :items="clientsStore.items" :value="(client) => client.id" :label="(client) => client.display_name" /></NativeSelect
       >
       <NativeSelect
         v-model="status"
@@ -192,6 +186,7 @@
 
 <script setup lang="ts">
 import ServerIcon from "@/components/ServerIcon.vue";
+import HostGroupedOptions from "@/components/HostGroupedOptions.vue";
 import { ChartNoAxesCombined, X } from "@lucide/vue";
 import { CardAction, CardHeader, CardTitle } from "@/components/ui/card";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";

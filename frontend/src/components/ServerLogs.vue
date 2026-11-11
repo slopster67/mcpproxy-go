@@ -22,7 +22,7 @@
             <span v-else />
             <time :datetime="row.entry.timestamp" :title="row.entry.timestamp" class="cursor-text tabular-nums text-muted-foreground">{{ row.time }}</time>
             <span class="cursor-text" :class="levelColor(row.entry.level)">{{ row.entry.level }}</span>
-            <span class="min-w-0 cursor-text whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{{ row.entry.message }}<template v-if="row.error">: {{ row.error }}</template></span>
+            <span class="min-w-0 cursor-text whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{{ row.text }}<template v-if="row.error">: {{ row.error }}</template></span>
           </div>
           <JsonCode v-if="expanded.has(row.key)" :data="row.details" class="mx-5 mb-2 cursor-text border border-border/50" />
         </div>
@@ -69,8 +69,13 @@ const rows = computed(() => {
     const occurrence = occurrences.get(record) ?? 0
     occurrences.set(record, occurrence + 1)
     const error = typeof entry.fields?.error === 'string' && !entry.message.includes(entry.fields.error) ? entry.fields.error : ''
-    const details = Object.fromEntries(Object.entries(entry.fields ?? {}).filter(([key]) => key !== 'error' || !error))
-    return { entry, error, details, key: `${record}:${occurrence}`, hasFields: Object.keys(details).length > 0, time: timeFormat.format(new Date(entry.timestamp)) }
+    // A line a child process printed (stderr, launcher output) carries its text
+    // in a field: show it inline after the label instead of behind a click.
+    const childLine = entry.fields?.child_output === true && typeof entry.fields.message === 'string' ? entry.fields.message : ''
+    const text = childLine ? `${entry.message}: ${childLine}` : entry.message
+    const details = Object.fromEntries(Object.entries(entry.fields ?? {}).filter(([key]) =>
+      (key !== 'error' || !error) && !(childLine && (key === 'message' || key === 'child_output'))))
+    return { entry, error, text, details, key: `${record}:${occurrence}`, hasFields: Object.keys(details).length > 0, time: timeFormat.format(new Date(entry.timestamp)) }
   }).reverse().sort((a, b) => Date.parse(b.entry.timestamp) - Date.parse(a.entry.timestamp))
 })
 const visibleRows = computed(() => {

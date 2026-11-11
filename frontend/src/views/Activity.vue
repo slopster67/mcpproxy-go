@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import ServerIcon from "@/components/ServerIcon.vue";
+import HostGroupedOptions from "@/components/HostGroupedOptions.vue";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { usePeersStore } from "@/stores/peers";
@@ -41,6 +42,15 @@ const servers = useServersStore(),
   clients = useClientsStore(),
   sessions = useSessionsStore();
 const { valueLabel } = useScopeLabels();
+// "(peer)" after a client or server chip, only when peers exist.
+function chipHost(name: string, value: string) {
+  if (!peers.hasPeers) return "";
+  const entity =
+    name === "client" ? clients.byId.get(value)
+    : name === "server" ? servers.byId.get(value)
+    : undefined;
+  return entity ? ` (${peers.label(entity.host_id)})` : "";
+}
 function clientName(row: { client_id?: string; client_name?: string }) {
   return clients.labelFor(row.client_id, row.client_name || (row.client_id ? 'Deleted client' : '—'));
 }
@@ -261,13 +271,7 @@ onUnmounted(() => {
         aria-label="Server"
         @change="setFilter('server', $event)"
         ><option value="">All servers</option>
-        <option
-          v-for="server in servers.items"
-          :key="server.name"
-          :value="server.name"
-        >
-          {{ server.name }}
-        </option></NativeSelect
+        <HostGroupedOptions :items="servers.items" :value="(server) => server.name" :label="(server) => server.name" /></NativeSelect
       >
       <NativeSelect
         v-if="view !== 'sessions'"
@@ -314,13 +318,7 @@ onUnmounted(() => {
                 :model-value="scope.state.client || ''"
                 @change="setFilter('client', $event)"
                 ><option value="">All clients</option>
-                <option
-                  v-for="client in clients.items"
-                  :key="client.id"
-                  :value="client.id"
-                >
-                  {{ client.display_name }}
-                </option></NativeSelect
+                <HostGroupedOptions :items="clients.items" :value="(client) => client.id" :label="(client) => client.display_name" /></NativeSelect
               ></Field
             >
             <template v-if="view !== 'sessions'"
@@ -364,7 +362,7 @@ onUnmounted(() => {
     >
       <Badge v-for="chip in visibleChips" :key="chip.name" variant="secondary"
         ><ServerIcon v-if="chip.name === 'server'" :name="chip.value" />{{ chip.label }}: {{ chip.name === 'client' || chip.name === 'profile' ? valueLabel(chip.name, chip.value) : chip.value
-        }}<button :aria-label="`Clear ${chip.label}`" @click="chip.remove">
+        }}{{ chipHost(chip.name, chip.value) }}<button :aria-label="`Clear ${chip.label}`" @click="chip.remove">
           <X class="size-3" /></button></Badge
       ><Badge v-for="chip in extraChips" :key="chip.key" variant="secondary"
         >{{ chip.key === "parent_id" ? "Sub-calls" : "Request"
