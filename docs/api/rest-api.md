@@ -147,7 +147,7 @@ Every route below serves the authenticated admin dashboard and works with one
 the same JSON field names `PATCH` accepts (`url`, `protocol`, `command`,
 `args`, `working_dir`, `env`, `headers`, the full `oauth` block including
 `mode` and `client_secret`, `enabled`, `trust_mode`, `host_id`,
-`available_to_peers`, `icon`, …) — flattened together with read-only runtime
+`available_to_peers`, `icon`, `description`, …) — flattened together with read-only runtime
 fields. Values are not masked and secret references such as
 `${secret:name}` stay references (they are not resolved). Responses carrying
 server objects use `Cache-Control: no-store`.

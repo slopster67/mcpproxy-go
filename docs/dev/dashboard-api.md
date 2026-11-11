@@ -33,7 +33,7 @@ answer the server object.
 
 | Entity | id | Writable via PATCH | Actions |
 |---|---|---|---|
-| `servers` | name | every config field (url, protocol, command, args, working_dir, env, headers, oauth, enabled, trust_mode, host_id, available_to_peers, icon, …) | `restart`, `login`, `logout`, `config-to-secret`; `GET /servers/{id}/oauth/discovered`, `GET /servers/{id}/logs` (reads) |
+| `servers` | name | every config field (url, protocol, command, args, working_dir, env, headers, oauth, enabled, trust_mode, host_id, available_to_peers, icon, description, …) | `restart`, `login`, `logout`, `config-to-secret`; `GET /servers/{id}/oauth/discovered`, `GET /servers/{id}/logs` (reads) |
 | `tools` | `server:tool` (URL-encoded; split at the first colon) | `enabled`, `classification` (+ `expected_hash`, `expected_incarnation`) | `approve`, `block` (hash-checked, per server: `POST /servers/{id}/tools/approve|block`) |
 | `clients` | client id | `display_name`, `profile`, `mode`, `host_id`, `allow_managing`, `allow_code_execution` | `rotate` |
 | `peers` | peer id | — (no PATCH) | `rotate` |

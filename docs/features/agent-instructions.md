@@ -66,6 +66,14 @@ it already holds until it re-lists or reconnects. `retrieve_tools` results and
 tool calls always follow the new profile.
 :::
 
+### Describing a server
+
+A server can carry an optional one-line `description` (up to 100 characters),
+set from the server page or when adding a server. Wherever the server is listed
+by name, the description follows it: `adrafinil (to prevent my mac from sleeping)`.
+Descriptions are plain single-line text and are not advertised when server names
+are turned off.
+
 ### Turning server names off
 
 Set `MCPPROXY_ADVERTISE_UPSTREAM_SERVERS=false` to keep server names out of client

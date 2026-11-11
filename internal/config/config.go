@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/slopster67/mcpproxy-go/internal/dashboardauth"
 	"github.com/slopster67/mcpproxy-go/internal/secret"
@@ -300,11 +302,32 @@ const (
 	TrustModeManual TrustMode = "manual"
 )
 
+// MaxServerDescription is the longest server description, in characters.
+const MaxServerDescription = 100
+
+// NormalizeServerDescription trims a server description and checks it: one line
+// of at most MaxServerDescription characters. Descriptions are shown to agents
+// beside the server name, so control characters (including newlines) are
+// refused. An empty result means no description.
+func NormalizeServerDescription(description string) (string, error) {
+	description = strings.TrimSpace(description)
+	if utf8.RuneCountInString(description) > MaxServerDescription {
+		return "", fmt.Errorf("description must be at most %d characters", MaxServerDescription)
+	}
+	for _, r := range description {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("description must be a single line of plain text")
+		}
+	}
+	return description, nil
+}
+
 // ServerConfig represents upstream MCP server configuration
 type ServerConfig struct {
 	HostID           *string           `json:"host_id,omitempty"`
 	AvailableToPeers *bool             `json:"available_to_peers,omitempty"`
 	Icon             *string           `json:"icon,omitempty"`
+	Description      *string           `json:"description,omitempty"` // Shown to agents beside the server name; at most MaxServerDescription characters
 	Name             string            `json:"name,omitempty"`
 	URL              string            `json:"url,omitempty"`
 	Protocol         string            `json:"protocol,omitempty"` // stdio, http, sse, streamable-http, auto
@@ -877,6 +900,11 @@ func (c *Config) validateDetailedCore() []ValidationError {
 		// carrying a typo ("Scan", "yolo") would otherwise behave as manual while
 		// every read surface echoed the typo back as if it were a real mode.
 		// Surface it as a validation error instead. Empty = inherit (valid).
+		if server.Description != nil {
+			if _, err := NormalizeServerDescription(*server.Description); err != nil {
+				errors = append(errors, ValidationError{Field: fieldPrefix + ".description", Message: err.Error()})
+			}
+		}
 		if server.Icon != nil {
 			if err := servericon.Validate(*server.Icon); err != nil {
 				errors = append(errors, ValidationError{Field: fieldPrefix + ".icon", Message: err.Error()})

@@ -195,6 +195,40 @@
                     <Globe v-else class="size-4" aria-hidden="true" />
                     {{ server.protocol === "stdio" ? "stdio" : "Remote" }}
                   </dd>
+                  <dt class="text-muted-foreground">Description</dt>
+                  <dd class="flex min-w-0 items-start gap-1">
+                    <template v-if="editingDescription">
+                      <textarea
+                        ref="descriptionInputRef"
+                        v-model="descriptionDraft"
+                        rows="1"
+                        aria-label="Server description"
+                        placeholder="What agents use this server for"
+                        autocomplete="off"
+                        maxlength="100"
+                        class="-my-1 w-full min-w-0 max-w-md resize-none overflow-hidden rounded-2xl border border-transparent bg-input/50 px-3 py-1.5 text-sm leading-5 outline-none transition-[color,box-shadow,background-color] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/30 disabled:opacity-50"
+                        :disabled="kvPatchInFlight"
+                        @input="onDescriptionInput"
+                        @blur="saveDescription"
+                        @keydown.enter.prevent="saveDescription"
+                        @keydown.esc.prevent="cancelDescription"
+                      />
+                      <span class="ml-2 w-12 shrink-0 text-right text-xs leading-5 tabular-nums text-muted-foreground">{{ descriptionDraft.length }}/100</span>
+                    </template>
+                    <template v-else>
+                      <span v-if="server.description" class="min-w-0 break-words leading-5">{{ server.description }}</span>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        class="-my-1 size-7 shrink-0"
+                        :class="server.description ? '' : '-ml-1.5'"
+                        aria-label="Edit description"
+                        title="Edit description"
+                        @click="startEditDescription"
+                        ><Pencil class="size-4" aria-hidden="true"
+                      /></Button>
+                    </template>
+                  </dd>
                 </dl>
               </CardContent>
             </Card>
@@ -489,7 +523,7 @@ import ServerOAuthSettings from "@/components/ServerOAuthSettings.vue";
 import SegmentedControl from "@/components/SegmentedControl.vue";
 import ServerLogs from "@/components/ServerLogs.vue";
 import { ref, computed, nextTick, onMounted, watch } from "vue";
-import { RotateCw, LogIn, LogOut, Trash2, Globe, SquareTerminal } from "@lucide/vue";
+import { RotateCw, LogIn, LogOut, Trash2, Globe, SquareTerminal, Pencil } from "@lucide/vue";
 import { useRoute, useRouter } from "vue-router";
 import { useServersStore } from "@/stores/servers";
 import { useSystemStore } from "@/stores/system";
@@ -578,6 +612,50 @@ watch(
 const displayName = computed(() =>
   server.value ? serverDisplayName(server.value) : props.serverName,
 );
+
+// --- Description -----------------------------------------------------------
+// Optional, up to 100 characters; agents see it beside the server name.
+const editingDescription = ref(false);
+const descriptionDraft = ref("");
+const descriptionInputRef = ref<HTMLTextAreaElement | null>(null);
+// The field grows to fit wrapped text.
+function fitDescription() {
+  const el = descriptionInputRef.value;
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = `${el.scrollHeight}px`;
+}
+// A description is one line: newlines (typed or pasted) become spaces.
+function onDescriptionInput() {
+  descriptionDraft.value = descriptionDraft.value.replace(/\s*\n\s*/g, " ");
+  fitDescription();
+}
+function startEditDescription() {
+  descriptionDraft.value = server.value?.description ?? "";
+  editingDescription.value = true;
+  void nextTick(() => {
+    const el = descriptionInputRef.value;
+    fitDescription();
+    el?.focus();
+    el?.select();
+  });
+}
+function cancelDescription() {
+  editingDescription.value = false;
+}
+// Leaving the field unchanged closes it; a changed value is saved.
+async function saveDescription() {
+  if (!editingDescription.value || kvPatchInFlight.value) return;
+  const next = descriptionDraft.value.trim();
+  if (next === (server.value?.description ?? "")) {
+    editingDescription.value = false;
+    return;
+  }
+  if (await patchServerDiff({ description: next }, next ? "Updated description" : "Removed description")) {
+    editingDescription.value = false;
+  }
+}
+
 type ServerTab = "config" | "tools" | "logs";
 const activeTab = computed<ServerTab>({
   get: () => {

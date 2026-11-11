@@ -560,6 +560,7 @@ type AddServerRequest struct {
 	HostID           *string            `json:"host_id,omitempty"`
 	AvailableToPeers *bool              `json:"available_to_peers,omitempty"`
 	Icon             *string            `json:"icon,omitempty"`
+	Description      *string            `json:"description,omitempty"`
 	Name             string             `json:"name"`
 	URL              string             `json:"url,omitempty"`
 	Command          string             `json:"command,omitempty"`
@@ -665,6 +666,15 @@ func resolveServerPatch(serverName string, req *AddServerRequest, existingSrv *c
 			return nil, &patchError{status: http.StatusBadRequest, msg: err.Error()}
 		}
 		updates.Icon = &normalized
+		hasUpdates = true
+	}
+
+	if req.Description != nil {
+		normalized, err := config.NormalizeServerDescription(*req.Description)
+		if err != nil {
+			return nil, &patchError{status: http.StatusBadRequest, msg: err.Error()}
+		}
+		updates.Description = &normalized
 		hasUpdates = true
 	}
 

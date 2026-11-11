@@ -5,6 +5,10 @@
         <FieldLabel :for="ids.name">Name</FieldLabel>
         <Input :id="ids.name" v-model="name" required autocomplete="off" :disabled="submitting" />
       </Field>
+      <Field :data-disabled="submitting">
+        <FieldLabel :for="ids.description">Description</FieldLabel>
+        <Input :id="ids.description" v-model="description" maxlength="100" autocomplete="off" placeholder="What agents use it for (optional)" :disabled="submitting" />
+      </Field>
       <Field v-if="peers.hasPeers"><FieldLabel>Run on</FieldLabel><HostSelect v-model="host" :disabled="submitting" /></Field>
       <Field v-if="!host && (peers.hasPeers || shared)" orientation="horizontal"><FieldLabel for="server-share">Available to peers</FieldLabel><Switch id="server-share" v-model="shared" :disabled="submitting" /></Field>
       <Field :data-disabled="submitting">
@@ -90,6 +94,7 @@ const serversStore = useServersStore();
 const uid = useId();
 const ids = ref({
   name: `${uid}-name`,
+  description: `${uid}-description`,
   url: `${uid}-url`,
   command: `${uid}-command`,
   type: `${uid}-type`,
@@ -99,6 +104,7 @@ const ids = ref({
 const errorEl = ref<InstanceType<typeof FieldError> | null>(null);
 
 const name = ref("");
+const description = ref("");
 const host = ref("");
 const shared = ref(false);
 const protocol = ref<"stdio" | "http">("stdio");
@@ -156,6 +162,7 @@ async function handleSubmit() {
       enabled: true,
       trust_mode: trustMode.value,
     };
+    if (description.value.trim()) serverData.description = description.value.trim();
     if (protocol.value === "http") {
       serverData.url = url.value;
       if (Object.keys(resolved.headers).length > 0)

@@ -503,6 +503,13 @@ func applyServerUpdates(existing, updates *config.ServerConfig) {
 			existing.Icon = &icon
 		}
 	}
+	if updates.Description != nil {
+		if description := *updates.Description; description == "" {
+			existing.Description = nil
+		} else {
+			existing.Description = &description
+		}
+	}
 	if updates.URL != "" {
 		existing.URL = updates.URL
 	}

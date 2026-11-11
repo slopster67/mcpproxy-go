@@ -25,15 +25,18 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+    // The backend derives the dashboard's public origin (OIDC redirect URI and
+    // the Origin it accepts on writes) from the request's Host, so the proxy
+    // keeps the browser's Host (localhost:3000) instead of rewriting it.
     proxy: {
-      "/oauth/callback": { target: backendURL, changeOrigin: true },
-      "/auth": { target: backendURL, changeOrigin: true },
-      "/server-icons": { target: backendURL, changeOrigin: true },
+      "/oauth/callback": { target: backendURL, changeOrigin: false },
+      "/auth": { target: backendURL, changeOrigin: false },
+      "/server-icons": { target: backendURL, changeOrigin: false },
       // Includes the /api/v1/events change stream (SSE streams through the
       // plain HTTP proxy).
       "/api": {
         target: backendURL,
-        changeOrigin: true,
+        changeOrigin: false,
       },
     },
   },

@@ -53,21 +53,32 @@ func (s *Server) prepareServerCreate(req AddServerRequest, masked bool) (*config
 		}
 		req.Icon = &normalized
 	}
+	var description *string
+	if req.Description != nil {
+		normalized, err := config.NormalizeServerDescription(*req.Description)
+		if err != nil {
+			return nil, &requestError{http.StatusBadRequest, err.Error()}
+		}
+		if normalized != "" {
+			description = &normalized
+		}
+	}
 	if req.HostID != nil && *req.HostID != "" && !s.controller.GetPeerHub().Exists(*req.HostID) {
 		return nil, &requestError{400, "Unknown execution host"}
 	}
 	serverConfig := &config.ServerConfig{
 		HostID: req.HostID, AvailableToPeers: req.AvailableToPeers,
-		Name:       req.Name,
-		Icon:       req.Icon,
-		URL:        req.URL,
-		Command:    req.Command,
-		Args:       req.Args,
-		Env:        flattenNullableMap(req.Env),
-		Headers:    flattenNullableMap(req.Headers),
-		WorkingDir: req.WorkingDir,
-		Protocol:   protocol,
-		Enabled:    enabled,
+		Name:        req.Name,
+		Icon:        req.Icon,
+		Description: description,
+		URL:         req.URL,
+		Command:     req.Command,
+		Args:        req.Args,
+		Env:         flattenNullableMap(req.Env),
+		Headers:     flattenNullableMap(req.Headers),
+		WorkingDir:  req.WorkingDir,
+		Protocol:    protocol,
+		Enabled:     enabled,
 	}
 
 	if req.TrustMode != "" {

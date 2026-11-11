@@ -49,6 +49,8 @@ export interface Server {
  available_to_peers?: boolean
   icon_url?: string;
   icon_uploaded?: boolean;
+  /** Optional note (up to 100 characters) shown to agents beside the server name. */
+  description?: string;
   name: string
   /**
    * Committed config generation and incarnation The

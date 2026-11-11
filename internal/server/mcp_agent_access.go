@@ -27,6 +27,9 @@ type callerAccess struct {
 	// Servers are the reachable upstream servers (enabled, approved,
 	// connected, in scope), sorted, capped at maxAdvertisedServers.
 	Servers []string
+	// Descriptions maps a listed server to its optional description, which is
+	// shown beside the name.
+	Descriptions map[string]string
 	// More counts reachable servers beyond the cap.
 	More int
 	// Tiers are the operation tiers a call may use, in ascending order.
@@ -80,6 +83,7 @@ func (p *MCPProxyServer) callerAccessFor(ctx context.Context) callerAccess {
 		names = names[:maxAdvertisedServers]
 	}
 	access.Servers = names
+	access.Descriptions = p.serverDescriptions(names)
 	return access
 }
 
@@ -154,9 +158,38 @@ func (p *MCPProxyServer) scanReachableServers() []string {
 	return names
 }
 
-// serverListText renders "a, b, c (+N more)".
+// serverDescriptions returns the configured descriptions of the named servers.
+func (p *MCPProxyServer) serverDescriptions(names []string) map[string]string {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		return nil
+	}
+	listed := make(map[string]bool, len(names))
+	for _, name := range names {
+		listed[name] = true
+	}
+	descriptions := make(map[string]string)
+	for _, server := range cfg.Servers {
+		if server == nil || server.Description == nil || !listed[server.Name] {
+			continue
+		}
+		if description := strings.TrimSpace(*server.Description); description != "" {
+			descriptions[server.Name] = description
+		}
+	}
+	return descriptions
+}
+
+// serverListText renders "a (what it is for), b, c (+N more)".
 func (a callerAccess) serverListText() string {
-	text := strings.Join(a.Servers, ", ")
+	entries := make([]string, len(a.Servers))
+	for i, name := range a.Servers {
+		entries[i] = name
+		if description := a.Descriptions[name]; description != "" {
+			entries[i] += " (" + description + ")"
+		}
+	}
+	text := strings.Join(entries, ", ")
 	if a.More > 0 {
 		if text != "" {
 			text += ", "
