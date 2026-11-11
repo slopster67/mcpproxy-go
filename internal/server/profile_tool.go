@@ -27,6 +27,7 @@ func buildSetProfileTool() mcp.Tool {
 			"on the base /mcp endpoint without re-indexing. Pass an empty string to clear the selection and go "+
 			"back to all servers. A locked client cannot switch away from its assigned profile."),
 		mcp.WithTitleAnnotation("Set Profile"),
+		mcp.WithToolTitle("Set Profile"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(false),

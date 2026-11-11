@@ -70,6 +70,7 @@ func buildProfilesTool() mcp.Tool {
 			"Operations: list, get, create, update (full replace), delete, rename, assign (one client to a profile, or bulk from_profile to to_profile), list_clients, effective_tools, explain. " +
 			"Requires the client’s Allow managing MCPProxy permission; errors carry the REST error body."),
 		mcp.WithTitleAnnotation("Manage profiles and client bindings"),
+		mcp.WithToolTitle("Manage profiles and client bindings"),
 		mcp.WithReadOnlyHintAnnotation(false),
 		mcp.WithDestructiveHintAnnotation(true),
 		mcp.WithIdempotentHintAnnotation(false),

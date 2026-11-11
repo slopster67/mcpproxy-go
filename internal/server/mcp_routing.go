@@ -256,6 +256,7 @@ func renderFullDirectTool(entry *directCatalogEntry, description string) mcp.Too
 	if entry.Annotations != nil {
 		if entry.Annotations.Title != "" {
 			opts = append(opts, mcp.WithTitleAnnotation(entry.Annotations.Title))
+			opts = append(opts, mcp.WithToolTitle(entry.Annotations.Title))
 		}
 		if entry.Annotations.ReadOnlyHint != nil {
 			opts = append(opts, mcp.WithReadOnlyHintAnnotation(*entry.Annotations.ReadOnlyHint))
@@ -685,6 +686,7 @@ func (p *MCPProxyServer) buildCodeExecModeTools() []mcpserver.ServerTool {
 			"Response includes a structured `session_risk` object (level, lethal_trifecta, has_open_world_tools, has_destructive_tools, has_write_tools)." +
 			retrieveToolsReachNote + retrieveToolsDiagnosticsNote),
 		mcp.WithTitleAnnotation("Retrieve Tools"),
+		mcp.WithToolTitle("Retrieve Tools"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(false),
@@ -729,6 +731,7 @@ func (p *MCPProxyServer) buildCallToolModeTools() []mcpserver.ServerTool {
 			"Use natural language to describe what you want to accomplish." +
 			retrieveToolsReachNote + retrieveToolsDiagnosticsNote),
 		mcp.WithTitleAnnotation("Retrieve Tools"),
+		mcp.WithToolTitle("Retrieve Tools"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(false),
@@ -779,6 +782,7 @@ func (p *MCPProxyServer) buildCallToolModeTools() []mcpserver.ServerTool {
 	readCacheTool := mcp.NewTool("read_cache",
 		mcp.WithDescription("Retrieve paginated data when mcpproxy indicates a tool response was truncated. Use the cache key provided in truncation messages."),
 		mcp.WithTitleAnnotation("Read Cache"),
+		mcp.WithToolTitle("Read Cache"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(false),
@@ -813,6 +817,7 @@ func (p *MCPProxyServer) buildCodeExecutionTool() []mcpserver.ServerTool {
 	codeExecutionTool := mcp.NewTool("code_execution",
 		mcp.WithDescription(codeExecutionToolDescription),
 		mcp.WithTitleAnnotation("Code Execution"),
+		mcp.WithToolTitle("Code Execution"),
 		mcp.WithDestructiveHintAnnotation(true),
 		mcp.WithReadOnlyHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(true),

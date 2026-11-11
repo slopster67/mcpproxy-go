@@ -75,6 +75,7 @@ func buildDescribeToolTool() mcp.Tool {
 	return mcp.NewTool("describe_tool",
 		mcp.WithDescription("Return full JSON Schema + long description for listed tools. Use when a signature is marked lossy ('~') or you need the exact schema before calling. With check:true it returns one availability verdict per id, not schemas ('ready', or a reason code with retryable/action), to gate a plan before its first call."),
 		mcp.WithTitleAnnotation("Describe Tool"),
+		mcp.WithToolTitle("Describe Tool"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(false),

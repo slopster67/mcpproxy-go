@@ -626,6 +626,7 @@ func buildCallToolVariantTool(variant string) mcp.Tool {
 	allOpts := []mcp.ToolOption{
 		mcp.WithDescription(description),
 		mcp.WithTitleAnnotation(title),
+		mcp.WithToolTitle(title),
 	}
 	allOpts = append(allOpts, opts...)
 	allOpts = append(allOpts,
@@ -693,6 +694,7 @@ func (p *MCPProxyServer) registerTools() {
 	retrieveToolsOpts := []mcp.ToolOption{
 		mcp.WithDescription("🔍 CALL THIS FIRST to discover relevant tools! This is the primary tool discovery mechanism that searches across ALL upstream MCP servers using intelligent BM25 full-text search. Always use this before attempting to call any specific tools. Use natural language to describe what you want to accomplish (e.g., 'create GitHub repository', 'query database', 'weather forecast'). Results include 'annotations' (tool behavior hints like destructiveHint) and 'call_with' recommendation indicating which tool variant to use (call_tool_read/write/destructive). Then use the recommended variant with an 'intent' parameter. Compact mode returns one-line signatures ('sig': '*'=required, '~'=lossy) with first-sentence 'desc'; call describe_tool for full schemas. New and changed tools require approval before use. TO ADD NEW SERVERS:" + retrieveToolsReachNote + retrieveToolsDiagnosticsNote),
 		mcp.WithTitleAnnotation("Retrieve Tools"),
+		mcp.WithToolTitle("Retrieve Tools"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(false),
@@ -733,6 +735,7 @@ func (p *MCPProxyServer) registerTools() {
 	readCacheTool := mcp.NewTool("read_cache",
 		mcp.WithDescription("Retrieve paginated data when mcpproxy indicates a tool response was truncated. Use the cache key provided in truncation messages to access the complete dataset with pagination."),
 		mcp.WithTitleAnnotation("Read Cache"),
+		mcp.WithToolTitle("Read Cache"),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(false),
