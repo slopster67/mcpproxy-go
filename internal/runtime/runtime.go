@@ -812,6 +812,7 @@ func (r *Runtime) Servers() ([]contracts.Server, error) {
 
 	result := make([]contracts.Server, 0, len(snapshot.Servers))
 	snapGens := committed.gens()
+	seen := make(map[string]struct{}, len(snapshot.Servers))
 	for _, serverStatus := range snapshot.Servers {
 		// A server the committed snapshot does not configure is a removed server the view has not caught up
 		// with; listing it would offer unbound rows (no incarnation).
@@ -819,6 +820,14 @@ func (r *Runtime) Servers() ([]contracts.Server, error) {
 			continue
 		}
 		serverStatus = committed.pairStatus(serverStatus)
+		seen[serverStatus.Name] = struct{}{}
+		result = append(result, r.buildServer(serverStatus, snapGens, oauthExpiryWarningHours))
+	}
+	// A create is committed before the supervisor reconciles it into the
+	// StateView. create/list/get all read this list, so a server that exists
+	// only in the snapshot must still be returned — not connected, no tools —
+	// instead of "server not found".
+	for _, serverStatus := range committed.unreconciled(seen) {
 		result = append(result, r.buildServer(serverStatus, snapGens, oauthExpiryWarningHours))
 	}
 
@@ -1113,6 +1122,46 @@ func (v committedView) pairStatus(st *stateview.ServerStatus) *stateview.ServerS
 	paired.Enabled = cs.Enabled
 
 	return &paired
+}
+
+// unreconciled returns a status for every committed server the StateView does
+// not already list. seen holds those names; names returned here are added to
+// it so a duplicate config entry is listed once. The status carries the
+// committed config and incarnation and no tools.
+func (v committedView) unreconciled(seen map[string]struct{}) []*stateview.ServerStatus {
+	if v.snap == nil || v.snap.Config == nil {
+		return nil
+	}
+	var out []*stateview.ServerStatus
+	for _, server := range v.snap.Config.Servers {
+		if server == nil || server.Name == "" {
+			continue
+		}
+		if _, ok := seen[server.Name]; ok {
+			continue
+		}
+		cs := config.CopyServerConfig(server)
+		if cs == nil {
+			continue
+		}
+		status := &stateview.ServerStatus{
+			Name:    cs.Name,
+			Config:  cs,
+			Enabled: cs.Enabled,
+		}
+		if g, ok := v.snap.ServerGeneration(cs.Name); ok {
+			status.Incarnation = g.Incarnation
+		}
+		// Reconcile publishes "connecting" for an enabled server it has no
+		// connection info for yet. Match that so the row does not flash
+		// "disconnected" in the gap.
+		if cs.Enabled {
+			status.State = "connecting"
+		}
+		seen[cs.Name] = struct{}{}
+		out = append(out, status)
+	}
+	return out
 }
 
 func (r *Runtime) GetServerTools(serverName string) ([]map[string]interface{}, error) {
