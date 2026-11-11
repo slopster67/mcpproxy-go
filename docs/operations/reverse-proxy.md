@@ -138,8 +138,10 @@ Both endpoint families always require a credential:
   (see [Dashboard OIDC](../features/dashboard-oidc.md)). Writes also check CSRF
   and `Origin`, so the proxy must pass the original `Host` and `Origin` headers.
 - **MCP endpoint (`/mcp`)** — a client token created on the **Clients** page,
-  sent as `Authorization: Bearer <token>`. A browser session is never an MCP
-  credential.
+  sent as `Authorization: Bearer <token>`, or an OAuth access token from
+  [client sign-in](../features/client-sign-in.md). A browser session is never an
+  MCP credential. Route `/.well-known/` and `/oauth/` to the primary too, so MCP
+  clients can discover and complete sign-in.
 
 ## Related
 

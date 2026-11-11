@@ -21,6 +21,7 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/dashboardauth"
 	"github.com/slopster67/mcpproxy-go/internal/httpapi"
 	"github.com/slopster67/mcpproxy-go/internal/management"
+	"github.com/slopster67/mcpproxy-go/internal/mcpauth"
 	"github.com/slopster67/mcpproxy-go/internal/oauth"
 	"github.com/slopster67/mcpproxy-go/internal/peering"
 	"github.com/slopster67/mcpproxy-go/internal/runtime"
@@ -40,6 +41,7 @@ type Status struct {
 
 type Server struct {
 	dashboardAuth         *dashboardauth.Manager
+	oauth                 *mcpauth.Server
 	logger                *zap.Logger
 	runtime               *runtime.Runtime
 	createAfterConfigRead func(name string)
@@ -92,6 +94,8 @@ func NewServer(cfg *config.Config, logger *zap.Logger) (*Server, error) {
 		runtime:       rt,
 		serveErrCh:    make(chan error, 1),
 	}
+	server.oauth = mcpauth.New(rt.StorageManager().GetDatabase().AuthenticationKey(), rt.StorageManager(), rt.Peers())
+	rt.Peers().AuthenticateBearer = server.oauth.AuthenticatePeer
 
 	// Replace the diagnostics package's placeholder fixers with the real,
 	// runtime-backed ones (see diagnostics_fixers.go). builtin_fixers.go has
@@ -164,13 +168,15 @@ func (s *Server) installProfilePublishObserver(mcpProxy *MCPProxyServer) *profil
 	return notifier
 }
 
-// mcpAuthMiddleware admits only credentials issued to saved clients.
+// mcpAuthMiddleware admits only credentials issued to saved clients: their
+// static client token or an OAuth access token issued for them. A client's
+// assigned host decides where its calls run, whichever address it entered by.
 func (s *Server) mcpAuthMiddleware(next http.Handler) http.Handler {
 	next = directRequestKindMiddleware(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := httpapi.ExtractToken(r)
-		if !strings.HasPrefix(token, auth.ClientTokenPrefixStr) {
-			http.Error(w, `{"error":"A client token is required"}`, http.StatusUnauthorized)
+		if token == "" {
+			mcpauth.Challenge(w, r, false, "Sign in or use a client token")
 			return
 		}
 		cfg := s.runtime.Config()
@@ -178,23 +184,25 @@ func (s *Server) mcpAuthMiddleware(next http.Handler) http.Handler {
 			http.Error(w, `{"error":"Server not ready"}`, http.StatusServiceUnavailable)
 			return
 		}
-		key := s.runtime.StorageManager().GetDatabase().AuthenticationKey()
-		record, err := s.runtime.StorageManager().ValidateClientToken(token, key)
-		if err != nil {
-			http.Error(w, `{"error":"Invalid client token"}`, http.StatusUnauthorized)
-			return
-		}
-		entryHost := ""
-		if peerToken := r.Header.Get(peering.Header); peerToken != "" {
-			peer, ok := s.runtime.Peers().Authenticate(peerToken)
-			if !ok || !s.runtime.Peers().Online(peer.ID) {
-				http.Error(w, "Peer is not connected", http.StatusUnauthorized)
+		var record *auth.ClientCredential
+		kind := auth.CredentialKindClientToken
+		switch {
+		case strings.HasPrefix(token, auth.ClientTokenPrefixStr):
+			key := s.runtime.StorageManager().GetDatabase().AuthenticationKey()
+			var err error
+			if record, err = s.runtime.StorageManager().ValidateClientToken(token, key); err != nil {
+				http.Error(w, `{"error":"Invalid client token"}`, http.StatusUnauthorized)
 				return
 			}
-			entryHost = peer.ID
-		}
-		if record.HostID != entryHost {
-			http.Error(w, "Client token belongs to a different host", http.StatusForbidden)
+		case strings.HasPrefix(token, mcpauth.AccessPrefix):
+			var ok bool
+			if record, ok = s.oauth.AuthenticateClient(token); !ok {
+				mcpauth.Challenge(w, r, true, "The access token is invalid, expired or revoked")
+				return
+			}
+			kind = auth.CredentialKindOAuth
+		default:
+			mcpauth.Challenge(w, r, true, "A client token or OAuth access token is required")
 			return
 		}
 		go func() {
@@ -203,6 +211,7 @@ func (s *Server) mcpAuthMiddleware(next http.Handler) http.Handler {
 			}
 		}()
 		caller := record.AuthContext()
+		caller.CredentialKind = kind
 		caller.ServerAvailable = func(name string) bool { return s.mcpProxy.hostAllows(caller, name) }
 		next.ServeHTTP(w, r.WithContext(auth.WithAuthContext(r.Context(), caller)))
 	})
@@ -960,6 +969,7 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	// the profiles service behind /profiles and /access/explain
 	// (both editions: profiles are admin-owned config in either).
 	httpAPIServer.SetProfilesService(s.runtime.ProfilesService())
+	httpAPIServer.SetOAuthConsent(s.oauth)
 	httpAPIServer.RegisterChangeHydrators(s.runtime.Changes())
 	// the `profiles` admin MCP tool reads the same admin views the
 	// REST routes do (one implementation,).
@@ -992,6 +1002,8 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	// The upstream OAuth callback dispatcher requires a
 	// live, single-use state and never initiates a sign-in itself.
 	mux.HandleFunc(config.OAuthRemoteCallbackPrefix, s.oauthCallback)
+	// MCP client and peer sign-in (OAuth authorization server).
+	s.oauth.Register(mux)
 
 	webUIHandler := web.NewHandler(s.logger.Sugar())
 	selectiveProtectedWebUIHandler := httpAPIServer.ProtectUI(http.StripPrefix("/ui", webUIHandler))

@@ -12,8 +12,8 @@ All settings come from environment variables and built-in defaults. There are no
 configuration flags or JSON files. Settings are fixed at startup; restart after
 changing them. See [the complete settings inventory](../../SETTINGS.md).
 
-Only the encryption key, the OIDC settings, peer token, trusted hosts and peer
-primary URL accept `_FILE` inputs. Other settings are direct environment values only. Use one nonempty source
+Only the encryption key, the OIDC settings, peer token and peer primary URL
+accept `_FILE` inputs. Other settings are direct environment values only. Use one nonempty source
 per setting. File values are read at startup, without exporting their contents
 into the environment. Trailing line endings are removed. Credential files must
 not be world-readable. Unreadable, empty or non-regular files fail startup.
@@ -30,7 +30,6 @@ export MCPPROXY_ENCRYPTION_KEY_FILE=/run/agenix/mcpproxy-key
 export MCPPROXY_OIDC_ISSUER=https://id.example.com
 export MCPPROXY_OIDC_CLIENT_ID=mcpproxy
 export MCPPROXY_OIDC_CLIENT_SECRET_FILE=/run/agenix/mcpproxy-oidc-secret
-export MCPPROXY_OIDC_REDIRECT_URL=https://mcp.example.com/auth/callback
 mcpproxy serve
 ```
 
@@ -44,13 +43,19 @@ are never written there. Scripts live in `<data-dir>/scripts`.
 export MCPPROXY_DATA_DIR=/var/lib/mcpproxy-peer
 export MCPPROXY_LISTEN=127.0.0.1:8080
 export MCPPROXY_PEER_PRIMARY_URL=https://mcp.example.com
+# Optional; omit it to sign the peer in through the browser instead.
 export MCPPROXY_PEER_TOKEN_FILE=/run/agenix/mcpproxy-peer-token
 mcpproxy peer
 ```
 
+Without a peer token, open the peer's address (by default
+`http://127.0.0.1:8080/`) in a browser on the same machine and choose which
+peer it is. See [Client and peer sign-in](../features/client-sign-in.md).
+
 Peer data defaults to `~/.mcpproxy-peer`; it has no settings file, encrypted
-primary database or dashboard. Peer credentials and server grants remain in
-memory. The primary URL must be an HTTP(S) origin without path or credentials.
+primary database or dashboard. Server grants and upstream credentials remain in
+memory. A browser sign-in keeps only its refresh token, in
+`<data-dir>/peer-credential.json` (owner-only). The primary URL must be an HTTP(S) origin without path or credentials.
 
 Both modes default to `127.0.0.1:8080`, console logging at `info`, and a file-log
 directory of `<data-dir>/logs` when `MCPPROXY_LOG_TO_FILE=true`.

@@ -86,8 +86,10 @@ process that has already unlocked the store.
 ## Peers
 
 Peers do not open any credential database or load the primary's encryption key.
-Supply only their bootstrap credential through `MCPPROXY_PEER_TOKEN` or `MCPPROXY_PEER_TOKEN_FILE`.
-For agenix, point the file option at the decrypted runtime secret. Set only one
+Supply their bootstrap credential through `MCPPROXY_PEER_TOKEN` or `MCPPROXY_PEER_TOKEN_FILE`,
+or leave both unset and sign the peer in through the browser. A browser sign-in
+stores only a refresh token in `<data-dir>/peer-credential.json` with owner-only
+permissions. For agenix, point the file option at the decrypted runtime secret. Set only one
 token source. File permissions follow the same no-world-read rule as key files.
 
 The primary sends the secret values and OAuth state needed by each peer's

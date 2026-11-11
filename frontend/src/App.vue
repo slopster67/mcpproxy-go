@@ -1,6 +1,9 @@
 <template>
   <div id="app" class="relative">
-    <SidebarProvider v-if="authStore.isAuthenticated" class="min-h-svh md:h-svh md:min-h-0 md:overflow-hidden md:[@media(any-pointer:coarse)]:h-auto md:[@media(any-pointer:coarse)]:min-h-svh md:[@media(any-pointer:coarse)]:overflow-visible">
+    <main v-if="authStore.isAuthenticated && bare" class="min-h-svh p-4 sm:p-8">
+      <router-view />
+    </main>
+    <SidebarProvider v-else-if="authStore.isAuthenticated" class="min-h-svh md:h-svh md:min-h-0 md:overflow-hidden md:[@media(any-pointer:coarse)]:h-auto md:[@media(any-pointer:coarse)]:min-h-svh md:[@media(any-pointer:coarse)]:overflow-visible">
       <SidebarNav v-if="authStore.shellPresented" />
       <MobileSidebarInset class="min-h-svh min-w-0 md:h-[calc(100svh-1rem)] md:min-h-0 md:overflow-hidden md:[@media(any-pointer:coarse)]:h-auto md:[@media(any-pointer:coarse)]:min-h-[calc(100svh-1rem)] md:[@media(any-pointer:coarse)]:overflow-visible">
         <header v-if="authStore.shellPresented" class="sticky top-0 z-30 flex h-14 shrink-0 items-center gap-3 border-b bg-background px-4 md:hidden">
@@ -16,7 +19,7 @@
       </MobileSidebarInset>
     </SidebarProvider>
 
-    <CommandPalette v-if="authStore.shellPresented" />
+    <CommandPalette v-if="authStore.shellPresented && !bare" />
 
     <!-- Toast Notifications -->
     <Toaster theme="dark" />
@@ -31,7 +34,8 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue';
+import { computed, onMounted, onUnmounted } from 'vue';
+import { useRoute } from 'vue-router';
 import { SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar';
 import SidebarNav from '@/components/SidebarNav.vue';
 import MobileSidebarInset from '@/components/MobileSidebarInset.vue';
@@ -45,6 +49,9 @@ import { useSystemStore } from '@/stores/system';
 import { useAuthStore } from '@/stores/auth';
 import { setUnauthorizedHandler } from '@/services/api';
 
+const route = useRoute();
+// Pages such as the sign-in consent render without the dashboard shell.
+const bare = computed(() => route.meta.bare === true);
 const systemStore = useSystemStore();
 const authStore = useAuthStore();
 function sessionLost() {

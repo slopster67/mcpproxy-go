@@ -23,6 +23,8 @@ import (
 	"github.com/mark3labs/mcp-go/v2/mcp"
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
+	"github.com/slopster67/mcpproxy-go/internal/httpx"
+	"github.com/slopster67/mcpproxy-go/internal/mcpauth"
 	"github.com/slopster67/mcpproxy-go/internal/oauth"
 	"github.com/slopster67/mcpproxy-go/internal/peering"
 	"github.com/slopster67/mcpproxy-go/internal/secret"
@@ -58,6 +60,16 @@ type Agent struct {
 	settings     map[string]*config.ServerConfig
 	calls        map[string]context.CancelFunc
 	locks        map[string]*sync.Mutex
+
+	// OAuth sign-in (used when no static peer token is configured).
+	credMu        sync.Mutex
+	credChanged   chan struct{}
+	refreshToken  string
+	accessToken   string
+	accessExpires time.Time
+	peerID        string
+	peerName      string
+	signins       map[string]signin
 }
 
 func Run(ctx context.Context, cfg *config.Config, logger *zap.Logger) error {
@@ -78,7 +90,8 @@ func Run(ctx context.Context, cfg *config.Config, logger *zap.Logger) error {
 	transport.ResponseHeaderTimeout = 15 * time.Second
 	controlClient := &http.Client{Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	defer controlClient.CloseIdleConnections()
-	a := &Agent{versions: map[string]int64{}, assigned: map[string]bool{}, cfg: cfg, url: remote, client: controlClient, logger: logger, tokens: map[string]*storage.MemoryOAuth{}, resolvers: map[string]*secret.Resolver{}, secrets: map[string]map[string]string{}, processID: uuid.NewString(), global: global, servers: map[string]*managed.Client{}, settings: map[string]*config.ServerConfig{}, calls: map[string]context.CancelFunc{}, locks: map[string]*sync.Mutex{}}
+	a := &Agent{versions: map[string]int64{}, assigned: map[string]bool{}, cfg: cfg, url: remote, client: controlClient, logger: logger, tokens: map[string]*storage.MemoryOAuth{}, resolvers: map[string]*secret.Resolver{}, secrets: map[string]map[string]string{}, processID: uuid.NewString(), global: global, servers: map[string]*managed.Client{}, settings: map[string]*config.ServerConfig{}, calls: map[string]context.CancelFunc{}, locks: map[string]*sync.Mutex{}, credChanged: make(chan struct{}, 1), signins: map[string]signin{}}
+	a.loadCredential()
 	a.refresh = oauth.NewRefreshManager(a, oauth.GetGlobalCoordinator(), logger)
 	a.refresh.SetRuntime(a)
 	oauth.GetTokenStoreManager().SetTokenSavedBoundCallback(func(name string, expires time.Time, binding commitview.CredentialBinding) {
@@ -117,6 +130,9 @@ func Run(ctx context.Context, cfg *config.Config, logger *zap.Logger) error {
 	go func() { defer close(controlDone); a.controlLoop(controlCtx) }()
 	defer func() { cancel(); <-controlDone }()
 	logger.Info("Peer MCP endpoint listening", zap.String("listen", listener.Addr().String()))
+	if !a.signedIn() {
+		logger.Warn("Peer is not signed in to the primary; open this address in a browser on this machine to sign in", zap.String("url", a.localURL()))
+	}
 	select {
 	case <-ctx.Done():
 	case err = <-errorsCh:
@@ -138,13 +154,24 @@ func (a *Agent) mcpHandler() http.Handler {
 		director(r)
 		r.URL.Path = strings.TrimSuffix(target.Path, "/") + "/mcp"
 		r.Host = target.Host
-		r.Header.Set(peering.Header, a.cfg.PeerToken)
 	}
+	proxy.ModifyResponse = rewriteChallenge
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "Primary unavailable", http.StatusServiceUnavailable)
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", a.handleHome)
+	mux.HandleFunc("GET /oauth/start", a.handleSigninStart)
+	mux.HandleFunc("GET /assets/geist.woff2", handleFont)
+	mux.HandleFunc("GET "+mcpauth.PeerCallbackPath, a.handleSigninCallback)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", a.handleProtectedResource)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", a.handleProtectedResource)
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", a.handleAuthorizationServer)
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		if !a.signedIn() {
+			http.Error(w, "Peer is not signed in to the primary. Open "+a.localURL()+" on this machine to sign in.", http.StatusServiceUnavailable)
+			return
+		}
 		if !a.online.Load() {
 			http.Error(w, "Primary unavailable", http.StatusServiceUnavailable)
 			return
@@ -156,7 +183,7 @@ func (a *Agent) mcpHandler() http.Handler {
 			http.Error(w, "Primary unavailable", 503)
 			return
 		}
-		requestCtx, stop := context.WithCancel(r.Context())
+		requestCtx, stop := context.WithCancel(context.WithValue(r.Context(), originKey{}, httpx.PublicOrigin(r)))
 		defer stop()
 		detach := context.AfterFunc(session, stop)
 		defer detach()
@@ -180,7 +207,11 @@ func (a *Agent) post(ctx context.Context, f peering.Frame) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.cfg.PeerToken)
+	token, err := a.bearer(ctx)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	response, err := a.client.Do(req)
 	if err != nil {
@@ -195,6 +226,14 @@ func (a *Agent) post(ctx context.Context, f peering.Frame) error {
 func (a *Agent) controlLoop(ctx context.Context) {
 	delay := time.Second
 	for ctx.Err() == nil {
+		if !a.signedIn() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-a.credChanged:
+			}
+			continue
+		}
 		attempt := time.Now()
 		err := a.control(ctx)
 		if a.connectedAt.After(attempt) {
@@ -211,6 +250,10 @@ func (a *Agent) controlLoop(ctx context.Context) {
 		case <-ctx.Done():
 			timer.Stop()
 			return
+		case <-a.credChanged:
+			timer.Stop()
+			delay = time.Second
+			continue
 		case <-timer.C:
 		}
 		if delay < 15*time.Second {
@@ -225,13 +268,20 @@ func (a *Agent) control(parent context.Context) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.cfg.PeerToken)
+	token, err := a.bearer(ctx)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-MCPProxy-Peer-Process", a.processID)
 	response, err := a.client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized {
+		a.invalidateAccess()
+	}
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("primary rejected connection (%d)", response.StatusCode)
 	}
@@ -242,6 +292,14 @@ func (a *Agent) control(parent context.Context) error {
 	defer a.online.Store(false)
 	a.connectedAt = time.Now()
 	a.logger.Info("Connected to primary")
+	// A new sign-in or sign-out replaces this stream's credential.
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-a.credChanged:
+			cancel()
+		}
+	}()
 	hello, _ := json.Marshal(a.hello())
 	if err = a.post(ctx, peering.Frame{Op: "hello", Data: hello}); err != nil {
 		return err
@@ -282,6 +340,13 @@ func (a *Agent) control(parent context.Context) error {
 		var f peering.Frame
 		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &f) != nil {
 			return fmt.Errorf("invalid control frame")
+		}
+		if f.Op == "welcome" {
+			var welcome peering.Welcome
+			if json.Unmarshal(f.Data, &welcome) == nil {
+				a.setIdentity(welcome)
+			}
+			continue
 		}
 		if f.Op == "cancel" {
 			a.mu.Lock()

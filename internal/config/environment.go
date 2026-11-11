@@ -201,10 +201,8 @@ func loadEnvironment(mode Mode, input map[string]string) (*Config, error) {
 		if err != nil || remote.Host == "" || remote.User != nil || (remote.Path != "" && remote.Path != "/") || remote.RawQuery != "" || remote.Fragment != "" || (remote.Scheme != "https" && remote.Scheme != "http") {
 			return nil, fmt.Errorf("MCPPROXY_PEER_PRIMARY_URL must be an HTTP(S) origin")
 		}
+		// Without a static token the peer signs in through the browser.
 		cfg.PeerToken = strings.TrimSpace(cfg.PeerToken)
-		if cfg.PeerToken == "" {
-			return nil, fmt.Errorf("MCPPROXY_PEER_TOKEN or MCPPROXY_PEER_TOKEN_FILE is required")
-		}
 	}
 	return cfg, nil
 }

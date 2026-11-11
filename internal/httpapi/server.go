@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/slopster67/mcpproxy-go/internal/dashboardauth"
+	"github.com/slopster67/mcpproxy-go/internal/mcpauth"
 	"go.uber.org/zap"
 
 	"github.com/slopster67/mcpproxy-go/internal/config"
@@ -113,6 +114,7 @@ type ServerController interface {
 // Server provides HTTP API endpoints with chi router
 type Server struct {
 	dashboardAuth *dashboardauth.Manager
+	oauthConsent  *mcpauth.Server
 	controller    ServerController
 	logger        *zap.SugaredLogger
 	httpLogger    *zap.Logger // Separate logger for HTTP requests
@@ -333,6 +335,7 @@ func (s *Server) setupRoutes() {
 
 			s.registerClientRoutes(r)
 			s.registerPeerRoutes(r)
+			s.registerOAuthConsentRoutes(r)
 
 			r.Get("/profiles", s.handleListProfiles)
 			r.Post("/profiles", s.handleCreateProfile)

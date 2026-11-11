@@ -2,12 +2,14 @@
 
 The dashboard and REST API use OpenID Connect browser sign-in. There is no admin
 API key, bearer-token login, URL credential or anonymous administration mode.
-MCP clients and peers continue to use their own generated tokens.
+MCP clients and peers use their own generated tokens or
+[sign in through the dashboard](client-sign-in.md).
 
 Configure an OIDC application in Pocket ID or another standards-compliant provider:
 
-1. Register an application with this exact redirect URI:
-   `https://mcp.example.com/auth/callback`.
+1. Register `<address>/auth/callback` as a redirect URI for every address you
+   open the dashboard on, for example `https://mcp.example.com/auth/callback`
+   and, for local use, `http://localhost:8080/auth/callback`.
 2. Allow the users who should administer MCPProxy to access that application.
    **Every user admitted by this application has full administrator access.**
 3. Supply all provider details through the daemon's environment:
@@ -16,11 +18,10 @@ Configure an OIDC application in Pocket ID or another standards-compliant provid
 export MCPPROXY_OIDC_ISSUER=https://id.example.com
 export MCPPROXY_OIDC_CLIENT_ID=your-application-client-id
 export MCPPROXY_OIDC_CLIENT_SECRET=your-application-client-secret
-export MCPPROXY_OIDC_REDIRECT_URL=https://mcp.example.com/auth/callback
 ```
 
 `MCPPROXY_OIDC_CLIENT_SECRET` can be omitted for a public client if the provider
-supports it. All other fields are required when any OIDC variable is set.
+supports it. The issuer and client ID are required.
 Incomplete or invalid settings prevent primary startup. If all OIDC variables are absent,
 dashboard sign-in stays unavailable; it never enables anonymous administration.
 
@@ -48,9 +49,11 @@ peer connections still work; the dashboard reports that sign-in is not configure
 inaccessible.
 
 Use HTTPS for both the issuer and callback in deployment. HTTP is accepted only
-on loopback for local development. The callback URL is explicit rather than
-inferred from request headers. A reverse proxy must route `/auth/`, `/ui/`,
-`/api/` (including the `/api/v1/events` stream) and `/mcp` to the primary. In Vite development, register
+on loopback for local development. The callback URL is built from the address of
+the request that started sign-in (its Host and, behind a TLS-terminating proxy,
+`X-Forwarded-Proto`), so the same primary works on its public and local
+addresses. A reverse proxy must route `/auth/`, `/ui/`, `/api/` (including the
+`/api/v1/events` stream), `/mcp`, `/oauth/` and `/.well-known/` to the primary. In Vite development, register
 `http://localhost:3000/auth/callback` and access the UI on that same origin.
 
 UI responses include `Content-Security-Policy: frame-ancestors 'none'` to prevent
@@ -92,17 +95,19 @@ and [Go OAuth2](https://pkg.go.dev/golang.org/x/oauth2).
 | None | `/healthz`, `/readyz`, root redirect `/`, `/ui/favicon.svg`, `/server-icons/{asset}`, `/auth/login`, unauthenticated status from `/auth/session`, CORS preflight |
 | OIDC browser session | Dashboard documents and assets under `/ui/` except the favicon, all `/api/v1/*` (including `/api/v1/events`), signed-in user/CSRF details from `/auth/session`, `/auth/logout` |
 | OIDC authorization flow | `/auth/callback`: browser-bound single-use state, authorization code, PKCE and verified ID token; creates the browser session |
-| Client bearer token | `/mcp`; includes management tools only for clients with management permission |
-| Peer bearer token | `/peer/control`, the primary/peer control channel |
-| Client token plus peer credential | `/mcp` requests forwarded by a peer: client bearer token plus the peer's `X-MCPProxy-Peer-Token`; both and the client's assigned host are checked |
+| None (OAuth discovery and token exchange) | `/.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server[/oauth/peers/{peer}]`, `/oauth/register`, `/oauth/token` (code + PKCE, or refresh token) |
+| OIDC browser session (consent) | `/oauth/authorize` and `/oauth/peers/{peer}/authorize` start a sign-in that is approved on `/ui/oauth/authorize` |
+| Client token or client OAuth token | `/mcp`, directly or forwarded unchanged by a peer; includes management tools only for clients with management permission. The client's assigned host decides where its calls run |
+| Peer token or peer OAuth token | `/peer/control`, the primary/peer control channel |
 | Upstream OAuth flow | `/oauth/callback/{server}` and temporary local callback listeners: valid outstanding single-use OAuth state/code; no dashboard session required |
 
 Dashboard writes and sign-out also require CSRF protection. HTTPS is terminated
 by your reverse proxy; MCPProxy itself serves HTTP only.
 
-A peer's own HTTP listener exposes only `/mcp`, authenticated by its assigned
-client tokens through the primary. It has no dashboard, API, probe or callback
-routes. Health aliases `/health`, `/livez`, `/ready` and bare dashboard route
+A peer's own HTTP listener exposes `/mcp` (authenticated by the primary), the
+OAuth discovery documents that point MCP clients at the primary, and its own
+sign-in pages (`/`, `/oauth/start`, `/oauth/callback`). It has no dashboard, API
+or probe routes. Health aliases `/health`, `/livez`, `/ready` and bare dashboard route
 aliases have been removed.
 
 Unauthenticated UI asset requests return `401`, while document navigations

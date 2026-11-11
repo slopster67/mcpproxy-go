@@ -42,6 +42,9 @@ type Hub struct {
 	ServerChanged     func(string, string)
 	PrepareConnection func(context.Context, string, *Connection) error
 	SaveCredentials   func(context.Context, string, string, Frame) (any, error)
+	// AuthenticateBearer resolves an OAuth access token to a peer ID and the
+	// token's expiry. Static mcp_peer_ tokens are checked by the hub itself.
+	AuthenticateBearer func(string) (string, time.Time, bool)
 }
 
 func NewHub(db *database.DB) *Hub {
@@ -98,7 +101,7 @@ func (h *Hub) List() ([]Peer, error) {
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return err
 			}
-			p.TokenHash = ""
+			p.TokenHash, p.OAuthSession = "", ""
 			peers = append(peers, p)
 			return nil
 		})
@@ -120,7 +123,7 @@ func (h *Hub) Get(id string) (Peer, error) {
 	if err != nil {
 		return Peer{}, err
 	}
-	p.TokenHash = ""
+	p.TokenHash, p.OAuthSession = "", ""
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if c := h.connections[id]; c != nil {
@@ -187,6 +190,50 @@ func (h *Hub) Delete(id string) error {
 	}
 	return err
 }
+
+// CredentialHash fingerprints the peer's static token and current OAuth
+// sign-in. OAuth grants are bound to it, so rotating the token or signing the
+// peer in on another machine revokes them.
+func (h *Hub) CredentialHash(id string) (string, bool) {
+	p, err := h.read(id)
+	return p.TokenHash + "|" + p.OAuthSession, err == nil && p.TokenHash != ""
+}
+
+// StartOAuthSession records a new browser sign-in for the peer, replacing the
+// previous one.
+func (h *Hub) StartOAuthSession(id string) error {
+	h.credentials.Lock()
+	defer h.credentials.Unlock()
+	p, err := h.read(id)
+	if err != nil {
+		return err
+	}
+	session, err := newToken()
+	if err != nil {
+		return err
+	}
+	p.OAuthSession = tokenHash(session)
+	return h.save(p)
+}
+
+// authenticate accepts a static peer token or an OAuth access token. The
+// returned expiry is zero for static tokens.
+func (h *Hub) authenticate(token string) (Peer, time.Time, bool) {
+	if strings.HasPrefix(token, "mcp_peer_") {
+		p, ok := h.Authenticate(token)
+		return p, time.Time{}, ok
+	}
+	if h.AuthenticateBearer == nil {
+		return Peer{}, time.Time{}, false
+	}
+	id, expires, ok := h.AuthenticateBearer(token)
+	if !ok {
+		return Peer{}, time.Time{}, false
+	}
+	p, err := h.read(id)
+	return p, expires, err == nil
+}
+
 func (h *Hub) Authenticate(token string) (Peer, bool) {
 	if !strings.HasPrefix(token, "mcp_peer_") || len(token) != 73 {
 		return Peer{}, false
@@ -306,7 +353,7 @@ func (h *Hub) Listen(server string, callback func(Frame)) func() {
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.credentials.RLock()
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	peer, ok := h.Authenticate(token)
+	peer, expires, ok := h.authenticate(token)
 	if !ok {
 		h.credentials.RUnlock()
 		http.Error(w, "Invalid peer token", http.StatusUnauthorized)
@@ -315,7 +362,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		h.credentials.RUnlock()
-		h.stream(w, r, peer)
+		h.stream(w, r, peer, expires)
 	case http.MethodPost:
 		defer h.credentials.RUnlock()
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(20 * time.Second))
@@ -394,7 +441,14 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
-func (h *Hub) stream(w http.ResponseWriter, r *http.Request, p Peer) {
+
+// Welcome is the first frame of a control stream: it tells the peer who it is.
+type Welcome struct {
+	PeerID string `json:"peer_id"`
+	Name   string `json:"name"`
+}
+
+func (h *Hub) stream(w http.ResponseWriter, r *http.Request, p Peer, expires time.Time) {
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -425,9 +479,19 @@ func (h *Hub) stream(w http.ResponseWriter, r *http.Request, p Peer) {
 		h.disconnectIf(p.ID, c)
 		h.touch(p.ID)
 	}()
-	fmt.Fprint(w, ": connected\n\n")
+	welcome, _ := json.Marshal(Welcome{PeerID: p.ID, Name: p.Name})
+	hello, _ := json.Marshal(Frame{Op: "welcome", Data: welcome})
+	fmt.Fprintf(w, ": connected\n\ndata: %s\n\n", hello)
 	if rc.Flush() != nil {
 		return
+	}
+	// A stream opened with an OAuth access token ends when the token expires;
+	// the peer reconnects with a refreshed one.
+	var expired <-chan time.Time
+	if !expires.IsZero() {
+		timer := time.NewTimer(time.Until(expires))
+		defer timer.Stop()
+		expired = timer.C
 	}
 	if h.Changed != nil {
 		h.Changed(p.ID, true)
@@ -459,6 +523,8 @@ func (h *Hub) stream(w http.ResponseWriter, r *http.Request, p Peer) {
 		case <-r.Context().Done():
 			return
 		case <-c.done:
+			return
+		case <-expired:
 			return
 		}
 	}

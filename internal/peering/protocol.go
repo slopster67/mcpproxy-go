@@ -15,7 +15,6 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/storage"
 )
 
-const Header = "X-MCPProxy-Peer-Token"
 const MaxMessage = 16 << 20
 
 var ErrOffline = errors.New("peer is offline")
@@ -34,13 +33,16 @@ type Executor interface {
 }
 
 type Peer struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	TokenHash string     `json:"token_hash,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	LastSeen  *time.Time `json:"last_seen,omitempty"`
-	Online    bool       `json:"online"`
-	Address   string     `json:"address,omitempty"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	TokenHash string `json:"token_hash,omitempty"`
+	// OAuthSession identifies the peer's current browser sign-in. A new
+	// sign-in replaces it, which revokes the previous machine's OAuth tokens.
+	OAuthSession string     `json:"oauth_session,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	LastSeen     *time.Time `json:"last_seen,omitempty"`
+	Online       bool       `json:"online"`
+	Address      string     `json:"address,omitempty"`
 }
 
 type ServerState struct {

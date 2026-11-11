@@ -8,9 +8,9 @@ or reloads. Unset or empty variables use built-in defaults. Restart to apply cha
 either mode. Unknown `MCPPROXY_*` variables and nonempty variables for the wrong
 mode fail startup. General help/version controls are not settings.
 
-Only the encryption key, the OIDC settings, peer token, trusted hosts and peer
-primary URL accept `_FILE` inputs (so a deployment can keep secrets and its own
-hostnames out of public configuration). All other settings accept direct
+Only the encryption key, the OIDC settings, peer token and peer primary URL
+accept `_FILE` inputs (so a deployment can keep secrets and its own hostnames
+out of public configuration). All other settings accept direct
 environment values only.
 Set only one nonempty source. Files must be regular, nonempty and at most 1 MiB.
 Trailing CR/LF characters are removed; other whitespace is preserved. Files must
@@ -50,7 +50,6 @@ variables are separate from this configuration schema.
 | `MCPPROXY_LOG_MAX_BACKUPS` | both |
 | `MCPPROXY_LOG_MAX_AGE` | both |
 | `MCPPROXY_LOG_COMPRESS` | both |
-| `MCPPROXY_TRUSTED_HOSTS`, `MCPPROXY_TRUSTED_HOSTS_FILE` | primary |
 | `MCPPROXY_CODE_EXECUTION_TIMEOUT_MS` | primary |
 | `MCPPROXY_CODE_EXECUTION_MAX_TOOL_CALLS` | primary |
 | `MCPPROXY_CODE_EXECUTION_POOL_SIZE` | primary |
@@ -78,7 +77,6 @@ variables are separate from this configuration schema.
 | `MCPPROXY_OIDC_ISSUER`, `MCPPROXY_OIDC_ISSUER_FILE` | primary |
 | `MCPPROXY_OIDC_CLIENT_ID`, `MCPPROXY_OIDC_CLIENT_ID_FILE` | primary |
 | `MCPPROXY_OIDC_CLIENT_SECRET`, `MCPPROXY_OIDC_CLIENT_SECRET_FILE` | primary |
-| `MCPPROXY_OIDC_REDIRECT_URL`, `MCPPROXY_OIDC_REDIRECT_URL_FILE` | primary |
 | `MCPPROXY_PEER_PRIMARY_URL`, `MCPPROXY_PEER_PRIMARY_URL_FILE` | peer |
 | `MCPPROXY_PEER_TOKEN`, `MCPPROXY_PEER_TOKEN_FILE` | peer |
 
@@ -88,8 +86,10 @@ Primary storage defaults to `~/.mcpproxy`; peer storage defaults to
 `~/.mcpproxy-peer`. Both listen on `127.0.0.1:8080` by default and put logs in
 `<data-dir>/logs`. Primary stored scripts live in `<data-dir>/scripts`.
 Primary requires a base64-encoded 32-byte encryption key. Peer requires the
-primary HTTP(S) origin and its peer token. Primary requires OIDC issuer,
-client ID and callback URL. Omit the OIDC secret for a public client. Startup
+primary HTTP(S) origin. Its peer token is optional: without one, the peer signs
+in through the browser (see [Client and peer sign-in](docs/features/client-sign-in.md)).
+Primary requires OIDC issuer and client ID; the sign-in callback is built from
+the address each request used. Omit the OIDC secret for a public client. Startup
 validates provider discovery and signing keys before opening the database or
 listener. Confidential client credentials are also checked when the provider
 supports authenticated introspection; otherwise they are verified at sign-in.

@@ -136,8 +136,8 @@ Luma dialogs, profile menus, fields and actions.
 Create a client with a name and optional profile, then copy its generated token
 into the AI client. Named profiles expose an Allow switching toggle, off by
 default. All servers always permits switching and hides the toggle in creation
-and editing. Client tokens do not expire. Only saved client tokens authenticate
-MCP connections; anonymous connections, the dashboard admin key and standalone
+and editing. Client tokens do not expire. Only saved client tokens and OAuth sign-ins
+issued for a saved client authenticate MCP connections; anonymous connections, the dashboard admin key and standalone
 agent tokens are rejected. The admin key still authenticates the dashboard REST API.
 
 Delete removes the saved client and its token, refreshing the roster in place.

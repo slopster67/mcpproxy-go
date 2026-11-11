@@ -101,6 +101,18 @@ export interface OAuthStartResponse {
   message?: string
 }
 
+// A pending MCP client or peer sign-in waiting for the consent page.
+export interface OAuthConsent {
+  kind: 'client' | 'peer'
+  app_name?: string
+  redirect_uri: string
+  redirect_host: string
+  loopback: boolean
+  host_id?: string
+  host_name: string
+  options: { id: string; name: string; detail?: string }[]
+}
+
 export interface ApproveToolsResult { approved: number; not_approved?: string[] }
 export interface BlockToolsResult { blocked: number }
 
@@ -175,6 +187,11 @@ const api = {
     create: (body: { name: string }) => post<Peer & { token: string }>('/api/v1/peers', body),
     rotate: (id: string) => post<Peer & { token: string }>(`/api/v1/peers/${seg(id)}/rotate`),
     delete: (id: string) => del(`/api/v1/peers/${seg(id)}`),
+  },
+  oauth: {
+    request: (id: string) => request<OAuthConsent>(`/api/v1/oauth/requests/${seg(id)}`),
+    decide: (id: string, body: { approve: boolean; subject?: string }) =>
+      post<{ redirect_url: string }>(`/api/v1/oauth/requests/${seg(id)}`, body),
   },
   profiles: {
     list: () => get<ProfileList>('/api/v1/profiles'),

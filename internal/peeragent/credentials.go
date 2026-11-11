@@ -32,7 +32,11 @@ func (a *Agent) newTokenStore(name string, snapshot storage.OAuthSnapshot) *stor
 		if err != nil {
 			return 0, err
 		}
-		request.Header.Set("Authorization", "Bearer "+a.cfg.PeerToken)
+		token, err := a.bearer(ctx)
+		if err != nil {
+			return 0, err
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
 		request.Header.Set("Content-Type", "application/json")
 		response, err := a.client.Do(request)
 		if err != nil {

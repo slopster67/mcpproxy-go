@@ -10,12 +10,6 @@
           @click="peerDialog?.show()"
           ><Plus data-icon="inline-start" />Add peer</Button
         >
-        <Button
-          v-if="!peers.hasPeers"
-          variant="outline"
-          @click="addClient()"
-          ><Plus data-icon="inline-start" />Add client</Button
-        >
       </div>
     </div>
     <Button
@@ -74,22 +68,14 @@
               >last seen {{ formatRelative(group.peer.last_seen) }}</span
             >
           </div>
-          <div class="flex items-center gap-2">
-            <Button
-              v-if="group.peer"
-              variant="ghost"
-              size="sm"
-              :aria-label="`Manage ${group.name}`"
-              @click="peerDialog?.show(group.peer)"
-              ><Settings2 data-icon="inline-start" />Manage peer</Button
-            >
-            <Button
-              variant="outline"
-              size="sm"
-              @click="addClient(group.id)"
-              ><Plus data-icon="inline-start" />Add client</Button
-            >
-          </div>
+          <Button
+            v-if="group.peer"
+            variant="ghost"
+            size="sm"
+            :aria-label="`Manage ${group.name}`"
+            @click="peerDialog?.show(group.peer)"
+            ><Settings2 data-icon="inline-start" />Manage peer</Button
+          >
         </header>
         <div
           class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4"
@@ -105,7 +91,7 @@
           <Card size="sm" class="relative justify-center border border-dashed bg-transparent shadow-none ring-0">
             <CardHeader>
               <button type="button" class="flex h-10 w-full cursor-pointer items-center justify-center gap-2 text-sm text-muted-foreground after:absolute after:inset-0 after:rounded-4xl hover:text-foreground focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-ring" @click="addClient(group.id)">
-                <Plus class="size-4" />{{ peers.hasPeers ? `Add a ${group.name} client` : 'Add a client' }}
+                <Plus class="size-4" />{{ peers.hasPeers ? `Add a client on ${group.name}` : 'Add a client' }}
               </button>
             </CardHeader>
           </Card>

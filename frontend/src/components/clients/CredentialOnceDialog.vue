@@ -9,6 +9,11 @@
       :credential="displayed.credential"
       :snippet="displayed.snippet"
     />
+    <p class="text-sm text-muted-foreground">
+      Or skip the token: add only the MCP URL to your MCP client. It opens a
+      browser sign-in where you choose this client. Rotating the token signs
+      those connections out too.
+    </p>
     <template #actions
       ><Button @click="emit('close')"
         >Done</Button

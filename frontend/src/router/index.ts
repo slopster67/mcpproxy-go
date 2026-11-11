@@ -8,6 +8,7 @@ import Secrets from "@/views/Secrets.vue";
 import Tools from "@/views/Tools.vue";
 import Activity from "@/views/Activity.vue";
 import NotFound from "@/views/NotFound.vue";
+import OAuthAuthorize from "@/views/OAuthAuthorize.vue";
 import { createRouter, createWebHistory } from "vue-router";
 
 const router = createRouter({
@@ -86,6 +87,12 @@ const router = createRouter({
       },
     },
 
+    {
+      path: "/oauth/authorize",
+      name: "oauth-authorize",
+      component: OAuthAuthorize,
+      meta: { title: "Sign in", bare: true },
+    },
     {
       path: "/:pathMatch(.*)*",
       name: "not-found",

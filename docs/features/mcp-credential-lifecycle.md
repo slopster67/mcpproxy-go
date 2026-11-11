@@ -59,11 +59,12 @@ or returned client/peer tokens.
 
 ## Peer HTTP surface
 
-A peer listens only on `/mcp`. It exposes no dashboard, REST API, event stream,
-health probes or peer-control route. Clients authenticate with their client tokens.
-The peer forwards the request to the primary with its separate peer credential;
-the primary validates both credentials and checks that the client is assigned to
-that peer. The peer credential alone cannot authenticate an MCP client. An offline
+A peer listens on `/mcp`, the OAuth discovery documents and its own sign-in pages
+(`/`, `/oauth/start`, `/oauth/callback`). It exposes no dashboard, REST API, event
+stream, health probes or peer-control route. Clients authenticate with their client
+tokens or OAuth access tokens. The peer forwards each request to the primary
+unchanged; the client's assigned host decides where its calls run. The peer's own
+credential never authenticates an MCP client. An offline
 peer returns `503` for `/mcp` until its primary connection is restored.
 
 ## Client code execution permission

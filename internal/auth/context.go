@@ -18,6 +18,7 @@ type CredentialKind string
 const (
 	CredentialKindSession     CredentialKind = "session"      // OIDC browser session
 	CredentialKindClientToken CredentialKind = "client_token" // an mcp_cli_ client token
+	CredentialKindOAuth       CredentialKind = "oauth"        // an OAuth access token issued for a saved client
 	CredentialKindAnonymous   CredentialKind = "anonymous"    // no authenticated credential
 )
 

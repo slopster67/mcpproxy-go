@@ -39,13 +39,13 @@ const title = computed(() =>
           : name.value,
 );
 const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
-const command = computed(
-  () =>
-    `mcpproxy peer --remote-url ${quote(remoteURL.value.replace(/\/$/, ""))} --peer-token ${quote(token.value)}`,
+const primary = computed(() => quote(remoteURL.value.replace(/\/$/, "")));
+const signinCommand = computed(
+  () => `MCPPROXY_PEER_PRIMARY_URL=${primary.value} mcpproxy peer`,
 );
-const environment = computed(
+const tokenCommand = computed(
   () =>
-    `export MCPPROXY_REMOTE_URL=${quote(remoteURL.value.replace(/\/$/, ""))}\nexport MCPPROXY_PEER_TOKEN=${quote(token.value)}\nmcpproxy peer`,
+    `MCPPROXY_PEER_PRIMARY_URL=${primary.value} \\\nMCPPROXY_PEER_TOKEN=${quote(token.value)} \\\nmcpproxy peer`,
 );
 function show(peer?: Peer) {
   selected.value = peer ?? null;
@@ -138,12 +138,12 @@ defineExpose({ show });
       </div></template
     >
     <p v-else-if="stage === 'rotate'" class="text-sm text-muted-foreground">
-      The current token will be invalidated and replaced with a new one. Update
-      it on the peer to reconnect.
+      The current token will be invalidated and replaced with a new one. A peer
+      signed in through the browser is signed out too. Update the token or sign
+      the peer in again to reconnect.
     </p>
     <DeleteConfirmationText v-else-if="stage === 'delete'" :name="name" />
     <FieldGroup v-else-if="stage === 'token'">
-      <ClientCredentialFields :credential="token" />
       <Field
         ><FieldLabel for="primary-url">Primary URL</FieldLabel
         ><Input
@@ -154,8 +154,18 @@ defineExpose({ show });
       /></Field>
       <Field
         v-for="item in [
-          { key: 'flags', label: 'Command', value: command },
-          { key: 'env', label: 'Environment variables', value: environment },
+          {
+            key: 'signin',
+            label: 'Sign in from the peer',
+            hint: `Run this on the peer, open its address (http://127.0.0.1:8080 by default) in a browser there and choose ${name}.`,
+            value: signinCommand,
+          },
+          {
+            key: 'token',
+            label: 'Or connect with a token',
+            hint: 'For machines without a browser. The token is shown only once.',
+            value: tokenCommand,
+          },
         ]"
         :key="item.key"
         ><div class="flex items-center justify-between">
@@ -167,10 +177,12 @@ defineExpose({ show });
             />{{ copied === item.key ? "Copied" : "Copy" }}</Button
           >
         </div>
+        <p class="text-xs text-muted-foreground">{{ item.hint }}</p>
         <pre
           class="min-w-0 max-w-full overflow-auto whitespace-pre-wrap break-all rounded-md bg-black p-3 font-mono text-xs leading-relaxed"
           >{{ item.value }}</pre>
       </Field>
+      <ClientCredentialFields :credential="token" />
     </FieldGroup>
     <Alert v-if="error" variant="destructive">{{ error }}</Alert>
     <template #actions
