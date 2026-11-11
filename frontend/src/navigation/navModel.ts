@@ -15,7 +15,7 @@ import { Server, Users, Layers, Wrench, KeyRound, Activity, ChartNoAxesCombined 
 
 export type NavIcon = Component
 
-export type NavBadge = 'review'
+export type NavBadge = 'review' | 'failed'
 
 export interface NavItem {
   id: string
@@ -42,7 +42,7 @@ export const SIDEBAR_GROUPS: NavGroup[] = [
     id: 'connect',
     label: 'Connect',
     items: [
-      { id: 'servers', label: 'Servers', path: '/servers', icon: Server },
+      { id: 'servers', label: 'Servers', path: '/servers', icon: Server, badge: 'failed' },
       { id: 'clients', label: 'Clients', path: '/clients', icon: Users },
       {
         id: 'profiles',

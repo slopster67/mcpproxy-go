@@ -22,9 +22,9 @@
                 </RouterLink>
               </SidebarMenuButton>
               <Transition name="sidebar-review-badge" appear>
-                <SidebarMenuBadge v-if="badgeValue(item) > 0" class="pointer-events-auto right-1.5 h-6 min-w-6 p-0">
-                  <RouterLink class="flex h-full min-w-6 items-center justify-center rounded-xl bg-warning/10 px-1.5 leading-none text-warning" :to="{ path: '/tools', query: { review: '1' } }" :aria-label="`${badgeValue(item)} tools need review`">
-                    {{ badgeValue(item) }}
+                <SidebarMenuBadge v-if="badgeFor(item)" class="pointer-events-auto right-1.5 h-6 min-w-6 p-0">
+                  <RouterLink class="flex h-full min-w-6 items-center justify-center rounded-xl px-1.5 leading-none" :class="badgeFor(item)!.classes" :to="badgeFor(item)!.to" :aria-label="badgeFor(item)!.label">
+                    {{ badgeFor(item)!.count }}
                   </RouterLink>
                 </SidebarMenuBadge>
               </Transition>
@@ -48,6 +48,7 @@ import { computed, onMounted, watch } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 import { useServersStore } from "@/stores/servers";
+import { serverFailed } from "@/utils/serverCardStatus";
 import {
   SIDEBAR_GROUPS,
   type NavItem,
@@ -75,7 +76,6 @@ const activePath = computed(() =>
 );
 
 const authStore = useAuthStore();
-// The one badge: tools awaiting review.
 const serversStore = useServersStore();
 // Tools awaiting review, from each server's quarantine counts.
 const reviewCount = computed(() =>
@@ -108,9 +108,26 @@ const visibleGroups = computed(() =>
   })),
 );
 
-// Per-item badge value (0 hides it).
-function badgeValue(item: NavItem): number {
-  return item.badge === "review" ? reviewCount.value : 0;
+// Servers whose card shows a red dot.
+const failedCount = computed(() => serversStore.items.filter(serverFailed).length);
+
+// The badge of an item, or null when there is nothing to show.
+function badgeFor(item: NavItem) {
+  if (item.badge === "review" && reviewCount.value > 0)
+    return {
+      count: reviewCount.value,
+      classes: "bg-warning/10 text-warning",
+      to: { path: "/tools", query: { review: "1" } },
+      label: `${reviewCount.value} tools need review`,
+    };
+  if (item.badge === "failed" && failedCount.value > 0)
+    return {
+      count: failedCount.value,
+      classes: "bg-destructive/10 text-destructive",
+      to: { path: "/servers" },
+      label: `${failedCount.value} ${failedCount.value === 1 ? "server has" : "servers have"} failed`,
+    };
+  return null;
 }
 
 function isActiveRoute(path: string): boolean {

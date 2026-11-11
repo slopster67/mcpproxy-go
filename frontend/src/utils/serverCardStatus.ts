@@ -1,6 +1,8 @@
 import type { Server } from "@/types";
 import { needsOAuthSignIn, healthStatusText } from "@/utils/health";
 
+const FAILED_COLOR = "bg-[var(--server-status-red)]";
+
 interface ServerCardStatus {
   order: 0 | 1 | 2 | 3;
   color: string;
@@ -35,7 +37,7 @@ export function serverCardStatus(server: Server): ServerCardStatus {
     return {
       error,
       order: 0,
-      color: "bg-[var(--server-status-red)]",
+      color: FAILED_COLOR,
       label:
         health?.detail ||
         server.diagnostic?.user_message ||
@@ -60,7 +62,7 @@ export function serverCardStatus(server: Server): ServerCardStatus {
   if (health?.level === "degraded")
     return {
       order: 0,
-      color: "bg-[var(--server-status-red)]",
+      color: FAILED_COLOR,
       label: health.summary || "Server needs attention",
       error: "Needs attention",
     };
@@ -69,4 +71,9 @@ export function serverCardStatus(server: Server): ServerCardStatus {
     color: "bg-[var(--server-status-green)]",
     label: "Connected",
   };
+}
+
+/** Whether the server's card shows a red dot. */
+export function serverFailed(server: Server): boolean {
+  return serverCardStatus(server).color === FAILED_COLOR;
 }
