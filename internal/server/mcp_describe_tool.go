@@ -72,7 +72,7 @@ const describeMalformedIDRemediation = "Tool ids must use '<server>:<tool>' form
 // buildDescribeToolTool constructs the describe_tool definition. ONE builder
 // feeds every surface that registers the tool, so the schemas cannot drift.
 func buildDescribeToolTool() mcp.Tool {
-	return mcp.NewTool("describe_tool",
+	return newProxyTool("describe_tool",
 		mcp.WithDescription("Return full JSON Schema + long description for listed tools. Use when a signature is marked lossy ('~') or you need the exact schema before calling. With check:true it returns one availability verdict per id, not schemas ('ready', or a reason code with retryable/action), to gate a plan before its first call."),
 		mcp.WithTitleAnnotation("Describe Tool"),
 		mcp.WithToolTitle("Describe Tool"),

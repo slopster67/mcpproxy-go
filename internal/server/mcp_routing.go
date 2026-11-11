@@ -704,7 +704,7 @@ func (p *MCPProxyServer) buildCodeExecModeTools() []mcpserver.ServerTool {
 		// handleRetrieveToolsWithMode) and does not expose the detail param.
 	}
 	codeExecRetrieveOpts = append(codeExecRetrieveOpts, retrieveToolsAnnotationFilterOptions()...)
-	retrieveToolsTool := mcp.NewTool("retrieve_tools", codeExecRetrieveOpts...)
+	retrieveToolsTool := newProxyTool("retrieve_tools", codeExecRetrieveOpts...)
 	tools = append(tools, p.setProfileServerTool())
 	tools = append(tools, mcpserver.ServerTool{
 		Tool:    retrieveToolsTool,
@@ -749,7 +749,7 @@ func (p *MCPProxyServer) buildCallToolModeTools() []mcpserver.ServerTool {
 	}
 	callToolRetrieveOpts = append(callToolRetrieveOpts, retrieveToolsAnnotationFilterOptions()...)
 	tools = append(tools, mcpserver.ServerTool{
-		Tool:    mcp.NewTool("retrieve_tools", callToolRetrieveOpts...),
+		Tool:    newProxyTool("retrieve_tools", callToolRetrieveOpts...),
 		Handler: p.handleRetrieveToolsForMode(config.RoutingModeRetrieveTools),
 	})
 
@@ -779,7 +779,7 @@ func (p *MCPProxyServer) buildCallToolModeTools() []mcpserver.ServerTool {
 	})
 
 	// read_cache for paginated responses
-	readCacheTool := mcp.NewTool("read_cache",
+	readCacheTool := newProxyTool("read_cache",
 		mcp.WithDescription("Retrieve paginated data when mcpproxy indicates a tool response was truncated. Use the cache key provided in truncation messages."),
 		mcp.WithTitleAnnotation("Read Cache"),
 		mcp.WithToolTitle("Read Cache"),
@@ -814,7 +814,7 @@ func (p *MCPProxyServer) buildCallToolModeTools() []mcpserver.ServerTool {
 // buildCodeExecutionTool defines the tool; client permission controls access.
 func (p *MCPProxyServer) buildCodeExecutionTool() []mcpserver.ServerTool {
 
-	codeExecutionTool := mcp.NewTool("code_execution",
+	codeExecutionTool := newProxyTool("code_execution",
 		mcp.WithDescription(codeExecutionToolDescription),
 		mcp.WithTitleAnnotation("Code Execution"),
 		mcp.WithToolTitle("Code Execution"),
@@ -936,6 +936,7 @@ func (p *MCPProxyServer) initRoutingModeServers() {
 	opts := []mcpserver.ServerOption{
 		mcpserver.WithToolCapabilities(true),
 		mcpserver.WithRecovery(),
+		mcpserver.WithIcons(mcpproxyIcons()...),
 	}
 	// Private short-lived cache hints on every routing-mode
 	// server (shared opts, so directOpts inherits them too).

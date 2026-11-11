@@ -76,7 +76,7 @@ func buildProfilesTool() mcp.Tool {
 		mcp.WithIdempotentHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(false),
 	}
-	return mcp.NewTool(profilesToolName, append(opts, profilesToolOptions()...)...)
+	return newProxyTool(profilesToolName, append(opts, profilesToolOptions()...)...)
 }
 
 // buildProfilesServerTool wraps buildProfilesTool for the three builders that

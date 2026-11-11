@@ -359,6 +359,7 @@ func NewMCPProxyServer(
 		mcpserver.WithToolCapabilities(true),
 		mcpserver.WithRecovery(),
 		mcpserver.WithHooks(hooks),
+		mcpserver.WithIcons(mcpproxyIcons()...),
 	}
 
 	// Explicit, private, short-lived cache hints.
@@ -646,7 +647,7 @@ func buildCallToolVariantTool(variant string) mcp.Tool {
 		),
 	)
 
-	return mcp.NewTool(variant, allOpts...)
+	return newProxyTool(variant, allOpts...)
 }
 
 // retrieveToolsDetailOption returns the per-call serialization override
@@ -714,7 +715,7 @@ func (p *MCPProxyServer) registerTools() {
 		retrieveToolsDetailOption(),
 	}
 	retrieveToolsOpts = append(retrieveToolsOpts, retrieveToolsAnnotationFilterOptions()...)
-	retrieveToolsTool := mcp.NewTool("retrieve_tools", retrieveToolsOpts...)
+	retrieveToolsTool := newProxyTool("retrieve_tools", retrieveToolsOpts...)
 	p.server.AddTool(retrieveToolsTool, p.handleRetrieveTools)
 
 	p.server.AddTool(buildDescribeToolTool(), p.handleDescribeTool)
@@ -732,7 +733,7 @@ func (p *MCPProxyServer) registerTools() {
 	p.server.AddTool(callToolDestructiveTool, p.handleCallToolDestructive)
 
 	// read_cache - Access paginated data when responses are truncated
-	readCacheTool := mcp.NewTool("read_cache",
+	readCacheTool := newProxyTool("read_cache",
 		mcp.WithDescription("Retrieve paginated data when mcpproxy indicates a tool response was truncated. Use the cache key provided in truncation messages to access the complete dataset with pagination."),
 		mcp.WithTitleAnnotation("Read Cache"),
 		mcp.WithToolTitle("Read Cache"),

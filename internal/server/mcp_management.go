@@ -34,7 +34,7 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 		schema := jsonSchemaForType(reflect.TypeOf(spec.Input))
 		properties := schema["properties"].(map[string]any)
 		properties["operation"].(map[string]any)["enum"] = spec.Operations
-		tool := mcp.NewTool(spec.Name, mcp.WithDescription(spec.Description), mcp.WithDestructiveHintAnnotation(true), mcp.WithReadOnlyHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(false), func(t *mcp.Tool) {
+		tool := newProxyTool(spec.Name, mcp.WithDescription(spec.Description), mcp.WithDestructiveHintAnnotation(true), mcp.WithReadOnlyHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(false), func(t *mcp.Tool) {
 			t.InputSchema.Properties = properties
 			t.InputSchema.Required = []string{"operation"}
 			t.InputSchema.AdditionalProperties = false

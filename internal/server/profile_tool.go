@@ -19,7 +19,7 @@ import (
 )
 
 func buildSetProfileTool() mcp.Tool {
-	return mcp.NewTool("set_profile",
+	return newProxyTool("set_profile",
 		mcp.WithDescription("Switch the active profile for THIS session. A profile scopes tool discovery "+
 			"(retrieve_tools) and tool calls to a named subset of upstream servers — useful to focus an agent "+
 			"on one task domain (e.g. 'research', 'deploy'). The selection persists for the lifetime of the "+
