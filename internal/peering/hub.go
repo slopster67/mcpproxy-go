@@ -18,10 +18,15 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/database"
 )
 
+// Peers already post hello reports every 10 seconds. Missing three reports
+// expires presence even when TCP/SSE writes still succeed into network buffers.
+const peerPresenceTimeout = 30 * time.Second
+
 var bucket = []byte("peers")
 var ErrNotFound = errors.New("peer not found")
 
 type connection struct {
+	lastHello   time.Time
 	done        chan struct{}
 	send        chan Frame
 	pending     map[string]chan Frame
@@ -380,6 +385,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				c.processID = hello.ProcessID
 				c.environment = hello.Environment
 				c.states = hello.Servers
+				c.lastHello = time.Now()
 			}
 		}
 
@@ -454,7 +460,7 @@ func (h *Hub) stream(w http.ResponseWriter, r *http.Request, p Peer, expires tim
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
-	c := &connection{processID: r.Header.Get("X-MCPProxy-Peer-Process"), done: make(chan struct{}), send: make(chan Frame, 128), pending: map[string]chan Frame{}}
+	c := &connection{lastHello: time.Now(), processID: r.Header.Get("X-MCPProxy-Peer-Process"), done: make(chan struct{}), send: make(chan Frame, 128), pending: map[string]chan Frame{}}
 	h.credentials.RLock()
 	currentPeer, err := h.read(p.ID)
 	if err != nil || currentPeer.TokenHash != p.TokenHash {
@@ -513,6 +519,12 @@ func (h *Hub) stream(w http.ResponseWriter, r *http.Request, p Peer, expires tim
 				return
 			}
 		case <-heartbeat.C:
+			h.mu.Lock()
+			stale := time.Since(c.lastHello) >= peerPresenceTimeout
+			h.mu.Unlock()
+			if stale {
+				return
+			}
 			_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
 			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
 				return

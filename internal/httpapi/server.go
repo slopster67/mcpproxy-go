@@ -412,6 +412,12 @@ func (s *Server) httpLoggingMiddleware() func(http.Handler) http.Handler {
 			// Process request
 			next.ServeHTTP(ww, r)
 
+			// Successful peer control POSTs include the periodic hello report.
+			// Keep this background traffic quiet while retaining failures.
+			if r.Method == http.MethodPost && r.URL.Path == "/peer/control" && ww.statusCode == http.StatusNoContent {
+				return
+			}
+
 			duration := time.Since(start)
 
 			s.httpLogger.Info("HTTP API Request",
