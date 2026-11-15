@@ -22,7 +22,7 @@
             <span v-else />
             <time :datetime="row.entry.timestamp" :title="row.entry.timestamp" class="cursor-text tabular-nums text-muted-foreground">{{ row.time }}</time>
             <span class="cursor-text" :class="levelColor(row.entry.level)">{{ row.entry.level }}</span>
-            <span class="min-w-0 cursor-text whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{{ row.text }}<template v-if="row.error">: {{ row.error }}</template></span>
+            <span class="min-w-0 cursor-text whitespace-pre-wrap break-words [overflow-wrap:anywhere]"><span v-for="(part, index) in row.parts" :key="index" :style="part.style">{{ part.text }}</span></span>
           </div>
           <JsonCode v-if="expanded.has(row.key)" :data="row.details" class="mx-5 mb-2 cursor-text border border-border/50" />
         </div>
@@ -45,6 +45,7 @@ import JsonCode from '@/components/JsonCode.vue'
 import { useDelayedLoading } from '@/composables/useDelayedLoading'
 import api from '@/services/api'
 import type { ServerLogEntry } from '@/types/api'
+import { parseAnsi } from '@/utils/ansi'
 
 const props = defineProps<{ name: string }>()
 const entries = ref<ServerLogEntry[]>([])
@@ -70,12 +71,13 @@ const rows = computed(() => {
     occurrences.set(record, occurrence + 1)
     const error = typeof entry.fields?.error === 'string' && !entry.message.includes(entry.fields.error) ? entry.fields.error : ''
     // A line a child process printed (stderr, launcher output) carries its text
-    // in a field: show it inline after the label instead of behind a click.
+    // in a field: show the output directly instead of the transport label.
     const childLine = entry.fields?.child_output === true && typeof entry.fields.message === 'string' ? entry.fields.message : ''
-    const text = childLine ? `${entry.message}: ${childLine}` : entry.message
+    const text = childLine || entry.message
+    const parts = parseAnsi(error ? `${text}: ${error}` : text)
     const details = Object.fromEntries(Object.entries(entry.fields ?? {}).filter(([key]) =>
       (key !== 'error' || !error) && !(childLine && (key === 'message' || key === 'child_output'))))
-    return { entry, error, text, details, key: `${record}:${occurrence}`, hasFields: Object.keys(details).length > 0, time: timeFormat.format(new Date(entry.timestamp)) }
+    return { entry, error, text, parts, details, key: `${record}:${occurrence}`, hasFields: Object.keys(details).length > 0, time: timeFormat.format(new Date(entry.timestamp)) }
   }).reverse().sort((a, b) => Date.parse(b.entry.timestamp) - Date.parse(a.entry.timestamp))
 })
 const visibleRows = computed(() => {
