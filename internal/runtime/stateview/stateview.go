@@ -1,6 +1,7 @@
 package stateview
 
 import (
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 // ToolInfo represents a cached tool definition.
 type ToolInfo struct {
+	Definition  json.RawMessage
 	Name        string
 	Description string
 	InputSchema map[string]interface{}

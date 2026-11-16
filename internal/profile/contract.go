@@ -21,7 +21,7 @@ type Source string
 const (
 	SourcePin     Source = "pin"
 	SourceBinding Source = "binding"
-	SourceSession Source = "session"
+	SourceRequest Source = "request"
 	SourceNone    Source = "none"
 )
 

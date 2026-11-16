@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/v2/mcp"
 
 	"github.com/slopster67/mcpproxy-go/internal/auth"
@@ -146,13 +147,15 @@ type directRequestKindCtxKey struct{}
 // holder of THIS pointer — the hook, and the filter that reads it later in
 // the same synchronous call chain — shares the one cell it points to.
 type directRequestKindBox struct {
-	kind directRequestKind
+	sessionID string
+	kind      directRequestKind
+	profile   string
 }
 
 // withDirectRequestKindBox installs an empty (unknown) box on ctx. Call
 // exactly once per inbound request, before mcp-go's HandleMessage runs.
 func withDirectRequestKindBox(ctx context.Context) context.Context {
-	return context.WithValue(ctx, directRequestKindCtxKey{}, &directRequestKindBox{})
+	return context.WithValue(ctx, directRequestKindCtxKey{}, &directRequestKindBox{sessionID: uuid.NewString()})
 }
 
 // setDirectRequestKind writes kind into ctx's box. A no-op when ctx carries
@@ -205,9 +208,11 @@ func (p *MCPProxyServer) directPolicyExcludedForListing(ctx context.Context, pol
 // request's ctx. See mcpAuthMiddleware (server.go), the one production
 // caller, for why this must wrap the handler chain BEFORE mcp-go's
 // HandleMessage runs.
-func directRequestKindMiddleware(next http.Handler) http.Handler {
+func directRequestKindMiddleware(next http.Handler, sessions *SessionStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r.WithContext(withDirectRequestKindBox(r.Context())))
+		ctx := withDirectRequestKindBox(r.Context())
+		defer sessions.RemoveSession(sessionIDFromContext(ctx))
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

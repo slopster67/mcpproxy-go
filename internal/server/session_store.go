@@ -5,10 +5,9 @@ import (
 	"sync"
 	"time"
 
-	mcpserver "github.com/mark3labs/mcp-go/v2/server"
+	"go.uber.org/zap"
 
 	"github.com/slopster67/mcpproxy-go/internal/storage"
-	"go.uber.org/zap"
 )
 
 // SessionInfo holds MCP session metadata
@@ -41,17 +40,6 @@ type SessionInfo struct {
 	// until the session does something.
 	persisted bool
 
-	// workspaceFetchStarted guards the roots request so it is attempted at most
-	// once per connection.
-	workspaceFetchStarted bool
-
-	// workspaceReady is closed once the roots answer has arrived OR we have given
-	// up on it. Activity waits (briefly) on this before deriving a work session,
-	// so the first tool call of a connection is not filed under a workspace-less
-	// key while the second lands under a workspace-keyed one — which would split
-	// one connection across two work sessions.
-	workspaceReady chan struct{}
-
 	// workSessionID is resolved once per connection and then reused, so every
 	// record from this connection agrees on which work session it belongs to.
 	workSessionID string
@@ -77,12 +65,6 @@ type SessionInfo struct {
 	Profile       string
 	ProfileSource string
 
-	// server is the MCP server instance that serves this session (one of the
-	// routing-mode servers), stamped from mcp-go's ServerFromContext at
-	// initialize so a binding change can send tools/list_changed on the right
-	// instance. Never persisted or serialised.
-	server *mcpserver.MCPServer
-
 	// closed marks a soft-closed session: the transport unregistered it, but the
 	// entry (client name, workspace, persisted flag, work session) is kept so a
 	// client that re-registers on the same id without a new initialize keeps its
@@ -98,12 +80,7 @@ const closedSessionTTL = 30 * time.Minute
 
 // SessionStore manages MCP session information
 type SessionStore struct {
-	sessions map[string]*SessionInfo
-	// activeProfiles holds the per-session active profile slug selected via the
-	// set_profile MCP tool. Kept orthogonal to sessions so a
-	// re-initialize (SetSession) never clobbers a live selection. Kept across
-	// a soft close (RemoveSession) and dropped with the closed entry on eviction.
-	activeProfiles map[string]string
+	sessions       map[string]*SessionInfo
 	mu             sync.RWMutex
 	logger         *zap.Logger
 	storageManager *storage.Manager
@@ -118,20 +95,18 @@ type SessionStore struct {
 // NewSessionStore creates a new session store
 func NewSessionStore(logger *zap.Logger) *SessionStore {
 	return &SessionStore{
-		sessions:       make(map[string]*SessionInfo),
-		activeProfiles: make(map[string]string),
-		logger:         logger,
+		sessions: make(map[string]*SessionInfo),
+		logger:   logger,
 	}
 }
 
 // evictClosedLocked drops soft-closed sessions older than closedSessionTTL,
-// along with their set_profile selection. Caller must hold the write lock.
+// Caller must hold the write lock.
 func (s *SessionStore) evictClosedLocked() {
 	cutoff := time.Now().Add(-closedSessionTTL)
 	for id, info := range s.sessions {
 		if info.closed && info.closedAt.Before(cutoff) {
 			delete(s.sessions, id)
-			delete(s.activeProfiles, id)
 		}
 	}
 }
@@ -212,20 +187,19 @@ func (s *SessionStore) SetSession(sessionID, clientName, clientVersion string, h
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	info := &SessionInfo{
-		SessionID:      sessionID,
-		ClientName:     clientName,
-		ClientVersion:  clientVersion,
-		hasRoots:       hasRoots,
-		hasSampling:    hasSampling,
-		experimental:   experimental,
-		startTime:      time.Now(),
-		workspaceReady: make(chan struct{}),
-		persistDone:    make(chan struct{}),
+	if info := s.sessions[sessionID]; info != nil {
+		info.ClientName, info.ClientVersion = clientName, clientVersion
+		return
 	}
-	// A client that cannot report roots will never make us wait for them.
-	if !hasRoots {
-		close(info.workspaceReady)
+	info := &SessionInfo{
+		SessionID:     sessionID,
+		ClientName:    clientName,
+		ClientVersion: clientVersion,
+		hasRoots:      hasRoots,
+		hasSampling:   hasSampling,
+		experimental:  experimental,
+		startTime:     time.Now(),
+		persistDone:   make(chan struct{}),
 	}
 	s.sessions[sessionID] = info
 	s.evictClosedLocked()
@@ -239,8 +213,7 @@ func (s *SessionStore) SetSession(sessionID, clientName, clientVersion string, h
 	)
 }
 
-// SetWorkspace records the project this session is working in, discovered by
-// asking the client for its MCP roots after the handshake completed.
+// SetWorkspace records the explicit workspace URI for activity grouping.
 //
 // If the session has already been persisted (it did some work before the roots
 // answer arrived — a real race, the roots round-trip is not instant), the stored
@@ -255,7 +228,6 @@ func (s *SessionStore) SetWorkspace(sessionID, workspaceRoot string) {
 	info.Workspace = workspaceRoot
 	persisted := info.persisted
 	mgr := s.storageManager
-	s.signalWorkspaceReadyLocked(info)
 	s.mu.Unlock()
 
 	s.logger.Debug("session workspace resolved",
@@ -373,21 +345,6 @@ func (s *SessionStore) WorkSessionID(sessionID string) string {
 	return ""
 }
 
-// TryClaimWorkspaceFetch returns true exactly once per session, for the caller
-// that should go and ask the client for its roots. Returns false if there is
-// nothing to fetch (no roots capability, already known) or someone already went.
-func (s *SessionStore) TryClaimWorkspaceFetch(sessionID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	info, ok := s.sessions[sessionID]
-	if !ok || info.workspaceFetchStarted || info.Workspace != "" || !info.hasRoots {
-		return false
-	}
-	info.workspaceFetchStarted = true
-	return true
-}
-
 // GetSession returns a COPY of the session info.
 //
 // It must be a copy: the roots goroutine writes Workspace under the lock while
@@ -403,57 +360,6 @@ func (s *SessionStore) GetSession(sessionID string) *SessionInfo {
 	}
 	cp := *info
 	return &cp
-}
-
-// signalWorkspaceReadyLocked closes the readiness channel exactly once.
-// Caller must hold the write lock.
-func (s *SessionStore) signalWorkspaceReadyLocked(info *SessionInfo) {
-	select {
-	case <-info.workspaceReady:
-		// already closed
-	default:
-		close(info.workspaceReady)
-	}
-}
-
-// WorkspaceSettled blocks until the client's roots have arrived, or we have
-// given up waiting, or the deadline passes — whichever comes first.
-//
-// This exists so the FIRST piece of activity on a connection is not attributed
-// before we know the project. Without it, the first tool call resolves a
-// workspace-less work session and the second (roots having landed in between)
-// resolves a workspace-keyed one: a single connection would split across two
-// work sessions.
-func (s *SessionStore) WorkspaceSettled(sessionID string, wait time.Duration) {
-	s.mu.RLock()
-	info, ok := s.sessions[sessionID]
-	s.mu.RUnlock()
-	if !ok {
-		return
-	}
-
-	select {
-	case <-info.workspaceReady:
-	case <-time.After(wait):
-		// The client is not going to answer in time. Give up for good, so we do
-		// not pay this wait on every subsequent call and do not later change our
-		// mind about which work session this connection belongs to.
-		s.mu.Lock()
-		if cur, ok := s.sessions[sessionID]; ok {
-			s.signalWorkspaceReadyLocked(cur)
-		}
-		s.mu.Unlock()
-	}
-}
-
-// AbandonWorkspaceFetch marks the roots answer as never coming, unblocking
-// anything waiting on it.
-func (s *SessionStore) AbandonWorkspaceFetch(sessionID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if info, ok := s.sessions[sessionID]; ok {
-		s.signalWorkspaceReadyLocked(info)
-	}
 }
 
 // RemoveSession soft-closes a session.
@@ -472,13 +378,13 @@ func (s *SessionStore) RemoveSession(sessionID string) {
 	info, ok := s.sessions[sessionID]
 	wasPersisted := ok && info.persisted
 	transition := ok && !info.closed
-	if ok {
+	if ok && !wasPersisted {
+		delete(s.sessions, sessionID)
+	} else if ok {
 		info.closed = true
 		if transition {
 			info.closedAt = time.Now()
 		}
-	} else {
-		delete(s.activeProfiles, sessionID)
 	}
 	s.evictClosedLocked()
 	s.mu.Unlock()
@@ -539,21 +445,6 @@ func (s *SessionStore) UpdateActivity(sessionID string) {
 	_ = mgr.UpdateSessionActivity(sessionID)
 }
 
-// SetActiveProfile records the active profile slug for a session
-// (set_profile). An empty slug clears the selection (back to all-servers).
-func (s *SessionStore) SetActiveProfile(sessionID, profileSlug string) {
-	if sessionID == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if profileSlug == "" {
-		delete(s.activeProfiles, sessionID)
-		return
-	}
-	s.activeProfiles[sessionID] = profileSlug
-}
-
 // SetSessionIdentity records the credential that authenticated a session:
 // the client credential name and its client id (empty for an admin
 // session). Called once at initialize, from the request's AuthContext — the
@@ -582,73 +473,6 @@ func (s *SessionStore) SetSessionTokenPrefix(sessionID, prefix string) {
 	if info, ok := s.sessions[sessionID]; ok {
 		info.TokenPrefix = prefix
 	}
-}
-
-// SessionsMatching returns every live session for which pred is true, with its
-// serving instance. pred runs under the store's read
-// lock and must not call back into the store.
-func (s *SessionStore) SessionsMatching(pred func(*SessionInfo) bool) []sessionTarget {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var out []sessionTarget
-	for id, info := range s.sessions {
-		if !info.closed && pred(info) {
-			out = append(out, sessionTarget{ID: id, Server: info.server})
-		}
-	}
-	return out
-}
-
-// ClearSelection drops every stored set_profile selection of the named
-// profile (it was deleted): those sessions fall back to their base.
-func (s *SessionStore) ClearSelection(name string) {
-	if name == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id, sel := range s.activeProfiles {
-		if sel == name {
-			delete(s.activeProfiles, id)
-		}
-	}
-}
-
-// SetSessionServer records the MCP server instance serving a session (the
-// session -> server-instance map). Called once at initialize.
-func (s *SessionStore) SetSessionServer(sessionID string, srv *mcpserver.MCPServer) {
-	if sessionID == "" || srv == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if info, ok := s.sessions[sessionID]; ok {
-		info.server = srv
-	}
-}
-
-// sessionTarget is one live session of a token, with the server instance that
-// serves it (nil when it was not recorded).
-type sessionTarget struct {
-	ID     string
-	Server *mcpserver.MCPServer
-}
-
-// NotifyTargets returns every live session authenticated by tokenName with its
-// serving instance.
-func (s *SessionStore) NotifyTargets(tokenName string) []sessionTarget {
-	if tokenName == "" {
-		return nil
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var out []sessionTarget
-	for id, info := range s.sessions {
-		if !info.closed && info.TokenName == tokenName {
-			out = append(out, sessionTarget{ID: id, Server: info.server})
-		}
-	}
-	return out
 }
 
 func (s *SessionStore) UpdateSessionProfile(sessionID, profileName, source string) {
@@ -694,17 +518,6 @@ func (s *SessionStore) UpdateSessionProfile(sessionID, profileName, source strin
 		s.logger.Debug("failed to write session profile through to storage",
 			zap.String("session_id", sessionID), zap.Error(err))
 	}
-}
-
-// GetActiveProfile returns the active profile slug for a session, or "" when the
-// session has no active profile selection.
-func (s *SessionStore) GetActiveProfile(sessionID string) string {
-	if sessionID == "" {
-		return ""
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.activeProfiles[sessionID]
 }
 
 // workspaceDisplayName is the basename of a workspace root. Only the basename is

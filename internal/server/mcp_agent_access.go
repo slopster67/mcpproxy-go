@@ -262,12 +262,6 @@ func containsTier(ts []profile.Tier, t profile.Tier) bool {
 	return false
 }
 
-// visibleBuiltins returns the names of the tools srv lists to this caller,
-// through the same request-scoped filter p.server, callToolServer and
-// codeExecServer apply on tools/list. It does not round-trip a tools/list
-// message: that would re-enter the hooks (beforeAny claims the workspace-
-// roots fetch on the first non-initialize request, which must not happen
-// while the initialize response is still unwritten).
 func (p *MCPProxyServer) visibleBuiltins(ctx context.Context, srv *mcpserver.MCPServer) map[string]bool {
 	registered := srv.ListTools()
 	tools := make([]mcp.Tool, 0, len(registered))
@@ -362,11 +356,6 @@ func (p *MCPProxyServer) filterAdvertiseServersInRetrieveTools(ctx context.Conte
 // installCallerInstructionsHooks rewrites the instructions of every
 // initialize and server/discover response for the calling session.
 func installCallerInstructionsHooks(hooks *mcpserver.Hooks, proxy func() *MCPProxyServer) {
-	hooks.AddAfterInitialize(func(ctx context.Context, _ any, _ *mcp.InitializeRequest, result *mcp.InitializeResult) {
-		if p := proxy(); p != nil && result != nil {
-			result.Instructions = p.instructionsForCaller(ctx, mcpserver.ServerFromContext(ctx), result.Instructions)
-		}
-	})
 	hooks.AddAfterDiscover(func(ctx context.Context, _ any, _ *mcp.DiscoverRequest, result *mcp.DiscoverResult) {
 		if p := proxy(); p != nil && result != nil {
 			result.Instructions = p.instructionsForCaller(ctx, mcpserver.ServerFromContext(ctx), result.Instructions)

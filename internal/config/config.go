@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -10,8 +11,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/slopster67/mcpproxy-go/internal/dashboardauth"
+	"github.com/slopster67/mcpproxy-go/internal/httpx"
 	"github.com/slopster67/mcpproxy-go/internal/secret"
-
 	"github.com/slopster67/mcpproxy-go/internal/secureenv"
 	"github.com/slopster67/mcpproxy-go/internal/servericon"
 )
@@ -157,7 +158,8 @@ func (c *Config) ResolveInitTimeout() time.Duration {
 
 // Config represents the main configuration structure
 type Config struct {
-	Listen string `env:"MCPPROXY_LISTEN" mode:"both" json:"listen"`
+	Listen         string   `env:"MCPPROXY_LISTEN" mode:"both" json:"listen"`
+	AllowedOrigins []string `env:"MCPPROXY_ALLOWED_ORIGINS" mode:"both" json:"allowed_origins,omitempty"`
 
 	DataDir string `env:"MCPPROXY_DATA_DIR" mode:"both" json:"data_dir"`
 
@@ -330,7 +332,7 @@ type ServerConfig struct {
 	Description      *string           `json:"description,omitempty"` // Shown to agents beside the server name; at most MaxServerDescription characters
 	Name             string            `json:"name,omitempty"`
 	URL              string            `json:"url,omitempty"`
-	Protocol         string            `json:"protocol,omitempty"` // stdio, http, sse, streamable-http, auto
+	Protocol         string            `json:"protocol,omitempty"` // stdio, http, streamable-http, auto
 	Command          string            `json:"command,omitempty"`
 	Args             []string          `json:"args,omitempty"`
 	WorkingDir       string            `json:"working_dir,omitempty"` // Working directory for stdio servers
@@ -447,6 +449,7 @@ func (c *OutputValidationConfig) BlockOnMissingStructured() bool {
 const ManagementServerName = "mcpproxy"
 
 type ToolMetadata struct {
+	Definition json.RawMessage `json:"definition,omitempty"`
 	// Name is the tool's display/lookup name. Discovery stores the RAW upstream
 	// name here (no server prefix); index reads return the canonical
 	// "<server>:<raw>" id. Consumers that need the exact upstream name
@@ -693,6 +696,12 @@ func (c *Config) validateDetailedCore() []ValidationError {
 	}
 
 	// Validate listen address format
+	for _, origin := range c.AllowedOrigins {
+		parsed, err := url.Parse(origin)
+		if err != nil || !httpx.OriginAllowed(origin, []string{parsed.Host}) {
+			errors = append(errors, ValidationError{Field: "allowed_origins", Message: fmt.Sprintf("invalid origin %q", origin)})
+		}
+	}
 	if c.Listen != "" {
 		// Check for valid format (host:port or :port)
 		if !isValidListenAddr(c.Listen) {
@@ -855,11 +864,11 @@ func (c *Config) validateDetailedCore() []ValidationError {
 		}
 
 		// Validate protocol
-		validProtocols := map[string]bool{"stdio": true, "http": true, "sse": true, "streamable-http": true, "auto": true}
+		validProtocols := map[string]bool{"stdio": true, "http": true, "streamable-http": true, "auto": true}
 		if server.Protocol != "" && !validProtocols[server.Protocol] {
 			errors = append(errors, ValidationError{
 				Field:   fieldPrefix + ".protocol",
-				Message: fmt.Sprintf("invalid protocol: %s (must be stdio, http, sse, streamable-http, or auto)", server.Protocol),
+				Message: fmt.Sprintf("invalid protocol: %s (must be stdio, http, streamable-http, or auto)", server.Protocol),
 			})
 		}
 
@@ -883,7 +892,7 @@ func (c *Config) validateDetailedCore() []ValidationError {
 		}
 
 		// Validate HTTP server requirements
-		if server.Protocol == "http" || server.Protocol == "sse" || server.Protocol == "streamable-http" {
+		if server.Protocol == "http" || server.Protocol == "streamable-http" {
 			if server.URL == "" {
 				errors = append(errors, ValidationError{
 					Field:   fieldPrefix + ".url",

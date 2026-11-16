@@ -219,6 +219,11 @@ func (b *Bucket) Put(k, v []byte) error {
 	}
 	return b.tx.tx.Set(b.row(k), bytes.Clone(v))
 }
+func (b *Bucket) PutUntil(k, v []byte, expires int64) error {
+	entry := badger.NewEntry(b.row(k), v)
+	entry.ExpiresAt = uint64(expires)
+	return b.tx.tx.SetEntry(entry)
+}
 func (b *Bucket) Delete(k []byte) error { return b.tx.tx.Delete(b.row(k)) }
 func (b *Bucket) ForEach(fn func([]byte, []byte) error) error {
 	cursor := b.Cursor()

@@ -19,8 +19,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	sdktransport "github.com/mark3labs/mcp-go/v2/client/transport"
 	"github.com/mark3labs/mcp-go/v2/mcp"
+	"go.uber.org/zap"
+
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/httpx"
@@ -32,7 +33,6 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/storage"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/core"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/managed"
-	"go.uber.org/zap"
 )
 
 type Agent struct {
@@ -535,26 +535,13 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 			return nil, err
 		}
 		request := payload.Request
-		if request.Method == "tools/call" {
-			ctx = core.WithPeerCallTimeout(ctx, payload.Timeout)
-			var params struct {
-				Name      string         `json:"name"`
-				Arguments map[string]any `json:"arguments"`
-			}
-			raw, err := json.Marshal(request.Params)
-			if err != nil {
-				return nil, err
-			}
-			if err = json.Unmarshal(raw, &params); err != nil {
-				return nil, err
-			}
-			result, err := instance.CallTool(ctx, params.Name, params.Arguments)
-			if err != nil {
-				return nil, err
-			}
-			data, err := json.Marshal(result)
-			return &sdktransport.JSONRPCResponse{JSONRPC: "2.0", ID: request.ID, Result: data}, err
+		request.Header = payload.Header
+		if payload.Timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, payload.Timeout)
+			defer cancel()
 		}
+
 		return instance.PeerRPC(ctx, request)
 	default:
 		return a.manage(ctx, f)

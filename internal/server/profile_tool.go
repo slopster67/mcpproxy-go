@@ -2,115 +2,14 @@ package server
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/mark3labs/mcp-go/v2/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/v2/server"
-	"go.uber.org/zap"
 
 	"github.com/slopster67/mcpproxy-go/internal/auth"
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/profile"
 )
-
-func buildSetProfileTool() mcp.Tool {
-	return newProxyTool("set_profile",
-		mcp.WithDescription("Switch the active profile for THIS session. A profile scopes tool discovery "+
-			"(retrieve_tools) and tool calls to a named subset of upstream servers — useful to focus an agent "+
-			"on one task domain (e.g. 'research', 'deploy'). The selection persists for the lifetime of the "+
-			"current MCP session and applies to subsequent retrieve_tools / call_tool_* / code_execution calls "+
-			"on the base /mcp endpoint without re-indexing. Pass an empty string to clear the selection and go "+
-			"back to all servers. A locked client cannot switch away from its assigned profile."),
-		mcp.WithTitleAnnotation("Set Profile"),
-		mcp.WithToolTitle("Set Profile"),
-		mcp.WithReadOnlyHintAnnotation(true),
-		mcp.WithDestructiveHintAnnotation(false),
-		mcp.WithOpenWorldHintAnnotation(false),
-		mcp.WithString("profile",
-			mcp.Description("Profile ID from the profiles list to activate for this session. Pass \"\" (empty) to "+
-				"clear the active profile and return to all servers."),
-		),
-	)
-}
-
-func setProfileRefusal(ctx context.Context, slug string) *mcp.CallToolResult {
-	if ac := auth.AuthContextFromContext(ctx); ac.IsClientCredential() {
-		format := profile.SetProfileNotSwitchableRefusalFormat
-		if ac.ProfileMode == auth.ProfileModeLocked {
-			format = profile.SetProfileLockedRefusalFormat
-		}
-		return mcp.NewToolResultError(fmt.Sprintf(format, slug))
-	}
-	return mcp.NewToolResultError(fmt.Sprintf("unknown profile '%s'", slug))
-}
-
-func (p *MCPProxyServer) handleSetProfile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	slug := strings.TrimSpace(request.GetString("profile", ""))
-
-	sessionID := sessionIDFromContext(ctx)
-	if sessionID == "" {
-		return mcp.NewToolResultError("set_profile requires an active MCP session; no session id is bound to this request"), nil
-	}
-
-	profiles := p.profileIndexCurrent(ctx)
-	if profiles == nil {
-		// Acquire's bounded retries could not pair a config snapshot with its
-		// index (a publication storm outran them); profileIndexCurrent only
-		// ever returns nil for a scoped caller — an administrator falls back
-		// to a fresh build instead. Fail closed with the exact uniform
-		// refusal every other non-selectable slug gets: no state change, no
-		// disclosure, no build.
-		return setProfileRefusal(ctx, slug), nil
-	}
-
-	if slug != "" {
-		if !profiles.selectable(ctx, slug) {
-			return setProfileRefusal(ctx, slug), nil
-		}
-	}
-
-	p.sessionStore.SetActiveProfile(sessionID, slug)
-
-	if slug != "" {
-		p.logger.Info("set_profile: session profile updated",
-			zap.String("session_id", sessionID),
-			zap.String("profile", slug),
-		)
-	}
-
-	effectiveProfileName := p.resolveEffectiveProfileForJustSetSlug(ctx, profiles, slug)
-	var allowed []string
-	if ac := auth.AuthContextFromContext(ctx); ac != nil {
-		allowed = ac.AllowedServers
-	}
-	return setProfileResult(slug, profiles.EffectiveServersFor(effectiveProfileName, allowed))
-}
-
-// setProfileResult renders the standard set_profile success payload.
-func setProfileResult(activeProfile string, servers []string) (*mcp.CallToolResult, error) {
-	if servers == nil {
-		servers = []string{}
-	}
-	profileSource := string(profile.SourceNone)
-	if activeProfile != "" {
-		profileSource = string(profile.SourceSession)
-	}
-	payload := map[string]interface{}{
-		"active_profile": activeProfile,
-		"profile_source": profileSource,
-		"servers":        servers,
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("failed to encode set_profile result: %v", err)), nil
-	}
-	return mcp.NewToolResultText(string(body)), nil
-}
 
 // allServerNames returns the names of every configured server (the "all
 // servers" set returned when a profile selection is cleared).
@@ -399,17 +298,6 @@ func (idx *profileIndex) reach(ctx context.Context, candidate int) bool {
 	return reach
 }
 
-// selectable reports whether the caller may select the profile named slug. It
-// is the predicate of the URL gate and of set_profile's
-// admission, and must never consult the selectable list: whatever the
-// outcome (slug absent, profile out of reach, pin deleted, pin zero-reach,
-// pin mismatch, empty fleet) it does the same work — one lookup of the slug,
-// one lookup of the pin when the caller is pinned, and exactly one
-// allocation-free reach test of the caller's own grant against the
-// candidate's precomputed set or the all-zero placeholder when there is none
-// — so no branch can be told from another by its cost, and none of it
-// depends on how many other profiles exist, on how many servers the
-// candidate declares or on how many servers are configured.
 func (idx *profileIndex) selectable(ctx context.Context, slug string) bool {
 	candidate := idx.position(slug)
 	if !idx.pinAllowsSelection(ctx, slug) {
@@ -573,11 +461,6 @@ func (c *profileIndexCache) Acquire(readCfg func() *config.Config) *profileIndex
 		}
 	}
 	return nil
-}
-
-// setProfileServerTool wraps buildSetProfileTool as a ServerTool for routing-mode registration.
-func (p *MCPProxyServer) setProfileServerTool() mcpserver.ServerTool {
-	return mcpserver.ServerTool{Tool: buildSetProfileTool(), Handler: p.handleSetProfile}
 }
 
 func (p *MCPProxyServer) profileIndexCurrent(ctx context.Context) *profileIndex {

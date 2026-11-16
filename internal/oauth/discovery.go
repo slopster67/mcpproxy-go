@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -36,71 +37,19 @@ type OAuthServerMetadata struct {
 	grantTypesPresent bool
 }
 
-// BuildRFC8414MetadataURLs constructs OAuth Authorization Server Metadata URLs per RFC 8414.
-//
-// RFC 8414 Section 3.1 specifies that when the issuer URL contains a path component,
-// the well-known path should be inserted between the host and the path:
-//
-//	https://example.com/path → https://example.com/.well-known/oauth-authorization-server/path
-//
-// Some servers instead publish it with the well-known path appended:
-//
-//	https://example.com/path → https://example.com/path/.well-known/oauth-authorization-server
-//
-// This function returns both variants to try, with RFC 8414 compliant path first.
-//
-// For URLs without a path:
-//
-//	https://example.com → https://example.com/.well-known/oauth-authorization-server
-func BuildRFC8414MetadataURLs(authServerURL string) []string {
-	u, err := url.Parse(authServerURL)
-	if err != nil {
-		// Fallback to simple concatenation if URL parsing fails
-		return []string{authServerURL + "/.well-known/oauth-authorization-server"}
+func BuildRFC8414MetadataURLs(issuer string) []string {
+	u, err := url.Parse(issuer)
+	if err != nil || u.Host == "" || u.Scheme == "" {
+		return nil
 	}
-
-	// Clean the path (remove trailing slash)
-	path := strings.TrimSuffix(u.Path, "/")
-
-	// Base URL without path
-	baseURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
-
-	var urls []string
-
-	if path == "" || path == "/" {
-		// No path - simple case
-		urls = append(urls, baseURL+"/.well-known/oauth-authorization-server")
-	} else {
-		// Has path - RFC 8414 says insert .well-known between host and path
-		// Example: https://auth.smithery.ai/googledrive
-		//       → https://auth.smithery.ai/.well-known/oauth-authorization-server/googledrive
-		rfc8414URL := baseURL + "/.well-known/oauth-authorization-server" + path
-		urls = append(urls, rfc8414URL)
-
-		// Also try the path-appended form some servers publish
-		// Example: https://auth.smithery.ai/googledrive/.well-known/oauth-authorization-server
-		appendedURL := strings.TrimSuffix(authServerURL, "/") + "/.well-known/oauth-authorization-server"
-		urls = append(urls, appendedURL)
-
-		// Also try base URL without path suffix for servers like Cloudflare that host
-		// metadata at the root level regardless of the MCP server path
-		// Example: https://logs.mcp.cloudflare.com/mcp
-		//       → https://logs.mcp.cloudflare.com/.well-known/oauth-authorization-server
-		baseOnlyURL := baseURL + "/.well-known/oauth-authorization-server"
-		urls = append(urls, baseOnlyURL)
+	path := strings.Trim(u.Path, "/")
+	base := u.Scheme + "://" + u.Host
+	if path == "" {
+		return []string{base + "/.well-known/oauth-authorization-server", base + "/.well-known/openid-configuration"}
 	}
-
-	return urls
+	return []string{base + "/.well-known/oauth-authorization-server/" + path, base + "/.well-known/openid-configuration/" + path, base + "/" + path + "/.well-known/openid-configuration"}
 }
 
-// discoverAuthServerMetadataWithFallback attempts to discover OAuth Authorization Server Metadata
-// by trying multiple URL patterns per RFC 8414 Section 3.1.
-//
-// It first tries the RFC 8414 compliant URL (well-known inserted between host and path),
-// then the path-appended form (well-known appended after the path), then the
-// origin root.
-//
-// Returns the first successfully discovered metadata and the URL that worked.
 func discoverAuthServerMetadataWithFallback(env Env, authServerURL string, timeout time.Duration) (*OAuthServerMetadata, string, error) {
 	logger := zap.L().Named("oauth.discovery")
 
@@ -116,7 +65,10 @@ func discoverAuthServerMetadataWithFallback(env Env, authServerURL string, timeo
 
 		metadata, err := fetchAuthorizationServerMetadata(env, metadataURL, timeout)
 		if err == nil {
-			// Validate required fields
+			if metadata.Issuer != authServerURL {
+				lastErr = fmt.Errorf("authorization metadata issuer mismatch")
+				continue
+			}
 			if metadata.AuthorizationEndpoint == "" || metadata.TokenEndpoint == "" {
 				lastErr = fmt.Errorf("metadata missing required fields: authorization_endpoint=%q, token_endpoint=%q",
 					metadata.AuthorizationEndpoint, metadata.TokenEndpoint)
@@ -151,7 +103,7 @@ func discoverAuthServerURL(env Env, serverURL string, timeout time.Duration, fet
 
 	// First, make a preflight request to get the WWW-Authenticate header with resource_metadata
 	client := env.client(timeout)
-	request, err := http.NewRequestWithContext(env.ctx(), http.MethodPost, serverURL, strings.NewReader("{}"))
+	request, err := http.NewRequestWithContext(env.ctx(), http.MethodHead, serverURL, nil)
 	if err != nil {
 		return ""
 	}
@@ -164,13 +116,6 @@ func discoverAuthServerURL(env Env, serverURL string, timeout time.Duration, fet
 		return ""
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusUnauthorized {
-		logger.Debug("Server did not return 401, cannot discover auth server",
-			zap.String("server_url", logSafeURL(serverURL)),
-			zap.Int("status_code", resp.StatusCode))
-		return ""
-	}
 
 	// Extract resource_metadata URL from WWW-Authenticate header
 	wwwAuth := resp.Header.Get("WWW-Authenticate")
@@ -202,6 +147,10 @@ func discoverAuthServerURL(env Env, serverURL string, timeout time.Duration, fet
 		return ""
 	}
 
+	if metadata.Resource != serverURL {
+		return ""
+	}
+
 	// Return first authorization server
 	if len(metadata.AuthorizationServers) > 0 {
 		authServer := metadata.AuthorizationServers[0]
@@ -216,27 +165,24 @@ func discoverAuthServerURL(env Env, serverURL string, timeout time.Duration, fet
 	return ""
 }
 
-// ExtractResourceMetadataURL parses WWW-Authenticate header to extract resource_metadata URL
-// Format: Bearer error="invalid_request", resource_metadata="https://..."
-func ExtractResourceMetadataURL(wwwAuthHeader string) string {
-	// Look for resource_metadata parameter
-	if !strings.Contains(wwwAuthHeader, "resource_metadata") {
-		return ""
-	}
+var quotedChallengePair = regexp.MustCompile(`\\(.)`)
+var challengeParameter = regexp.MustCompile(`(?i)(?:^|[ ,])([a-z_]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^,\s]+)`)
 
-	// Split on resource_metadata=" to find the URL
-	parts := strings.Split(wwwAuthHeader, "resource_metadata=\"")
-	if len(parts) < 2 {
-		return ""
+func ChallengeParameter(challenge, name string) string {
+	for _, match := range challengeParameter.FindAllStringSubmatch(challenge, -1) {
+		if !strings.EqualFold(match[1], name) {
+			continue
+		}
+		if strings.HasPrefix(match[2], "\"") {
+			return quotedChallengePair.ReplaceAllString(match[2][1:len(match[2])-1], "$1")
+		}
+		return match[2]
 	}
+	return ""
+}
 
-	// Find the closing quote
-	endIdx := strings.Index(parts[1], "\"")
-	if endIdx == -1 {
-		return ""
-	}
-
-	return parts[1][:endIdx]
+func ExtractResourceMetadataURL(challenge string) string {
+	return ChallengeParameter(challenge, "resource_metadata")
 }
 
 // discoverProtectedResourceMetadata is DiscoverProtectedResourceMetadata on
@@ -333,7 +279,7 @@ func ValidateOAuthMetadataWithEnv(env Env, serverURL, serverName string, timeout
 
 	// Step 1: Make preflight request to get WWW-Authenticate header
 	client := env.client(timeout)
-	request, err := http.NewRequestWithContext(env.ctx(), http.MethodPost, serverURL, strings.NewReader("{}"))
+	request, err := http.NewRequestWithContext(env.ctx(), http.MethodHead, serverURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -627,7 +573,7 @@ func findWorkingMetadataDoc(env Env, serverURL string, timeout time.Duration) (s
 			lastErr = err
 			continue
 		}
-		if doc.meta.AuthorizationEndpoint == "" || doc.meta.TokenEndpoint == "" {
+		if doc.meta.Issuer != serverURL || doc.meta.AuthorizationEndpoint == "" || doc.meta.TokenEndpoint == "" {
 			lastErr = fmt.Errorf("metadata missing required fields")
 			continue
 		}

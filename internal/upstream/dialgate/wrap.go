@@ -2,9 +2,12 @@ package dialgate
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/mark3labs/mcp-go/v2/client/transport"
 	"github.com/mark3labs/mcp-go/v2/mcp"
+
+	"github.com/slopster67/mcpproxy-go/internal/mcprelay"
 )
 
 // Unwrapper is implemented by every transport WrapTransport returns.
@@ -29,12 +32,12 @@ func Unwrap(t transport.Interface) transport.Interface {
 // WrapTransport gates an mcp-go transport: Start, SendRequest and
 // SendNotification refuse with ErrRetired once g is retired. It takes no
 // lock: the bytes themselves are gated where they are written
-// (gatedConn for HTTP and SSE) and the stdio child is killed by Retire, so
+// (gatedConn for HTTP) and the stdio child is killed by Retire, so
 // the wrapper only stops a retired instance from starting new work.
 //
 // mcp-go and core discover optional behaviour by type assertion on the
 // transport, so the wrapper preserves every capability its inner kind has
-// and no other: the three kinds core builds each get
+// and no other: the two kinds core builds each get
 // their own wrapper type, and an unknown kind gets a generic one.
 func WrapTransport(g *Gate, t transport.Interface) transport.Interface {
 	if t == nil {
@@ -49,8 +52,6 @@ func WrapTransport(g *Gate, t transport.Interface) transport.Interface {
 		return &gatedStdio{base: b, stdio: inner}
 	case *transport.StreamableHTTP:
 		return &gatedStreamableHTTP{base: b, http: inner}
-	case *transport.SSE:
-		return &gatedSSE{base: b, sse: inner}
 	default:
 		return &gatedGeneric{base: b}
 	}
@@ -73,7 +74,14 @@ func (b *base) SendRequest(ctx context.Context, request transport.JSONRPCRequest
 	if b.g.Retired() {
 		return nil, ErrRetired
 	}
-	return b.inner.SendRequest(ctx, request)
+	if request.Method == "initialize" {
+		return nil, fmt.Errorf("upstream must support MCP %s", mcp.LATEST_PROTOCOL_VERSION)
+	}
+	prepared, err := mcprelay.Prepare(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return b.inner.SendRequest(ctx, prepared)
 }
 
 func (b *base) SendNotification(ctx context.Context, notification mcp.JSONRPCNotification) error {
@@ -135,21 +143,6 @@ func (w *gatedStreamableHTTP) RequiresLegacyProtocol() bool { return w.http.Requ
 func (w *gatedStreamableHTTP) GetOAuthHandler() *transport.OAuthHandler {
 	return w.http.GetOAuthHandler()
 }
-
-// gatedSSE wraps *transport.SSE: HTTPConnection, SetConnectionLostHandler and
-// the OAuth handler accessors.
-type gatedSSE struct {
-	base
-	sse *transport.SSE
-}
-
-func (w *gatedSSE) SetProtocolVersion(version string) { w.sse.SetProtocolVersion(version) }
-
-func (w *gatedSSE) SetConnectionLostHandler(handler func(error)) {
-	w.sse.SetConnectionLostHandler(handler)
-}
-
-func (w *gatedSSE) GetOAuthHandler() *transport.OAuthHandler { return w.sse.GetOAuthHandler() }
 
 // gatedGeneric wraps a transport kind core does not build. It forwards no
 // optional capability; TestWrapTransportCapabilityParity fails for any kind

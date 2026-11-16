@@ -11,6 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mark3labs/mcp-go/v2/mcp"
+	"go.uber.org/zap"
+
 	"github.com/slopster67/mcpproxy-go/internal/auth"
 	"github.com/slopster67/mcpproxy-go/internal/codescripts"
 	"github.com/slopster67/mcpproxy-go/internal/config"
@@ -22,10 +25,6 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/storage"
 	"github.com/slopster67/mcpproxy-go/internal/upstream"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/managed"
-
-	"github.com/mark3labs/mcp-go/v2/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/v2/server"
-	"go.uber.org/zap"
 )
 
 // The code_execution tool is registered on two surfaces — the default tool set
@@ -142,9 +141,9 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 	resolveCodeExecutionDefaults(&options, configTimeoutMs, configMaxToolCalls, configMaxParallel)
 
 	// Extract session information from context
-	var sessionID, clientName, clientVersion string
-	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-		sessionID = sess.SessionID()
+	sessionID := sessionIDFromContext(ctx)
+	var clientName, clientVersion string
+	if sessionID != "" {
 		if sessInfo := p.sessionStore.GetSession(sessionID); sessInfo != nil {
 			clientName = sessInfo.ClientName
 			clientVersion = sessInfo.ClientVersion

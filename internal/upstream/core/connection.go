@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/slopster67/mcpproxy-go/internal/logs"
 	"github.com/slopster67/mcpproxy-go/internal/oauth"
 	"github.com/slopster67/mcpproxy-go/internal/transport"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/dialgate"
-
-	"go.uber.org/zap"
 )
 
 const (
@@ -29,7 +29,6 @@ const (
 	// Transport types
 	transportHTTP           = "http"
 	transportHTTPStreamable = "streamable-http"
-	transportSSE            = "sse"
 )
 
 // Context key types
@@ -238,7 +237,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	var err error
 	if c.config.ExecutionHost() == "" {
 		switch c.transportType {
-		case transportHTTP, transportHTTPStreamable, transportSSE:
+		case transportHTTP, transportHTTPStreamable:
 			if c.config.Command != "" {
 				c.logger.Debug("🚀 Launching local upstream before HTTP/SSE connect",
 					zap.String("server", c.config.Name),
@@ -259,9 +258,6 @@ func (c *Client) Connect(ctx context.Context) error {
 		case transportHTTP, transportHTTPStreamable:
 			c.logger.Debug("🌐 Using HTTP transport")
 			err = c.connectHTTP(ctx)
-		case transportSSE:
-			c.logger.Debug("📡 Using SSE transport")
-			err = c.connectSSE(ctx)
 		default:
 			return fmt.Errorf("unsupported transport type: %s", c.transportType)
 		}

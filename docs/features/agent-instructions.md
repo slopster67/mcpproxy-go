@@ -51,7 +51,7 @@ a tool is called, so it stays in sync with what the caller can actually do:
 
 | Source | Effect on the text |
 |--------|--------------------|
-| [Profile](profiles.md) (assigned or selected with `set_profile`) | Only the profile's servers are listed. The tiers of its selected tools set "Allowed operations". |
+| [Profile](profiles.md) (assigned or selected in request metadata) | Only the profile's servers are listed. The tiers of its selected tools set "Allowed operations". |
 | Client permissions | `code_execution` is reported as unavailable without **Allow code execution**. |
 | Server state | Only enabled, **connected** servers on the connection host are listed. |
 
@@ -59,12 +59,7 @@ A caller never sees the name of a server outside its scope. When the set of
 connected servers changes, mcpproxy sends `notifications/tools/list_changed` so
 clients re-list and pick up the new `retrieve_tools` description.
 
-:::note
-Initialize instructions are read once per connection, and `set_profile` does not
-push `tools/list_changed`, so after a mid-session switch the client keeps the text
-it already holds until it re-lists or reconnects. `retrieve_tools` results and
-tool calls always follow the new profile.
-:::
+Instructions are returned by `server/discover` and reflect the request credentials.
 
 ### Describing a server
 

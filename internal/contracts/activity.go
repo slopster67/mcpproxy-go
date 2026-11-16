@@ -47,7 +47,7 @@ type ActivityRecord struct {
 	// client_name is self-reported and stays. Absent on records with no
 	// MCP/REST request context.
 	Profile       string `json:"profile,omitempty"`        // Effective profile name (profile_change: the new profile)
-	ProfileSource string `json:"profile_source,omitempty"` // pin|binding|url|session|anonymous|none
+	ProfileSource string `json:"profile_source,omitempty"` // pin|binding|request|none
 	ClientID      string `json:"client_id,omitempty"`      // Client id from the client-credential binding
 	ClientName    string `json:"client_name,omitempty"`    // Self-reported clientInfo.name (advisory)
 	TokenName     string `json:"token_name,omitempty"`     // Agent/client token name

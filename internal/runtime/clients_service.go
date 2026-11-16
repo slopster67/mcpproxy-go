@@ -10,9 +10,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"go.uber.org/zap"
-
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"github.com/slopster67/mcpproxy-go/internal/auth"
 	"github.com/slopster67/mcpproxy-go/internal/config"
@@ -47,11 +46,7 @@ type ClientCredentialStore interface {
 	ListClientCredentials() ([]auth.ClientCredential, error)
 }
 
-// BindingNotifier delivers the live effects for a token whose binding
-// changed: clear the stored set_profile selection of every session it
-// authenticated and send notifications/tools/list_changed to each. The server
-// implements it; it is called synchronously so clearing is complete before
-// the mutation returns.
+// BindingNotifier sends tools/list_changed when a credential binding changes.
 type BindingNotifier interface {
 	NotifyBindingChanged(tokenName string)
 }

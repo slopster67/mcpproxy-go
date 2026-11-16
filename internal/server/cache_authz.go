@@ -17,7 +17,7 @@ import (
 // cacheAuthorization derives the authorization a request acts under, in the
 // shape the cache stamps on entries and checks on reads:
 // caller kind, principal, agent server scope, permission tier, profile pin and
-// the effective profile (token pin > URL > session set_profile).
+// the effective profile (credential binding > request metadata).
 //
 // A request with no auth context at all is the unauthenticated /mcp path,
 // which the auth middleware would otherwise have handed an anonymous admin
@@ -61,8 +61,7 @@ func (p *MCPProxyServer) cacheAuthorizationWith(ctx context.Context, profileName
 		a.ProfileScoped = true
 		// A caller-bounded token's stamp is the
 		// CALLER-INTERSECTED profile membership — the same
-		// EffectiveServersFor helper handleSetProfile's own scoped-visible
-		// path already renders through (profile_tool.go), O(len(callerAllowed))
+		// EffectiveServersFor helper used by profile visibility, O(len(callerAllowed))
 		// via idx's precomputed serverPos/members data, never a fleet- or
 		// profile-declared-size walk. A profile member entirely outside the
 		// token's own grant (the token never had, and never will have,
@@ -117,7 +116,7 @@ func (s producerCacheStore) Store(key, toolName string, args map[string]interfac
 // through, stamping every entry with producer — the authorization the handler
 // captured when it authorized the call (never re-sampled at truncation time:
 // read_cache gates the read and re-caches an oversize page, and a concurrent
-// set_profile or profile deletion must not stamp the page under a different
+// A profile change must not stamp the page under a different
 // scope than the one that passed the gate). Returns an untyped nil when there
 // is no cache manager so the helpers' `cacheStore != nil` short-circuit holds.
 func (p *MCPProxyServer) cacheStoreAs(producer cache.Authorization) CacheStore {

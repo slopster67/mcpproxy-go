@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -12,6 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+
+	"github.com/mark3labs/mcp-go/v2/mcp"
+	mcpserver "github.com/mark3labs/mcp-go/v2/server"
+	"go.uber.org/zap"
 
 	"github.com/slopster67/mcpproxy-go/internal/auth"
 	"github.com/slopster67/mcpproxy-go/internal/cache"
@@ -29,12 +34,6 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/truncate"
 	"github.com/slopster67/mcpproxy-go/internal/upstream"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/managed"
-
-	"errors"
-
-	"github.com/mark3labs/mcp-go/v2/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/v2/server"
-	"go.uber.org/zap"
 )
 
 const (
@@ -70,6 +69,8 @@ func mcpServerVersion() string {
 
 // MCPProxyServer implements an MCP server that acts as a proxy
 type MCPProxyServer struct {
+	continuationMu      sync.Mutex
+	continuations       map[string]*continuation
 	managementIndexOnce sync.Once
 	managementIndex     *index.Manager
 	managementIndexErr  error
@@ -210,10 +211,7 @@ func NewMCPProxyServer(
 	}
 
 	// Forward handles to the MCP server and the proxy, both constructed below but
-	// needed by the hooks above them (to send a roots request back to the client,
-	// and to attribute work to a session). Atomic because the hooks run on client
-	// goroutines.
-	var mcpSrvRef atomic.Pointer[mcpserver.MCPServer]
+	// needed by the hooks above them to attribute work.
 	var proxyRef atomic.Pointer[MCPProxyServer]
 
 	// Create hooks to capture session information
@@ -222,129 +220,42 @@ func NewMCPProxyServer(
 	// Without this, sessions that only do retrieve_tools (not tool calls) would
 	// appear inactive and get closed by the background cleanup.
 	hooks.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {
-		session := mcpserver.ClientSessionFromContext(ctx)
-		if session == nil {
-			return
+		sessionID := sessionIDFromContext(ctx)
+		var metadata struct {
+			Params struct {
+				Meta map[string]any `json:"_meta"`
+			} `json:"params"`
 		}
-		sessionStore.UpdateActivity(session.SessionID())
-
-		// Ask the client which project it is working in — once, lazily,
-		// on the first real request after the handshake.
-		//
-		// The timing is the whole trick, and two obvious options are both wrong:
-		//   - AddAfterInitialize runs BEFORE the initialize response is written,
-		//     so asking there DEADLOCKS: the client cannot answer until it has
-		//     the initialize result it is still waiting for.
-		//   - notifications/initialized never reaches this hook at all — mcp-go
-		//     dispatches notifications before beforeAny is invoked
-		//     (request_handler.go: `if baseMessage.ID == nil { ... return }`).
-		//
-		// The first request with an id (tools/list, tools/call, ...) is the
-		// earliest point that both fires this hook and finds the client able to
-		// answer. Fetching is async and best-effort: a client that will not
-		// answer simply has no workspace.
-		if method != mcp.MethodInitialize && sessionStore.TryClaimWorkspaceFetch(session.SessionID()) {
-			go fetchWorkspaceRoot(ctx, mcpSrvRef.Load(), sessionStore, logger)
+		if raw, err := json.Marshal(message); err == nil && json.Unmarshal(raw, &metadata) == nil {
+			if box, ok := ctx.Value(directRequestKindCtxKey{}).(*directRequestKindBox); ok {
+				box.profile, _ = metadata.Params.Meta["ke.oa.mcpproxy/profile"].(string)
+			}
 		}
+		if info := mcpserver.RequestProtocolInfoFromContext(ctx); info != nil {
+			name, version := "", ""
+			if info.ClientInfo != nil {
+				name, version = info.ClientInfo.Name, info.ClientInfo.Version
+			}
+			sessionStore.SetSession(sessionID, name, version, false, false, nil)
+			if ac := auth.AuthContextFromContext(ctx); ac != nil {
+				sessionStore.SetSessionIdentity(sessionID, ac.AgentName, ac.ClientID)
+				sessionStore.SetSessionTokenPrefix(sessionID, ac.TokenPrefix)
+			}
+			if call, ok := message.(*mcp.CallToolRequest); ok && call.Params.Meta != nil {
+				if workspace, ok := call.Params.Meta.AdditionalFields["ke.oa.mcpproxy/workspace"].(string); ok {
+					sessionStore.SetWorkspace(sessionID, workspace)
+				}
+			}
+		}
+		sessionStore.UpdateActivity(sessionID)
 
-		// Attribute this request to a work session before the handler
-		// runs, so every activity record the handler writes carries it. Kicked off
-		// AFTER the roots fetch above, which it may wait on briefly — the fetch is
-		// already in flight by then.
 		if proxy := proxyRef.Load(); proxy != nil {
 			proxy.markWorkIfToolCall(ctx, method)
 		}
 	})
 
-	hooks.AddOnRegisterSession(func(ctx context.Context, sess mcpserver.ClientSession) {
-		sessionID := sess.SessionID()
-
-		// Client info and capabilities are set by OnAfterInitialize. A transport
-		// can re-register an id that was unregistered without a new initialize
-		// (a GET stream ending and being re-opened), so revive the soft-closed
-		// entry to keep its attribution.
-		sessionStore.Reopen(sessionID)
-		logger.Info("MCP session registered",
-			zap.String("session_id", sessionID),
-		)
-	})
-
-	// Add hook to capture client capabilities after initialize completes
-	// This hook is called for ALL transports (including HTTP POST), and receives the
-	// InitializeRequest with client info and capabilities.
-	hooks.AddAfterInitialize(func(ctx context.Context, id any, request *mcp.InitializeRequest, result *mcp.InitializeResult) {
-		// Get session from context
-		session := mcpserver.ClientSessionFromContext(ctx)
-		if session == nil {
-			return
-		}
-
-		sessionID := session.SessionID()
-
-		// Extract client info and capabilities directly from the initialize request
-		// This works for all transports, including ephemeral streamable HTTP sessions
-		clientName := request.Params.ClientInfo.Name
-		clientVersion := request.Params.ClientInfo.Version
-
-		capabilities := request.Params.Capabilities
-		hasRoots := capabilities.Roots != nil
-		hasSampling := capabilities.Sampling != nil
-
-		var experimental []string
-		if len(capabilities.Experimental) > 0 {
-			experimental = make([]string, 0, len(capabilities.Experimental))
-			for key := range capabilities.Experimental {
-				experimental = append(experimental, key)
-			}
-		}
-
-		// Store/update session information with capabilities
-		sessionStore.SetSession(sessionID, clientName, clientVersion, hasRoots, hasSampling, experimental)
-
-		// Record which credential authenticated
-		// this session and which server instance serves it, so a binding
-		// change can find the session and notify it on the right instance.
-		// The credential never changes mid-connection, so this is once.
-		if ac := auth.AuthContextFromContext(ctx); ac != nil && ac.AgentName != "" {
-			sessionStore.SetSessionIdentity(sessionID, ac.AgentName, ac.ClientID)
-			sessionStore.SetSessionTokenPrefix(sessionID, ac.TokenPrefix)
-		}
-		sessionStore.SetSessionServer(sessionID, mcpserver.ServerFromContext(ctx))
-
-		logger.Info("MCP client initialized with capabilities",
-			zap.String("session_id", sessionID),
-			zap.String("client_name", clientName),
-			zap.String("client_version", clientVersion),
-			zap.Bool("has_roots", hasRoots),
-			zap.Bool("has_sampling", hasSampling),
-			zap.Strings("experimental", experimental),
-		)
-	})
-
 	// Per-caller instructions: profile, token scope and limits (mcp_agent_access.go).
 	installCallerInstructionsHooks(hooks, proxyRef.Load)
-
-	// Add hook to clean up session on disconnect
-	// NOTE: for Streamable HTTP this hook fires whenever a GET stream ends, not
-	// only on a real disconnect, and the client may keep using the same session id
-	// afterwards. So it only soft-closes (SessionStore.RemoveSession): attribution
-	// is kept and revived by the next activity or register, and closed entries are
-	// evicted after a TTL. Persisted records are also closed by inactivity timeout
-	// (see runtime.backgroundSessionCleanup).
-	hooks.AddOnUnregisterSession(func(ctx context.Context, sess mcpserver.ClientSession) {
-		sessionID := sess.SessionID()
-
-		logger.Debug("OnUnregisterSession hook called - transport supports disconnect detection",
-			zap.String("session_id", sessionID),
-		)
-
-		// Soft-close the session (closes in storage, keeps attribution)
-		sessionStore.RemoveSession(sessionID)
-
-		logger.Info("MCP session unregistered",
-			zap.String("session_id", sessionID),
-		)
-	})
 
 	// Annotate every tool in tools/list responses with
 	// `_meta.anthropic/maxResultSizeChars`. Claude Code and other clients
@@ -373,10 +284,6 @@ func NewMCPProxyServer(
 		mcpServerVersion(),
 		capabilities...,
 	)
-
-	// Publish the server to the hooks, which need it to ask the client for its
-	// workspace roots. Set before the server ever serves a request.
-	mcpSrvRef.Store(mcpServer)
 
 	jsPool, err := jsruntime.NewPool(config.CodeExecutionPoolSize)
 	if err != nil {
@@ -414,6 +321,7 @@ func NewMCPProxyServer(
 
 	// Let the hooks (registered before the proxy existed) reach it.
 	proxyRef.Store(proxy)
+	mcpServer.Use(proxy.continueTool)
 
 	// Build the stored-script index now that the scripts directory is known,
 	// so no scoped request ever lists it.
@@ -720,9 +628,6 @@ func (p *MCPProxyServer) registerTools() {
 
 	p.server.AddTool(buildDescribeToolTool(), p.handleDescribeTool)
 
-	// set_profile switches the session's active profile
-	p.server.AddTool(buildSetProfileTool(), p.handleSetProfile)
-
 	callToolReadTool := buildCallToolVariantTool(contracts.ToolVariantRead)
 	p.server.AddTool(callToolReadTool, p.handleCallToolRead)
 
@@ -781,10 +686,7 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	startTime := time.Now()
 
 	// Extract session info for activity logging
-	var sessionID string
-	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-		sessionID = sess.SessionID()
-	}
+	sessionID := sessionIDFromContext(ctx)
 	requestID := mintCorrelationID("retrieve_tools")
 
 	query, err := request.RequireString("query")
@@ -846,7 +748,7 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	}
 
 	// Resolve the effective profile (token pin > URL > session
-	// set_profile > none) and search the matching per-profile index when one is
+	// request metadata > none) and search the matching per-profile index when one is
 	// in effect. The per-profile index physically holds only that profile's
 	// servers' tools, so switching costs no re-index. The shared index remains
 	// the allow-all fallback; profileScope still post-filters as defense in depth
@@ -1310,12 +1212,7 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	}
 
 	// Helper to get session ID for activity logging
-	getSessionID := func() string {
-		if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-			return sess.SessionID()
-		}
-		return ""
-	}
+	getSessionID := func() string { return sessionIDFromContext(ctx) }
 
 	// Mint the activity request id HERE, above the first policy gate, not at
 	// the point the upstream call is prepared. Intent extraction and intent
@@ -1492,9 +1389,9 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	}
 
 	// Extract session information from context early (needed for activity events, including early failures)
-	var sessionID, clientName, clientVersion string
-	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-		sessionID = sess.SessionID()
+	sessionID := sessionIDFromContext(ctx)
+	var clientName, clientVersion string
+	if sessionID != "" {
 		if sessInfo := p.sessionStore.GetSession(sessionID); sessInfo != nil {
 			clientName = sessInfo.ClientName
 			clientVersion = sessInfo.ClientVersion
@@ -1848,10 +1745,7 @@ func (p *MCPProxyServer) handleReadCache(ctx context.Context, request mcp.CallTo
 	startTime := time.Now()
 
 	// Extract session info for activity logging
-	var sessionID string
-	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-		sessionID = sess.SessionID()
-	}
+	sessionID := sessionIDFromContext(ctx)
 	requestID := mintCorrelationID("read_cache")
 
 	key, err := request.RequireString("key")
@@ -2685,10 +2579,7 @@ func (p *MCPProxyServer) applyOutputValidation(ctx context.Context, serverName, 
 		return nil // clean pass / no-op
 	}
 
-	sessionID := ""
-	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-		sessionID = sess.SessionID()
-	}
+	sessionID := sessionIDFromContext(ctx)
 
 	p.emitActivityPolicyDecision(ctx, serverName, toolName, sessionID, requestID, d.decision, d.reason)
 	if d.block {

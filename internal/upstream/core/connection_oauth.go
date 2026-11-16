@@ -10,6 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mark3labs/mcp-go/v2/client"
+	uptransport "github.com/mark3labs/mcp-go/v2/client/transport"
+	"go.uber.org/zap"
+
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/contracts"
 	"github.com/slopster67/mcpproxy-go/internal/diagnostics"
@@ -17,10 +21,6 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/storage"
 	"github.com/slopster67/mcpproxy-go/internal/transport"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/dialgate"
-
-	"github.com/mark3labs/mcp-go/v2/client"
-	uptransport "github.com/mark3labs/mcp-go/v2/client/transport"
-	"go.uber.org/zap"
 )
 
 type ErrOAuthPending struct {
@@ -44,14 +44,12 @@ func (e *ErrOAuthPending) Error() string {
 // Code attributes a stable diagnostic code so diagnostics.Classify's typed
 // fast-path resolves this to an actionable OAuth user-state instead of
 // MCPX_UNKNOWN_UNCLASSIFIED. A first-time sign-in maps to OAuthLoginRequired;
-// the "stored token broke" variant (connection_oauth.go server-5xx path) maps
-// to OAuthReauthRequired. The distinction is carried in the message text so the
+// an unusable stored grant maps to OAuthReauthRequired. The message makes the
 // stringified error classifies the same way downstream (e.g. health).
 func (e *ErrOAuthPending) Code() diagnostics.Code {
 	lower := strings.ToLower(e.Error())
 	if strings.Contains(lower, "re-login available") ||
-		strings.Contains(lower, "re-authentication required") ||
-		strings.Contains(lower, "server error with stored token") {
+		strings.Contains(lower, "re-authentication required") {
 		return diagnostics.OAuthReauthRequired
 	}
 	return diagnostics.OAuthLoginRequired
@@ -101,7 +99,7 @@ func (c *Client) storedGrantPending() *ErrOAuthPending {
 // IsOAuthPending checks if an error is (or wraps) an ErrOAuthPending.
 //
 // It MUST unwrap: the pending error is raised inside an auth strategy and then
-// wrapped twice on its way out — connectHTTP/connectSSE add "all authentication
+// wrapped twice on its way out — connectHTTP adds "all authentication
 // strategies failed, last error: %w" and Connect adds "failed to connect: %w".
 func IsOAuthPending(err error) bool {
 	var pending *ErrOAuthPending
@@ -216,7 +214,7 @@ func (c *Client) tryOAuthAuth(ctx context.Context) (oauthErr error) {
 	logger.Debug("🔧 Creating OAuth config with resource auto-detection")
 
 	// Create OAuth config with auto-detected extra params (RFC 8707 resource)
-	oauthConfig, extraParams, oauthConfigErr := oauth.CreateOAuthConfigWithEnv(c.oauthEnv(ctx), c.config, c.storage, c.oauthLogger())
+	oauthConfig, extraParams, oauthConfigErr := c.createOAuthConfig(ctx)
 
 	c.logger.Debug("OAuth config created",
 		zap.Bool("config_nil", oauthConfig == nil),
@@ -520,55 +518,6 @@ func (c *Client) tryOAuthAuth(ctx context.Context) (oauthErr error) {
 
 			c.logger.Info("✅ MCP initialization successful after OAuth authorization",
 				zap.String("server", c.config.Name))
-		} else if c.isServerSideError(err) && !skipBrowserFlow {
-			// Server returned 5xx (e.g., 500) during MCP initialize.
-			// Some servers (e.g., Cloudflare Workers) crash with 500 instead of returning
-			// 401 when they receive an invalid/revoked/stale token. Clear the stored token
-			// and attempt a fresh browser OAuth flow.
-			c.logger.Warn("⚠️ Server returned 5xx during MCP init - stored token may be invalid, attempting fresh OAuth",
-				zap.String("server", c.config.Name),
-				logSafeErrorField(err))
-
-			// Clear the stored token so a fresh one can be obtained
-			if tokenStore, ok := oauthConfig.TokenStore.(interface{ ClearToken() error }); ok {
-				if clearErr := tokenStore.ClearToken(); clearErr != nil {
-					c.logger.Warn("Failed to clear stored token",
-						zap.String("server", c.config.Name),
-						logSafeErrorField(clearErr))
-				}
-			}
-
-			c.clearOAuthState()
-
-			// For daemon mode, defer to background retry
-			if c.shouldDeferOAuth(ctx) {
-				c.logger.Info("⏳ Deferring fresh OAuth to background after server 5xx error",
-					zap.String("server", c.config.Name))
-				return &ErrOAuthPending{
-					ServerName: c.config.Name,
-					ServerURL:  c.logSafeURL(),
-					Message:    "server error with stored token - re-sign-in available from the server page",
-				}
-			}
-
-			// Handle fresh OAuth authorization
-			if handleErr := c.handleOAuthAuthorization(ctx, err, oauthConfig, extraParams); handleErr != nil {
-				c.clearOAuthState()
-				oauthErr = fmt.Errorf("OAuth re-authorization after server 5xx failed: %w", handleErr)
-				return oauthErr
-			}
-
-			// Retry MCP initialization with fresh token
-			if retryErr := c.initialize(ctx); retryErr != nil {
-				c.logger.Error("❌ MCP initialization failed after fresh OAuth (server may be down)",
-					zap.String("server", c.config.Name),
-					logSafeErrorField(retryErr))
-				oauthErr = fmt.Errorf("MCP initialize failed after fresh OAuth: %w", retryErr)
-				return oauthErr
-			}
-
-			c.logger.Info("✅ MCP initialization successful after fresh OAuth re-authorization",
-				zap.String("server", c.config.Name))
 		} else {
 			oauthErr = fmt.Errorf("MCP initialize failed during OAuth strategy: %w", err)
 			return oauthErr
@@ -577,325 +526,6 @@ func (c *Client) tryOAuthAuth(ctx context.Context) (oauthErr error) {
 
 	c.logger.Info("✅ MCP initialization completed successfully after OAuth",
 		zap.String("server", c.config.Name))
-
-	return nil
-}
-
-// trySSEOAuthAuth attempts SSE OAuth authentication
-func (c *Client) trySSEOAuthAuth(ctx context.Context) (oauthErr error) {
-	// Use the global OAuth flow coordinator to prevent race conditions
-	coordinator := oauth.GetGlobalCoordinator()
-
-	// Try to start a new OAuth flow for this server
-	flowCtx, err := coordinator.StartFlow(c.config.Name)
-	if err != nil {
-		if err == oauth.ErrFlowInProgress {
-			// Another flow is already in progress for this server
-			// Wait for it to complete instead of starting a new one
-			c.logger.Info("⏳ SSE OAuth flow already in progress for this server, waiting for completion",
-				zap.String("server", c.config.Name))
-
-			waitErr := coordinator.WaitForFlow(ctx, c.config.Name)
-			if waitErr != nil {
-				return fmt.Errorf("waiting for SSE OAuth flow failed: %w", waitErr)
-			}
-
-			// Flow completed; see the streamable-HTTP twin — never nil here.
-			c.logger.Info("✅ SSE OAuth flow completed by another goroutine, retrying connection",
-				zap.String("server", c.config.Name))
-			return errOAuthFlowCompletedElsewhere(c.config.Name)
-		}
-		return fmt.Errorf("failed to start SSE OAuth flow: %w", err)
-	}
-
-	// We own this OAuth flow, make sure to end it when done. oauthErr is the
-	// NAMED return so every exit reaches EndFlow with the real outcome; a nil
-	// outcome would tell a concurrent waiter on the same server that the flow
-	// succeeded.
-	defer func() {
-		success := oauthErr == nil
-		coordinator.EndFlow(c.config.Name, success, oauthErr)
-	}()
-
-	// Update the flow context with the one from the coordinator
-	ctx = oauth.WithFlowContext(ctx, flowCtx)
-	logger := oauth.CorrelationLoggerWithFlow(ctx, c.logger)
-
-	oauth.LogOAuthFlowStart(logger, c.config.Name, flowCtx.CorrelationID)
-
-	tokenManager := oauth.GetTokenStoreManager()
-	skipBrowserFlow := false
-
-	// First check for valid persisted token directly (handles cross-process OAuth)
-	hasTokenPrecheck, hasRefreshPrecheck, tokenExpiredPrecheck := oauth.HasPersistedTokenBound(c.config.Name, c.config.URL, c.storage, c.CredentialBinding())
-	if hasTokenPrecheck && !tokenExpiredPrecheck {
-		logger.Info("🔄 Valid OAuth token found in persistent storage - will skip browser flow if OAuth error occurs",
-			zap.String("server", c.config.Name),
-			zap.Bool("has_refresh_token", hasRefreshPrecheck))
-		skipBrowserFlow = true
-	} else if tokenManager.HasRecentOAuthCompletionBound(c.config.Name, c.CredentialBinding()) {
-		// Also check in-memory completion flag (same-process OAuth)
-		logger.Info("🔄 SSE OAuth was recently completed in this process but token may be stale",
-			zap.String("server", c.config.Name),
-			zap.Bool("has_token", hasTokenPrecheck),
-			zap.Bool("token_expired", tokenExpiredPrecheck))
-	}
-
-	logger.Debug("🔐 Attempting SSE OAuth authentication",
-		zap.String("url", c.logSafeURL()))
-
-	// Mark OAuth as in progress
-	c.markOAuthInProgress()
-
-	// Check if tokens already exist for this server (both in-memory and persisted)
-	hasInMemoryTokens := tokenManager.HasTokenStore(c.config.Name)
-	hasPersistedToken, hasRefreshToken, isExpired := oauth.HasPersistedTokenBound(c.config.Name, c.config.URL, c.storage, c.CredentialBinding())
-	logger.Info("🔍 SSE OAuth strategy token status",
-		zap.Bool("has_in_memory_token_store", hasInMemoryTokens),
-		zap.Bool("has_persisted_token", hasPersistedToken),
-		zap.Bool("has_refresh_token", hasRefreshToken),
-		zap.Bool("token_expired", isExpired),
-		zap.String("strategy", "SSE OAuth"))
-
-	// If we have a persisted token with refresh_token but it's expired,
-	// mcp-go should automatically try to refresh it when we call Start().
-	// Log this scenario for debugging.
-	if hasPersistedToken && hasRefreshToken && isExpired {
-		logger.Info("🔄 Token expired but refresh_token available - mcp-go will attempt automatic refresh",
-			zap.String("strategy", "SSE OAuth"))
-	}
-
-	// Create OAuth config with auto-detected extra params (RFC 8707 resource)
-	oauthConfig, extraParams, oauthConfigErr := oauth.CreateOAuthConfigWithEnv(c.oauthEnv(ctx), c.config, c.storage, c.oauthLogger())
-	if oauthConfig == nil {
-		c.logger.Error("🚨 Failed to create OAuth config", logSafeErrorField(oauthConfigErr))
-		oauthErr = wrapOAuthConfigError(oauthConfigErr)
-		return oauthErr
-	}
-
-	c.logger.Info("🌟 Starting SSE OAuth authentication flow",
-		zap.String("server", c.config.Name),
-		zap.String("redirect_uri", oauthConfig.RedirectURI),
-		zap.Strings("scopes", oauthConfig.Scopes),
-		zap.Bool("pkce_enabled", oauthConfig.PKCEEnabled))
-
-	// Create SSE transport config with OAuth
-	c.logger.Debug("🛠️ Creating SSE transport config for OAuth")
-	httpConfig := c.httpTransportConfig(c.config, oauthConfig)
-
-	c.logger.Debug("🔨 Calling transport.CreateSSEClient with OAuth config")
-	sseClient, err := transport.CreateSSEClient(httpConfig)
-	if err != nil {
-		c.logger.Error("💥 Failed to create OAuth SSE client in transport layer",
-			logSafeErrorField(err))
-		return fmt.Errorf("failed to create OAuth SSE client: %w", err)
-	}
-
-	c.logger.Debug("✅ SSE client created, storing in c.client")
-
-	c.logger.Debug("🔗 OAuth SSE client created, starting connection")
-	c.client = sseClient
-	c.bindOAuthRefresher(oauthConfig) // serialize mcp-go's reactive refresh
-
-	// Register connection lost handler for SSE transport to detect GOAWAY/disconnects
-	c.client.OnConnectionLost(func(err error) {
-		c.logger.Warn("⚠️ SSE OAuth connection lost detected",
-			zap.String("server", c.config.Name),
-			logSafeErrorField(err),
-			zap.String("transport", "sse-oauth"),
-			zap.String("note", "Connection dropped by server or network - will attempt reconnection"))
-	})
-
-	// Add detailed logging before starting the OAuth client
-	c.logger.Info("🚀 Starting OAuth SSE client - this should trigger browser opening",
-		zap.String("server", c.config.Name),
-		zap.String("callback_uri", oauthConfig.RedirectURI))
-
-	// Add debug logging to check environment and system capabilities
-	c.logger.Debug("🔍 SSE OAuth environment diagnostics",
-		zap.String("DISPLAY", os.Getenv("DISPLAY")),
-		zap.String("PATH", os.Getenv("PATH")),
-		zap.String("GOOS", runtime.GOOS),
-		zap.Bool("has_open_command", hasCommand("open")),
-		zap.Bool("has_xdg_open", hasCommand("xdg-open")),
-		zap.String("BROWSER", os.Getenv("BROWSER")),
-		zap.String("XDG_SESSION_TYPE", os.Getenv("XDG_SESSION_TYPE")),
-		zap.String("WAYLAND_DISPLAY", os.Getenv("WAYLAND_DISPLAY")),
-		zap.Bool("CI", os.Getenv("CI") != ""),
-		zap.Bool("HEADLESS", os.Getenv("HEADLESS") != ""))
-
-	// Detect conditions that might prevent browser opening
-	var browserBlockingConditions []string
-	if os.Getenv("CI") != "" {
-		browserBlockingConditions = append(browserBlockingConditions, "CI=true")
-	}
-	if os.Getenv("HEADLESS") != "" {
-		browserBlockingConditions = append(browserBlockingConditions, "HEADLESS=true")
-	}
-	if os.Getenv("NO_BROWSER") != "" {
-		browserBlockingConditions = append(browserBlockingConditions, "NO_BROWSER=true")
-	}
-	if os.Getenv("SSH_CLIENT") != "" || os.Getenv("SSH_TTY") != "" {
-		browserBlockingConditions = append(browserBlockingConditions, "SSH_session")
-	}
-	if runtime.GOOS == osLinux && os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
-		browserBlockingConditions = append(browserBlockingConditions, "no_GUI_on_linux")
-	}
-
-	if len(browserBlockingConditions) > 0 {
-		c.logger.Warn("⚠️ Detected conditions that may prevent browser opening for SSE OAuth",
-			zap.String("server", c.config.Name),
-			zap.Strings("blocking_conditions", browserBlockingConditions),
-			zap.String("recommendation", "You may need to manually open the OAuth URL when prompted"))
-
-		// For remote scenarios, log additional guidance
-		if os.Getenv("SSH_CLIENT") != "" || os.Getenv("SSH_TTY") != "" {
-			c.logger.Info("📡 Remote SSH session detected - extended OAuth timeout enabled",
-				zap.String("server", c.config.Name),
-				zap.Duration("timeout", 120*time.Second),
-				zap.String("note", "OAuth URL will be displayed for manual opening"))
-		}
-	}
-
-	// Start the OAuth client and handle OAuth authorization errors properly
-	c.logger.Info("🚀 Starting SSE OAuth client - using proper mcp-go OAuth error handling",
-		zap.String("server", c.config.Name),
-		zap.Duration("callback_timeout", 120*time.Second))
-
-	persistentCtx := c.Gate().Context() // cancelled when the instance is retired
-	c.logger.Debug("🔍 Starting SSE OAuth client with persistent context",
-		zap.String("server", c.config.Name))
-
-	// Token refresh retry configuration
-	refreshConfig := oauth.DefaultRefreshConfig()
-	var lastErr error
-
-	// If we have a refresh token, retry Start() with exponential backoff
-	// to give mcp-go's automatic token refresh a chance to succeed
-	if hasRefreshToken {
-		backoff := refreshConfig.InitialBackoff
-		for attempt := 1; attempt <= refreshConfig.MaxAttempts; attempt++ {
-			oauth.LogClientConnectionAttempt(c.logger, attempt, refreshConfig.MaxAttempts)
-
-			err = c.client.Start(persistentCtx)
-			if err == nil {
-				oauth.LogClientConnectionSuccess(c.logger, time.Duration(attempt)*backoff)
-				lastErr = nil
-				break
-			}
-
-			// If not an OAuth error, don't retry for token refresh
-			if !client.IsOAuthAuthorizationRequiredError(err) {
-				c.logger.Error("❌ SSE OAuth client start failed with non-OAuth error",
-					zap.String("server", c.config.Name),
-					logSafeErrorField(err))
-				oauthErr = fmt.Errorf("SSE OAuth client start failed: %w", err)
-				return oauthErr
-			}
-
-			oauth.LogClientConnectionFailure(c.logger, attempt, err)
-			lastErr = err
-
-			// Don't sleep on the last attempt
-			if attempt < refreshConfig.MaxAttempts {
-				c.logger.Debug("⏳ Waiting before retry",
-					zap.String("server", c.config.Name),
-					zap.Duration("backoff", backoff),
-					zap.Int("attempt", attempt))
-				time.Sleep(backoff)
-				backoff = min(backoff*2, refreshConfig.MaxBackoff)
-			}
-		}
-	} else {
-		// No refresh token, single attempt
-		err = c.client.Start(persistentCtx)
-		lastErr = err
-	}
-
-	// If we still have an error after retries, proceed with browser OAuth flow
-	if lastErr != nil {
-		if storedGrantUnusable(lastErr) && c.shouldDeferOAuth(ctx) {
-			return c.storedGrantPending()
-		}
-		// Check if this is an OAuth authorization error that we need to handle manually
-		if client.IsOAuthAuthorizationRequiredError(lastErr) {
-			// If we have a valid persisted token (e.g., from CLI OAuth),
-			// skip browser flow and return retriable error. The token exists but
-			// the mcp-go client needs to pick it up on retry.
-			if skipBrowserFlow {
-				c.logger.Info("🔄 SSE OAuth authorization error but valid token exists - skipping browser flow",
-					zap.String("server", c.config.Name),
-					zap.String("tip", "Token should be used on next connection attempt"))
-
-				// Clear in-progress state so retry can proceed
-				c.clearOAuthState()
-
-				// Return a retriable error - the managed client will retry and pick up the token
-				return fmt.Errorf("OAuth token exists in storage, retry connection to use it: %w", lastErr)
-			}
-
-			// mcp-go's SSE Start() asks the token store BEFORE opening the
-			// stream, so a declared-OAuth SSE server with no token lands here on
-			// every automatic connect. Mirror the streamable-HTTP init path:
-			// park in PendingAuth for the daemon instead of a background browser,
-			// and clear the in-progress mark set above — handleOAuthAuthorization
-			// refuses with "already in progress" otherwise.
-			if c.shouldDeferOAuth(ctx) {
-				c.logger.Info("⏳ Deferring SSE OAuth to prevent UI blocking - will retry in background",
-					zap.String("server", c.config.Name))
-				return &ErrOAuthPending{
-					ServerName: c.config.Name,
-					ServerURL:  c.logSafeURL(),
-					Message:    c.oauthPendingMessage(),
-					Probe:      c.speculativeOAuthPark(ctx, hasTokenPrecheck),
-				}
-			}
-
-			c.logger.Info("🎯 SSE OAuth authorization required after connection attempts - starting manual OAuth flow",
-				zap.String("server", c.config.Name),
-				zap.Bool("had_refresh_token", hasRefreshToken))
-
-			c.clearOAuthState()
-
-			// Handle OAuth authorization manually using the example pattern
-			if handleErr := c.handleOAuthAuthorization(ctx, lastErr, oauthConfig, extraParams); handleErr != nil {
-				c.clearOAuthState() // Clear state on OAuth failure
-				oauthErr = fmt.Errorf("SSE OAuth authorization failed: %w", handleErr)
-				return oauthErr
-			}
-
-			// Retry starting the client after OAuth is complete
-			c.logger.Info("🔄 Retrying SSE client start after OAuth authorization",
-				zap.String("server", c.config.Name))
-
-			err = c.client.Start(persistentCtx)
-			if err != nil {
-				c.logger.Error("❌ SSE OAuth client start failed after authorization",
-					zap.String("server", c.config.Name),
-					logSafeErrorField(err))
-				oauthErr = fmt.Errorf("SSE OAuth client start failed after authorization: %w", err)
-				return oauthErr
-			}
-
-			c.logger.Info("✅ SSE OAuth client start successful after authorization",
-				zap.String("server", c.config.Name))
-		} else {
-			c.logger.Error("❌ SSE OAuth client start failed with non-OAuth error",
-				zap.String("server", c.config.Name),
-				logSafeErrorField(lastErr))
-			oauthErr = fmt.Errorf("SSE OAuth client start failed: %w", lastErr)
-			return oauthErr
-		}
-	}
-
-	c.logger.Info("✅ SSE OAuth client started successfully",
-		zap.String("server", c.config.Name))
-
-	// Use the caller's context for initialize() to respect timeouts.
-	if err := c.initialize(ctx); err != nil {
-		oauthErr = fmt.Errorf("MCP initialize failed during SSE OAuth strategy: %w", err)
-		return oauthErr
-	}
 
 	return nil
 }
@@ -1051,6 +681,9 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 	}
 	callbackCh := callbackServer.RegisterState(state)
 	callbackServer.NoteRedirect(state, oauthConfig.RedirectURI)
+	if err := c.bindCallbackIssuer(ctx, callbackServer, state, oauthHandler, oauthConfig); err != nil {
+		return err
+	}
 	defer callbackServer.UnregisterState(state)
 
 	// Check if OAuth credentials are available (either from config or persisted DCR)
@@ -1198,7 +831,7 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 
 	// A persisted DCR client the authorization server has since deleted is
 	// re-registered once instead of opening a browser on a dead client_id.
-	if !hasStaticCredentials && hasPersistedCredentials {
+	if !hasStaticCredentials && hasPersistedCredentials && !strings.HasPrefix(oauthConfig.ClientID, "https://") {
 		recoveredURL, staleErr := c.recoverStaleDCRClient(ctx, oauthHandler, oauthConfig.ClientID, authURL, state, codeChallenge, extraParams, "")
 		if staleErr != nil {
 			return staleErr
@@ -1410,6 +1043,9 @@ func (c *Client) handleOAuthAuthorizationWithResult(ctx context.Context, authErr
 	}
 	callbackCh := callbackServer.RegisterState(state)
 	callbackServer.NoteRedirect(state, oauthConfig.RedirectURI)
+	if err := c.bindCallbackIssuer(ctx, callbackServer, state, oauthHandler, oauthConfig); err != nil {
+		return result, err
+	}
 	defer callbackServer.UnregisterState(state)
 
 	// Check for existing credentials or attempt DCR
@@ -1506,7 +1142,7 @@ func (c *Client) handleOAuthAuthorizationWithResult(ctx context.Context, authErr
 
 	// A persisted DCR client the authorization server has since deleted is
 	// re-registered once instead of opening a browser on a dead client_id.
-	if !hasStaticCredentials && hasPersistedCredentials {
+	if !hasStaticCredentials && hasPersistedCredentials && !strings.HasPrefix(oauthConfig.ClientID, "https://") {
 		recoveredURL, staleErr := c.recoverStaleDCRClient(ctx, oauthHandler, oauthConfig.ClientID, authURL, state, codeChallenge, extraParams, result.CorrelationID)
 		if staleErr != nil {
 			return result, staleErr
@@ -1892,7 +1528,7 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (*OAuthStartResult, er
 	}
 
 	// Create OAuth config
-	oauthConfig, extraParams, oauthConfigErr := oauth.CreateOAuthConfigWithEnv(c.oauthEnv(ctx), c.config, c.storage, c.oauthLogger())
+	oauthConfig, extraParams, oauthConfigErr := c.createOAuthConfig(ctx)
 	if oauthConfig == nil {
 		c.logger.Error("❌ Failed to create OAuth config",
 			zap.String("server", c.config.Name),
@@ -2151,7 +1787,7 @@ func (c *Client) getAuthorizationURLQuick(ctx context.Context, oauthConfig *clie
 	// A persisted DCR client the authorization server has since deleted is
 	// re-registered once instead of handing out a URL the server answers with
 	// HTTP 400 "Invalid client_id" and never redirects back from.
-	if !hasStaticCredentials && hasPersistedCredentials {
+	if !hasStaticCredentials && hasPersistedCredentials && !strings.HasPrefix(oauthConfig.ClientID, "https://") {
 		recoveredURL, staleErr := c.recoverStaleDCRClient(ctx, oauthHandler, oauthConfig.ClientID, authURL, state, codeChallenge, extraParams, correlationID)
 		if staleErr != nil {
 			return "", nil, "", "", staleErr
@@ -2168,6 +1804,9 @@ func (c *Client) getAuthorizationURLQuick(ctx context.Context, oauthConfig *clie
 	if callbackServer, exists := oauth.GetCallbackServer(c.config.Name); exists {
 		callbackServer.RegisterState(state)
 		callbackServer.NoteRedirect(state, oauthConfig.RedirectURI)
+		if err := c.bindCallbackIssuer(ctx, callbackServer, state, oauthHandler, oauthConfig); err != nil {
+			return "", nil, "", "", err
+		}
 	}
 
 	return authURL, oauthHandler, codeVerifier, state, nil
@@ -2397,8 +2036,6 @@ func (c *Client) ForceOAuthFlowWithResult(ctx context.Context) (*OAuthStartResul
 	switch c.transportType {
 	case transportHTTP, transportHTTPStreamable:
 		return c.forceHTTPOAuthFlowWithResult(manualCtx)
-	case transportSSE:
-		return c.forceSSEOAuthFlowWithResult(manualCtx)
 	default:
 		return nil, fmt.Errorf("OAuth not supported for transport type: %s", c.transportType)
 	}
@@ -2420,7 +2057,7 @@ func wrapOAuthConfigError(err error) error {
 // forceHTTPOAuthFlowWithResult forces OAuth flow for HTTP transport and returns auth URL/browser status.
 func (c *Client) forceHTTPOAuthFlowWithResult(ctx context.Context) (*OAuthStartResult, error) {
 	// Create OAuth config with auto-detected extra params (RFC 8707 resource)
-	oauthConfig, extraParams, oauthConfigErr := oauth.CreateOAuthConfigWithEnv(c.oauthEnv(ctx), c.config, c.storage, c.oauthLogger())
+	oauthConfig, extraParams, oauthConfigErr := c.createOAuthConfig(ctx)
 	if oauthConfig == nil {
 		c.logger.Error("❌ Failed to create OAuth config",
 			zap.String("server", c.config.Name),
@@ -2491,104 +2128,6 @@ func (c *Client) forceHTTPOAuthFlowWithResult(ctx context.Context) (*OAuthStartR
 	return &OAuthStartResult{BrowserOpened: false}, nil
 }
 
-// forceSSEOAuthFlowWithResult forces OAuth flow for SSE transport and returns auth URL/browser status.
-func (c *Client) forceSSEOAuthFlowWithResult(ctx context.Context) (*OAuthStartResult, error) {
-	// Create OAuth config with auto-detected extra params (RFC 8707 resource)
-	oauthConfig, extraParams, oauthConfigErr := oauth.CreateOAuthConfigWithEnv(c.oauthEnv(ctx), c.config, c.storage, c.oauthLogger())
-	if oauthConfig == nil {
-		c.logger.Error("❌ Failed to create OAuth config",
-			zap.String("server", c.config.Name),
-			logSafeErrorField(oauthConfigErr))
-		return nil, wrapOAuthConfigError(oauthConfigErr)
-	}
-
-	c.logger.Info("🌐 Starting manual SSE OAuth flow with result tracking...",
-		zap.String("server", c.config.Name),
-		zap.Int("extra_params_count", len(extraParams)))
-
-	// Create SSE transport config with OAuth
-	httpConfig := c.httpTransportConfig(c.config, oauthConfig)
-
-	// Create OAuth-enabled SSE client using transport layer
-	sseClient, err := transport.CreateSSEClient(httpConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create OAuth SSE client: %w", err)
-	}
-
-	// Store the client temporarily
-	c.client = sseClient
-	c.bindOAuthRefresher(oauthConfig) // serialize mcp-go's reactive refresh
-
-	c.logger.Info("🚀 Starting OAuth SSE client and triggering authorization...")
-
-	// Start the client first - this may fail with authorization required for SSE
-	var result *OAuthStartResult
-	err = c.client.Start(ctx)
-	if err != nil {
-		// Check if this is an OAuth authorization error from Start()
-		if c.isOAuthError(err) || strings.Contains(err.Error(), "authorization required") || strings.Contains(err.Error(), "no valid token") {
-			c.logger.Info("✅ OAuth authorization required from SSE Start() - triggering manual OAuth flow")
-
-			// Handle OAuth authorization manually and get result. Assign the
-			// outer result: the post-initialize check below uses it to tell
-			// that a flow has already run.
-			var oauthErr error
-			result, oauthErr = c.handleOAuthAuthorizationWithResult(ctx, err, oauthConfig, extraParams)
-			if oauthErr != nil {
-				return result, fmt.Errorf("OAuth authorization failed: %w", oauthErr)
-			}
-
-			// Retry starting the client after OAuth is complete
-			c.logger.Info("🔄 Retrying SSE client start after OAuth authorization")
-			err = c.client.Start(ctx)
-			if err != nil {
-				return result, fmt.Errorf("SSE client start failed after OAuth authorization: %w", err)
-			}
-		} else {
-			return nil, fmt.Errorf("failed to start OAuth client: %w", err)
-		}
-	}
-
-	// Now try to initialize to ensure connection is working
-	c.logger.Info("🎯 Attempting initialize to verify connection...")
-	err = c.initialize(ctx)
-	if err == nil && result == nil {
-		// A per-method-auth upstream passes this probe; honour the
-		// operator's OAuth mode "on" instead of concluding "no OAuth needed".
-		// (result != nil means Start() already ran the flow above.)
-		err = c.forcedAuthorizationRequired()
-	}
-	if err != nil {
-		// Check if this is an OAuth authorization error that we need to handle manually
-		if client.IsOAuthAuthorizationRequiredError(err) || c.isOAuthError(err) {
-			c.logger.Info("✅ OAuth authorization requirement from initialize - starting manual OAuth flow")
-
-			// Handle OAuth authorization manually and get result (assign the
-			// outer result — see the Start() branch above).
-			var oauthErr error
-			result, oauthErr = c.handleOAuthAuthorizationWithResult(ctx, err, oauthConfig, extraParams)
-			if oauthErr != nil {
-				return result, fmt.Errorf("OAuth authorization failed: %w", oauthErr)
-			}
-
-			// Retry initialization after OAuth is complete
-			c.logger.Info("🔄 Retrying initialization after OAuth authorization")
-			err = c.initialize(ctx)
-			if err != nil {
-				return result, fmt.Errorf("initialization failed after OAuth authorization: %w", err)
-			}
-		} else {
-			return nil, fmt.Errorf("initialization failed with non-OAuth error: %w", err)
-		}
-	}
-
-	c.logger.Info("✅ Manual SSE OAuth authentication completed successfully")
-	if result == nil {
-		result = &OAuthStartResult{BrowserOpened: false}
-	}
-	return result, nil
-}
-
 // isManualOAuthFlow checks if this is a manual OAuth flow
 func (c *Client) isManualOAuthFlow(ctx context.Context) bool {
 	// Check if context has manual OAuth marker
@@ -2644,4 +2183,46 @@ func scrubMetadataStatus(m *contracts.MetadataStatus) {
 	for i, u := range m.AuthorizationServers {
 		m.AuthorizationServers[i] = oauth.LogSafeURL(u)
 	}
+}
+
+func (c *Client) bindCallbackIssuer(ctx context.Context, cb *oauth.CallbackServer, state string, handler *uptransport.OAuthHandler, cfg *client.OAuthConfig) error {
+	metadata, err := handler.GetServerMetadata(ctx)
+	if err != nil {
+		cb.UnregisterState(state)
+		return err
+	}
+	err = cb.BindIssuer(ctx, state, cfg.AuthServerMetadataURL, metadata.Issuer, cfg.HTTPClient)
+	if err != nil {
+		cb.UnregisterState(state)
+	}
+	return err
+}
+
+func (c *Client) createOAuthConfig(ctx context.Context) (*client.OAuthConfig, map[string]string, error) {
+	env := c.oauthEnv(ctx)
+	if metadata, ok := c.challengeMetadata.Load().(string); ok {
+		env.ResourceMetadataURL = metadata
+	}
+	cfg, extra, err := oauth.CreateOAuthConfigWithEnv(env, c.config, c.storage, c.oauthLogger())
+	if err != nil {
+		return nil, nil, err
+	}
+	if metadata, ok := c.challengeMetadata.Load().(string); ok && metadata != "" {
+		cfg.ProtectedResourceMetadataURL = metadata
+	}
+	if scopes, ok := c.challengeScopes.Load().(string); ok && scopes != "" {
+		for _, scope := range strings.Fields(scopes) {
+			found := false
+			for _, existing := range cfg.Scopes {
+				if existing == scope {
+					found = true
+					break
+				}
+			}
+			if !found {
+				cfg.Scopes = append(cfg.Scopes, scope)
+			}
+		}
+	}
+	return cfg, extra, nil
 }

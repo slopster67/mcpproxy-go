@@ -20,6 +20,7 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/contracts"
 	"github.com/slopster67/mcpproxy-go/internal/dashboardauth"
 	"github.com/slopster67/mcpproxy-go/internal/httpapi"
+	"github.com/slopster67/mcpproxy-go/internal/httpx"
 	"github.com/slopster67/mcpproxy-go/internal/management"
 	"github.com/slopster67/mcpproxy-go/internal/mcpauth"
 	"github.com/slopster67/mcpproxy-go/internal/oauth"
@@ -117,15 +118,7 @@ func NewServer(cfg *config.Config, logger *zap.Logger) (*Server, error) {
 	)
 
 	server.mcpProxy = mcpProxy
-	//: the one evaluator behind every guarded write (config routes,
-	// connect, client bindings) and the runtime anonymous guard.
-	// the profiles service asks the same proxy for effective tools,
-	// try, explain and tool counts, and tells it to rewrite live sessions'
-	// stored selections on a rename or delete.
 	rt.SetProfileEvaluator(mcpProxy)
-	rt.ProfilesService().SetSessionHook(mcpProxy)
-	//: a binding change clears the stored set_profile selection of every
-	// live session of that credential and sends tools/list_changed to each.
 	rt.ClientsService().SetNotifier(mcpProxy)
 
 	// Registered BEFORE StartBackgroundInitialization so the first server
@@ -172,7 +165,7 @@ func (s *Server) installProfilePublishObserver(mcpProxy *MCPProxyServer) *profil
 // static client token or an OAuth access token issued for them. A client's
 // assigned host decides where its calls run, whichever address it entered by.
 func (s *Server) mcpAuthMiddleware(next http.Handler) http.Handler {
-	next = directRequestKindMiddleware(next)
+	next = directRequestKindMiddleware(next, s.mcpProxy.sessionStore)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := httpapi.ExtractToken(r)
 		if token == "" {
@@ -196,7 +189,7 @@ func (s *Server) mcpAuthMiddleware(next http.Handler) http.Handler {
 			}
 		case strings.HasPrefix(token, mcpauth.AccessPrefix):
 			var ok bool
-			if record, ok = s.oauth.AuthenticateClient(token); !ok {
+			if record, ok = s.oauth.AuthenticateClient(token, httpx.PublicOrigin(r)+"/mcp"); !ok {
 				mcpauth.Challenge(w, r, true, "The access token is invalid, expired or revoked")
 				return
 			}
@@ -917,7 +910,7 @@ func (s *Server) streamingNoDeadline(next http.Handler) http.Handler {
 func clientFacingStreamableOptions() []server.StreamableHTTPOption {
 	return []server.StreamableHTTPOption{
 		server.WithDisableLocalhostProtection(true),
-		server.WithStreamableHTTPProtocolVersions(mcp.LegacyProtocolVersions()...),
+		server.WithStreamableHTTPProtocolVersions(mcp.LATEST_PROTOCOL_VERSION),
 	}
 }
 
@@ -1031,7 +1024,7 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	s.mu.Lock()
 	s.httpServer = &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           publicOriginHandler(mux),
+		Handler:           publicOriginHandler(mux, cfg.AllowedOrigins),
 		ReadHeaderTimeout: 60 * time.Second, // Slowloris guard — deliberately not configurable
 		ReadTimeout:       readTimeout,      // Full request read timeout (http_read_timeout)
 		WriteTimeout:      writeTimeout,     // Response write timeout (http_write_timeout; 0 = none; streaming routes opt out)
