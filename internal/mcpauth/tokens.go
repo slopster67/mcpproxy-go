@@ -1,8 +1,3 @@
-// Package mcpauth is the primary's OAuth 2.1 authorization server. MCP clients
-// (harnesses) and peers sign in through the dashboard's OIDC session and pick
-// the saved client or peer they act as. Issued tokens are stateless: they are
-// HMAC-signed and bound to the subject's current static credential, so rotating
-// or deleting that client or peer revokes every OAuth token issued for it.
 package mcpauth
 
 import (
@@ -39,12 +34,15 @@ const (
 )
 
 type claims struct {
-	Type    string `json:"t"` // "a" access, "r" refresh
-	Kind    Kind   `json:"k"`
-	Subject string `json:"s"`
-	Version string `json:"v"`
-	App     string `json:"c"`
-	Expires int64  `json:"e"`
+	Resource string `json:"resource"`
+	Family   string `json:"family"`
+	TokenID  string `json:"id"`
+	Type     string `json:"t"` // "a" access, "r" refresh
+	Kind     Kind   `json:"k"`
+	Subject  string `json:"s"`
+	Version  string `json:"v"`
+	App      string `json:"c"`
+	Expires  int64  `json:"e"`
 }
 
 // app is a registered OAuth client, carried inside its signed client_id.

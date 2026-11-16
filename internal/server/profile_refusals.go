@@ -8,7 +8,7 @@ import (
 
 func profileDisclosedTo(source profile.Source) bool {
 	switch source {
-	case profile.SourcePin, profile.SourceBinding, profile.SourceSession:
+	case profile.SourcePin, profile.SourceBinding, profile.SourceRequest:
 		return true
 	default:
 		return false

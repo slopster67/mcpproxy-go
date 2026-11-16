@@ -121,10 +121,10 @@ export type ProfileReason = typeof ProfileReasonNone | typeof ProfileReasonServe
 
 export const ProfileSourcePin = 'pin' as const;
 export const ProfileSourceBinding = 'binding' as const;
-export const ProfileSourceSession = 'session' as const;
+export const ProfileSourceRequest = 'request' as const;
 
 export const ProfileSourceNone = 'none' as const;
-export type ProfileSource = typeof ProfileSourcePin | typeof ProfileSourceBinding | typeof ProfileSourceSession | typeof ProfileSourceNone;
+export type ProfileSource = typeof ProfileSourcePin | typeof ProfileSourceBinding | typeof ProfileSourceRequest | typeof ProfileSourceNone;
 
 
 export const BlockReasonProfileRule = 'profile_rule' as const;

@@ -2,153 +2,13 @@ package server
 
 import (
 	"context"
-	"time"
 
 	"github.com/mark3labs/mcp-go/v2/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/v2/server"
-	"go.uber.org/zap"
 
 	"github.com/slopster67/mcpproxy-go/internal/auth"
 	"github.com/slopster67/mcpproxy-go/internal/runtime"
 )
 
-// workspaceFetchTimeout bounds one roots round-trip.
-const workspaceFetchTimeout = 10 * time.Second
-
-// workspaceFetchAttempts: the roots request travels back to the client on its
-// listening SSE stream, which on Streamable HTTP may not be open yet when the
-// client fires its very first request. Retry rather than losing the workspace to
-// a startup race.
-const workspaceFetchAttempts = 3
-
-// workspaceFetchRetryDelay spaces the attempts out.
-const workspaceFetchRetryDelay = 2 * time.Second
-
-// workspaceSettleWait is how long the FIRST piece of activity waits for the
-// client's roots before being attributed without a project.
-//
-// This wait is what keeps one connection inside one work session. Without it the
-// first tool call resolves a workspace-less key and the second — roots having
-// landed in between — resolves a workspace-keyed one, splitting a single
-// connection across two work sessions: precisely the fragmentation this feature
-// exists to remove. Paid at most once per connection, and not at all by clients
-// that never declared roots.
-const workspaceSettleWait = 3 * time.Second
-
-// fetchWorkspaceRoot asks the client which project it is working in, and records
-// the answer on the session.
-//
-// Runs in a goroutine off the first request. The timing is the whole trick, and
-// two obvious choices are both wrong:
-//
-//   - AddAfterInitialize runs BEFORE the initialize response is written, so a
-//     roots request there DEADLOCKS: the client cannot answer until it has the
-//     initialize result it is still waiting for.
-//   - notifications/initialized never reaches the hook at all — mcp-go dispatches
-//     notifications before beforeAny (request_handler.go).
-//
-// The first request with an id is the earliest point that both fires the hook
-// and finds the client able to answer.
-//
-// However this turns out, the workspace is marked "settled" on the way out, so
-// nothing waits on an answer that is never coming.
-func fetchWorkspaceRoot(ctx context.Context, srv *mcpserver.MCPServer, store *SessionStore, logger *zap.Logger) {
-	if srv == nil || store == nil {
-		return
-	}
-
-	session := mcpserver.ClientSessionFromContext(ctx)
-	if session == nil {
-		return
-	}
-	sessionID := session.SessionID()
-
-	// Release anything waiting on the workspace, whatever happens below.
-	defer store.AbandonWorkspaceFetch(sessionID)
-
-	// Keep the session values (the client session lives in the context) but drop
-	// the inbound request's cancellation — that request finishes long before the
-	// client answers, and its context dies with it.
-	base := context.WithoutCancel(ctx)
-
-	result, err := fetchRootsWithRetry(base, store, sessionID, workspaceFetchRetryDelay,
-		func(fetchCtx context.Context) (*mcp.ListRootsResult, error) {
-			return srv.RequestRoots(fetchCtx, mcp.ListRootsRequest{})
-		})
-
-	if err != nil {
-		// Entirely expected for clients that do not support roots (measured:
-		// Codex). Not an error the user should ever see.
-		logger.Debug("workspace: client did not provide roots",
-			zap.String("session_id", sessionID),
-			zap.Error(err),
-		)
-		return
-	}
-	if result == nil || len(result.Roots) == 0 {
-		logger.Debug("workspace: client returned no roots",
-			zap.String("session_id", sessionID),
-		)
-		return
-	}
-
-	// A client may report several roots (a multi-root workspace). Always take the
-	// first, so the same workspace always yields the same work session rather
-	// than flapping between roots.
-	root := result.Roots[0].URI
-
-	store.SetWorkspace(sessionID, root)
-	logger.Debug("workspace: resolved from client roots",
-		zap.String("session_id", sessionID),
-		zap.String("workspace", workspaceDisplayName(root)),
-		zap.Int("roots_reported", len(result.Roots)),
-	)
-}
-
-// fetchRootsWithRetry runs request up to workspaceFetchAttempts times, stopping
-// early on a non-empty answer or once the session is gone.
-//
-// "Gone" includes soft-closed: RemoveSession keeps the entry (marked closed) for
-// closedSessionTTL, so a plain GetSession()==nil test would keep asking a
-// disconnected client for the rest of the retry budget. A session reopened on
-// the same id is open again and keeps fetching.
-func fetchRootsWithRetry(
-	base context.Context,
-	store *SessionStore,
-	sessionID string,
-	retryDelay time.Duration,
-	request func(context.Context) (*mcp.ListRootsResult, error),
-) (*mcp.ListRootsResult, error) {
-	var result *mcp.ListRootsResult
-	var err error
-	for attempt := 1; attempt <= workspaceFetchAttempts; attempt++ {
-		// Stop if the client went away mid-fetch — no point asking a ghost, and
-		// no point holding a goroutine open for it.
-		if info := store.GetSession(sessionID); info == nil || info.closed {
-			return result, err
-		}
-
-		fetchCtx, cancel := context.WithTimeout(base, workspaceFetchTimeout)
-		result, err = request(fetchCtx)
-		cancel()
-
-		if err == nil && result != nil && len(result.Roots) > 0 {
-			break
-		}
-		if attempt < workspaceFetchAttempts {
-			time.Sleep(retryDelay)
-		}
-	}
-	return result, err
-}
-
-// principalFromContext identifies who is making the request, for work-session
-// grouping.
-//
-// An client token is the strongest identity available, and it is exactly what
-// SEP-2567 tells gateways to key on now that the protocol's own session id is
-// being removed. Unauthenticated use yields "", and grouping degrades to
-// client + project.
 func principalFromContext(ctx context.Context) string {
 	ac := auth.AuthContextFromContext(ctx)
 	if ac == nil {
@@ -188,10 +48,6 @@ func (p *MCPProxyServer) markSessionWorked(ctx context.Context, sessionID string
 	if sessionID == "" || p.sessionStore == nil {
 		return ""
 	}
-
-	// Wait (briefly, once) for the project, so this connection's first record is
-	// not filed under a different work session than its second.
-	p.sessionStore.WorkspaceSettled(sessionID, workspaceSettleWait)
 
 	principal := principalFromContext(ctx)
 
@@ -239,9 +95,5 @@ func (p *MCPProxyServer) markWorkIfToolCall(ctx context.Context, method mcp.MCPM
 	if method != mcp.MethodToolsCall {
 		return ""
 	}
-	session := mcpserver.ClientSessionFromContext(ctx)
-	if session == nil {
-		return ""
-	}
-	return p.markSessionWorked(ctx, session.SessionID())
+	return p.markSessionWorked(ctx, sessionIDFromContext(ctx))
 }

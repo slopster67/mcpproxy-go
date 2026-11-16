@@ -24,7 +24,7 @@ selects the tool interface for every client; client tokens determine profile
 permissions. The mode is fixed at startup. There are no per-mode or per-profile
 MCP URLs.
 
-Every mode also offers `set_profile` for switchable clients, `code_execution` for
+Every mode also offers `code_execution` for
 clients with **Allow code execution**, and the [management tools](mcp-credential-lifecycle.md)
 for clients with **Allow MCPProxy management**.
 

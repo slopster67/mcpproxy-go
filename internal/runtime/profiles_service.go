@@ -17,15 +17,6 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/storage"
 )
 
-// ProfileSessionHook updates live sessions after deletion or reassignment.
-type ProfileSessionHook interface {
-	ProfileDeleted(name string)
-	// ProfileTokensMoved is called after a delete-with-reassign moved these
-	// tokens' pins: their sessions' base changed, so each is re-listed and its
-	// stored selection cleared.
-	ProfileTokensMoved(tokenNames []string)
-}
-
 type ProfilesService struct {
 	rt *Runtime
 
@@ -71,23 +62,10 @@ func (r *Runtime) SetProfileEvaluator(e ProfileEvaluator) {
 	r.profileEvaluatorMu.Unlock()
 }
 
-// SetSessionHook installs live-session updates for deletion and reassignment.
-func (s *ProfilesService) SetSessionHook(h ProfileSessionHook) {
-	s.rt.profileEvaluatorMu.Lock()
-	s.rt.profileSessionHook = h
-	s.rt.profileEvaluatorMu.Unlock()
-}
-
 func (s *ProfilesService) evaluator() ProfileEvaluator {
 	s.rt.profileEvaluatorMu.RLock()
 	defer s.rt.profileEvaluatorMu.RUnlock()
 	return s.rt.profileEvaluator
-}
-
-func (s *ProfilesService) sessionHook() ProfileSessionHook {
-	s.rt.profileEvaluatorMu.RLock()
-	defer s.rt.profileEvaluatorMu.RUnlock()
-	return s.rt.profileSessionHook
 }
 
 // --- reads -----------------------------------------------------------------
@@ -451,7 +429,6 @@ func (s *ProfilesService) Delete(ctx context.Context, a Actor, name, reassignTo 
 				return ChangeHint{}, &ValidationError{Field: "reassign_to", Message: fmt.Sprintf("reassign_to must name another existing profile, got %q", reassignTo)}
 			}
 			res.Moved = movedRefs(u)
-			res.movedTokenNames = u.tokenNames()
 
 		}
 		d.Profiles = append(d.Profiles[:i:i], d.Profiles[i+1:]...)
@@ -478,12 +455,7 @@ func (s *ProfilesService) Delete(ctx context.Context, a Actor, name, reassignTo 
 	if err != nil {
 		return nil, err
 	}
-	if h := s.sessionHook(); h != nil {
-		h.ProfileDeleted(name)
-		if reassignTo != "" {
-			h.ProfileTokensMoved(res.movedTokenNames)
-		}
-	}
+
 	return res, nil
 }
 

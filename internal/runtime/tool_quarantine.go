@@ -1052,6 +1052,7 @@ func (r *Runtime) snapshotToolMetadata(serverName, toolName string, inc int64) *
 			RawName:          info.Name,
 			Description:      info.Description,
 			ParamsJSON:       paramsJSON,
+			Definition:       info.Definition,
 			OutputSchemaJSON: info.OutputSchemaJSON,
 			Annotations:      info.Annotations,
 		}

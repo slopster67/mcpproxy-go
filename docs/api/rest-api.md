@@ -863,7 +863,7 @@ List recent MCP sessions.
 | `client` | string | Sessions whose credential is bound to this client id; `-` selects sessions with none |
 | `token` | string | Sessions that initialized with this token name; `-` selects sessions with none. `agent` is an alias of `token`; naming two different tokens returns `400` |
 
-Each row carries `client_id`, `token_name`, `profile` and `profile_source` (`pin`, `binding`, `url`, `session`, `anonymous` or `none`). `client_name` is not a sessions filter and returns `400` (`client_name is not supported on this endpoint; filter by client`). The scope filters are applied before the `limit` truncation, so `total` is the filtered count.
+Each row carries `client_id`, `token_name`, `profile` and `profile_source` (`pin`, `binding`, `request` or `none`). `client_name` is not a sessions filter and returns `400` (`client_name is not supported on this endpoint; filter by client`). The scope filters are applied before the `limit` truncation, so `total` is the filtered count.
 
 The `status` filter is applied during the storage walk, **before** the `limit`
 truncation, so a long-running session that is still active is returned even when

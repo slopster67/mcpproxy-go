@@ -14,7 +14,7 @@ import (
 type ProfileResolution struct {
 	Name string
 	// Source is one of the profile.Source* constants: pin, binding,
-	// session, anonymous, none.
+	// request, anonymous, none.
 	Source string
 	// Scope is the resolved profile's server scope; nil for "none" and for
 	// the empty-pin "All servers" binding/anonymous case.
@@ -23,7 +23,7 @@ type ProfileResolution struct {
 	// is nil, and also for a dangling base (a name that no longer resolves).
 	Policy *profile.CompiledPolicy
 	// Base is the bound or anonymous base profile used for switchable_to
-	// admission — "" for sources session/none, and for a source
+	// admission — "" for source none, and for a source
 	// pin/binding/anonymous whose base is "All servers" (empty pin).
 	Base string
 }
@@ -113,7 +113,10 @@ func (p *MCPProxyServer) resolveProfileV3(ctx context.Context, idx *profileIndex
 
 	// Tier 1: pin. Authoritative — never falls through, including when
 	// dangling.
-	if source == profile.SourcePin && base != "" {
+	if source == profile.SourcePin {
+		if base == "" {
+			return ProfileResolution{Source: string(source)}
+		}
 		if dangling {
 			return ProfileResolution{Name: base, Source: string(source), Scope: profile.NewProfileScope(base, nil), Base: base}
 		}
@@ -124,7 +127,7 @@ func (p *MCPProxyServer) resolveProfileV3(ctx context.Context, idx *profileIndex
 	}
 
 	// A dangling binding or anonymous base is likewise authoritative deny-all
-	//: no session selection is admitted (its switchable_to is
+	//: no request selection is admitted (its switchable_to is
 	// unknown).
 	if (source == profile.SourceBinding) && dangling {
 		return ProfileResolution{Name: base, Source: string(source), Scope: profile.NewProfileScope(base, nil), Base: base}
@@ -132,22 +135,13 @@ func (p *MCPProxyServer) resolveProfileV3(ctx context.Context, idx *profileIndex
 
 	basePolicy := idx.PolicyFor(base) // nil when base == "" (no such profile — expected)
 
-	// Session selection (set_profile), re-validated against the CURRENT base
-	// on every request; a selection no longer permitted is cleared.
-	if p.sessionStore != nil {
-		if sid := sessionIDFromContext(ctx); sid != "" {
-			if sel := p.sessionStore.GetActiveProfile(sid); sel != "" {
-				if base == "" || admittedBySwitchableTo(basePolicy, base, sel) {
-					if scope := profileScopeFromIndex(idx, sel); scope != nil {
-						return ProfileResolution{
-							Name: sel, Source: string(profile.SourceSession),
-							Scope: scope, Policy: idx.PolicyFor(sel), Base: base,
-						}
-					}
-				}
-				p.sessionStore.SetActiveProfile(sid, "")
+	if box, ok := ctx.Value(directRequestKindCtxKey{}).(*directRequestKindBox); ok && box.profile != "" {
+		if base == "" || admittedBySwitchableTo(basePolicy, base, box.profile) {
+			if scope := profileScopeFromIndex(idx, box.profile); scope != nil {
+				return ProfileResolution{Name: box.profile, Source: string(profile.SourceRequest), Scope: scope, Policy: idx.PolicyFor(box.profile), Base: base}
 			}
 		}
+		return ProfileResolution{Name: box.profile, Source: string(profile.SourceRequest), Scope: profile.NewProfileScope(box.profile, nil), Base: base}
 	}
 
 	if source == profile.SourceBinding {

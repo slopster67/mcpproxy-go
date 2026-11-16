@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 
-	mcpserver "github.com/mark3labs/mcp-go/v2/server"
 	"go.uber.org/zap"
 
 	"github.com/slopster67/mcpproxy-go/internal/auth"
@@ -11,14 +10,9 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/profile"
 )
 
-// sessionIDFromContext returns the stable mcp-go per-session id available at
-// tool-call time, or "" when no session is bound to the request. This is the
-// id confirmed (Profiles v2 T2 first subtask) to be exposed by mcp-go via
-// server.ClientSessionFromContext for both streamable-HTTP and SSE transports;
-// no synthetic fallback is required.
 func sessionIDFromContext(ctx context.Context) string {
-	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-		return sess.SessionID()
+	if box, ok := ctx.Value(directRequestKindCtxKey{}).(*directRequestKindBox); ok {
+		return box.sessionID
 	}
 	return ""
 }
@@ -137,80 +131,7 @@ func (p *MCPProxyServer) resolveActiveProfileWithSourceFromIndex(ctx context.Con
 		return pin, profile.NewProfileScope(pin, nil), profile.SourcePin
 	}
 
-	// 2. Explicit URL profile. Authoritative for this request, so it
-	//    overrides any stored session selection on the same connection.
-
-	// 3. Session selection set via the set_profile tool on the base /mcp endpoint.
-	if p.sessionStore != nil {
-		if sid := sessionIDFromContext(ctx); sid != "" {
-			if name := p.sessionStore.GetActiveProfile(sid); name != "" {
-				if scope := profileScopeFromIndex(idx, name); scope != nil {
-					return name, scope, profile.SourceSession
-				}
-				// Stored profile vanished from config — drop the stale selection.
-				p.sessionStore.SetActiveProfile(sid, "")
-			}
-		}
-	}
-
-	// 4. No profile in effect.
 	return "", nil, profile.SourceNone
-}
-
-// resolveEffectiveProfileForJustSetSlug is resolveActiveProfileFromIndex's
-// precedence (pin > URL > session selection) for the ONE caller that must
-// never re-read the session store's mutable selection to answer it:
-// handleSetProfile, immediately after it has itself just written slug via
-// SetActiveProfile. Tiers 1 (pin) and 2 (URL) are per-request context values
-// and safe to re-resolve as-is; tier 3 uses slug DIRECTLY instead of calling
-// SessionStore.GetActiveProfile — closing a race a concurrent set_profile
-// call on the SAME session could otherwise open between this call's own
-// write and its own response render: call A sets "research", call B
-// (interleaved) sets "deploy", and A's subsequent GetActiveProfile would see
-// B's "deploy" — so A's response would report active_profile: "research"
-// (A's own requested slug) with "deploy"'s servers, an stored-
-// selection/effective-scope consistency violation. slug is already validated selectable against idx immediately before
-// the write (handleSetProfile's own profiles.selectable(ctx, slug) check),
-// so idx.position(slug) cannot miss here the way tier 3's general "stored
-// profile vanished from config" fallback anticipates for a session's OLD
-// selection read on some later, unrelated call.
-//
-// Returns only the profile NAME, never a *ProfileScope: its one caller
-// renders through EffectiveServersFor(name, callerAllowed), which never
-// touches this scope, so building one would be wasted work.
-// idx.position is the O(1) existence check the pin/slug
-// tiers actually need.
-func (p *MCPProxyServer) resolveEffectiveProfileForJustSetSlug(ctx context.Context, idx *profileIndex, slug string) string {
-	// A SWITCHABLE client credential's ProfilePin is its BINDING (the base for
-	// switchable_to), which ranks BELOW the url and session tiers. It is
-	// authoritative only while no selection is in effect, so a just-written
-	// slug must be reported instead of the binding. A locked credential and a
-	// regular client token pin stay authoritative.
-	switchableBinding := ""
-	if pin, mode, ok := clientCredentialFromContext(ctx); ok && mode != auth.ProfileModeLocked {
-		switchableBinding = pin
-	}
-	if pin := profilePinFromContext(ctx); pin != "" && pin != switchableBinding {
-		if idx != nil && idx.position(pin) >= 0 {
-			return pin
-		}
-		// Stale pin (profile deleted since the token was minted): still
-		// authoritative — the caller stays deny-all under its own pin,
-		// never falls through to slug — and still worth an operator's
-		// attention, exactly as resolveActiveProfileFromIndex's own stale-
-		// pin branch logs it.
-		if p.logger != nil {
-			p.logger.Warn("client-token profile_pin no longer matches any configured profile; resolving to a deny-all scope",
-				zap.String("profile_pin", pin))
-		}
-		return pin
-	}
-	if slug != "" && idx != nil && idx.position(slug) >= 0 && (switchableBinding == "" || idx.position(switchableBinding) >= 0) {
-		return slug
-	}
-	// No selection in effect: a switchable credential falls back to its binding
-	// (a dangling binding stays deny-all, as resolveV3Base resolves it).
-	return switchableBinding
 }
 
 // profileScopeFromIndex builds the ProfileScope for slug's FULL membership

@@ -9,8 +9,10 @@ import (
 
 	sdktransport "github.com/mark3labs/mcp-go/v2/client/transport"
 	"github.com/mark3labs/mcp-go/v2/mcp"
+
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
+	"github.com/slopster67/mcpproxy-go/internal/mcprelay"
 )
 
 // Transport presents one peer-owned upstream to the primary's existing runtime.
@@ -20,7 +22,6 @@ type Transport struct {
 	cfg        *config.ServerConfig
 	binding    commitview.CredentialBinding
 	generation int64
-	info       mcp.InitializeResult
 	mu         sync.Mutex
 	handler    func(mcp.JSONRPCNotification)
 	unlisten   func()
@@ -39,7 +40,7 @@ func (t *Transport) Start(ctx context.Context) error {
 			return err
 		}
 	}
-	if err := t.executor.Call(ctx, t.cfg.ExecutionHost(), "connect", t.cfg.Name, desired, &t.info); err != nil {
+	if err := t.executor.Call(ctx, t.cfg.ExecutionHost(), "connect", t.cfg.Name, desired, nil); err != nil {
 		return err
 	}
 	if hub, ok := t.executor.(*Hub); ok {
@@ -59,24 +60,25 @@ func (t *Transport) Start(ctx context.Context) error {
 }
 func (t *Transport) SendRequest(ctx context.Context, request sdktransport.JSONRPCRequest) (*sdktransport.JSONRPCResponse, error) {
 	if request.Method == "initialize" {
-		data, err := json.Marshal(t.info)
-		return &sdktransport.JSONRPCResponse{JSONRPC: "2.0", ID: request.ID, Result: data}, err
+		return nil, fmt.Errorf("upstream must support MCP %s", mcp.LATEST_PROTOCOL_VERSION)
 	}
+	prepared, err := mcprelay.Prepare(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	request = prepared
 	timeout := time.Duration(0)
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = time.Until(deadline)
 	}
 	var result sdktransport.JSONRPCResponse
-	if err := t.executor.Call(ctx, t.cfg.ExecutionHost(), "rpc", t.cfg.Name, RPC{Timeout: timeout, Request: request}, &result); err != nil {
+	if err := t.executor.Call(ctx, t.cfg.ExecutionHost(), "rpc", t.cfg.Name, RPC{Timeout: timeout, Request: request, Header: request.Header}, &result); err != nil {
 		return nil, err
 	}
 	result.ID = request.ID
 	return &result, nil
 }
 func (t *Transport) SendNotification(ctx context.Context, notification mcp.JSONRPCNotification) error {
-	if notification.Method == "notifications/initialized" {
-		return nil
-	}
 	return t.executor.Call(ctx, t.cfg.ExecutionHost(), "notify", t.cfg.Name, notification, nil)
 }
 func (t *Transport) SetNotificationHandler(fn func(mcp.JSONRPCNotification)) {

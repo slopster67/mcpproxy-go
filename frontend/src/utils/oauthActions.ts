@@ -4,7 +4,7 @@ import type { Server } from '@/types'
 // is classified as a reconnect error, or a background connection is running.
 export function canStartOAuthLogin(server: Server): boolean {
   const protocol = String(server.protocol)
-  const remote = ['http', 'sse', 'streamable-http'].includes(protocol) ||
+  const remote = ['http', 'streamable-http'].includes(protocol) ||
     (protocol === 'auto' && !!server.url && !server.command)
   return !!(server.enabled && remote && server.oauth_mode !== 'off' && (
     server.oauth_active || server.authenticated || server.health?.action === 'login' ||

@@ -46,6 +46,7 @@ type BleveIndex struct {
 
 // ToolDocument represents a tool document in the index
 type ToolDocument struct {
+	Definition       string `json:"definition"`
 	ToolName         string `json:"tool_name"`      // Just the tool name (without server prefix)
 	FullToolName     string `json:"full_tool_name"` // Complete server:tool format
 	ServerName       string `json:"server_name"`
@@ -83,6 +84,28 @@ func newBleveIndexAt(indexPath string, logger *zap.Logger) (*BleveIndex, error) 
 	}
 	if err != nil {
 		return nil, fmt.Errorf("open search index %s: %w", indexPath, err)
+	}
+	current, err := json.Marshal(index.Mapping())
+	if err != nil {
+		index.Close()
+		return nil, err
+	}
+	expected, err := json.Marshal(currentIndexMapping())
+	if err != nil {
+		index.Close()
+		return nil, err
+	}
+	if string(current) != string(expected) {
+		if err := index.Close(); err != nil {
+			return nil, err
+		}
+		if err := os.RemoveAll(indexPath); err != nil {
+			return nil, err
+		}
+		index, err = createBleveIndex(indexPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &BleveIndex{index: index, logger: logger}, nil
 }
@@ -137,6 +160,10 @@ func currentIndexMapping() *mapping.IndexMappingImpl {
 	paramsField.Store = true
 	paramsField.Index = true
 	toolMapping.AddFieldMappingsAt("params_json", paramsField)
+	definitionField := bleve.NewTextFieldMapping()
+	definitionField.Store = true
+	definitionField.Index = false
+	toolMapping.AddFieldMappingsAt("definition", definitionField)
 
 	// Output schema JSON field: stored only, never searched (it is JSON, not
 	// prose) — same shape as hash and annotations_json below. The explicit
@@ -209,6 +236,7 @@ func toolDocument(toolMeta *config.ToolMetadata) (string, *ToolDocument) {
 		FullToolName:     toolMeta.Name,
 		ServerName:       toolMeta.ServerName,
 		Description:      toolMeta.Description,
+		Definition:       string(toolMeta.Definition),
 		ParamsJSON:       toolMeta.ParamsJSON,
 		OutputSchemaJSON: toolMeta.OutputSchemaJSON,
 		Hash:             toolMeta.Hash,
@@ -253,6 +281,7 @@ func readToolMetadata(docID string, fields map[string]interface{}) *config.ToolM
 	}
 
 	return &config.ToolMetadata{
+		Definition:       json.RawMessage(getStringField(fields, "definition")),
 		Name:             canonical,
 		RawName:          strings.TrimPrefix(canonical, serverName+":"),
 		ServerName:       serverName,
@@ -344,7 +373,7 @@ func newToolSearchRequest(q bquery.Query, from, size int) *bleve.SearchRequest {
 	searchReq := bleve.NewSearchRequest(q)
 	searchReq.From = from
 	searchReq.Size = size
-	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "output_schema_json", "hash", "annotations_json"}
+	searchReq.Fields = []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "output_schema_json", "definition", "hash", "annotations_json"}
 	searchReq.Highlight = bleve.NewHighlight()
 
 	// Deterministic tie-break: primary sort by score descending (bleve's
@@ -736,7 +765,7 @@ func (b *BleveIndex) GetToolsByServer(serverName string) ([]*config.ToolMetadata
 	query := bleve.NewTermQuery(serverName)
 	query.SetField("server_name")
 
-	fields := []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "output_schema_json", "hash", "annotations_json"}
+	fields := []string{"tool_name", "full_tool_name", "server_name", "description", "params_json", "output_schema_json", "definition", "hash", "annotations_json"}
 
 	b.logger.Debug("Querying tools by server", zap.String("server", serverName))
 

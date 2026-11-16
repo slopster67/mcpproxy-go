@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"sort"
 
 	"go.uber.org/zap"
@@ -83,6 +84,7 @@ type directCatalog struct {
 // never validate against a definition other than the one its own registration
 // advertised.
 type directCatalogEntry struct {
+	Definition  json.RawMessage
 	DisplayName string
 	ServerName  string
 	ToolName    string
@@ -126,6 +128,7 @@ func (e *directCatalogEntry) toolMetadata() *config.ToolMetadata {
 		return nil
 	}
 	return &config.ToolMetadata{
+		Definition:       e.Definition,
 		ServerName:       e.ServerName,
 		Name:             e.ServerName + ":" + e.ToolName,
 		Description:      e.Description,
@@ -227,6 +230,7 @@ func buildDirectCatalog(tools []*config.ToolMetadata, logger *zap.Logger) *direc
 
 		t := group[0]
 		entry := &directCatalogEntry{
+			Definition:         t.Definition,
 			DisplayName:        name,
 			ServerName:         t.ServerName,
 			ToolName:           t.Name,

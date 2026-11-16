@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"time"
 
 	sdktransport "github.com/mark3labs/mcp-go/v2/client/transport"
+
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/storage"
@@ -62,6 +64,7 @@ type Hello struct {
 
 // RPC carries only headers already admitted by the primary's live forwarding policy.
 type RPC struct {
+	Header  http.Header                 `json:"headers,omitempty"`
 	Timeout time.Duration               `json:"timeout"`
 	Request sdktransport.JSONRPCRequest `json:"request"`
 }

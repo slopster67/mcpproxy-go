@@ -9,7 +9,26 @@ keywords: [mcp, protocol, tools, proxy]
 
 # MCP Protocol
 
-MCPProxy implements the Model Context Protocol (MCP) specification, providing AI clients with unified access to multiple upstream MCP servers.
+MCPProxy supports MCP `2026-07-28` on `/mcp` and upstream connections.
+Requests carry their version and client capabilities in `params._meta`.
+The legacy HTTP+SSE transport is not supported; use Streamable HTTP.
+Use `server/discover` to read capabilities and instructions; there is no
+initialization handshake or protocol session.
+
+Browser origins on loopback are accepted. For a public dashboard or browser
+client, set `allowed_origins` to its exact origins, such as
+`["https://mcp.example.com"]`, and restart MCPProxy. Non-browser clients can omit
+`Origin`.
+
+Optional request metadata:
+
+- `ke.oa.mcpproxy/profile`: select a profile for this request, subject to the client's permissions.
+- `ke.oa.mcpproxy/workspace`: workspace URI for activity grouping.
+
+A tool that needs user input returns `resultType: "input_required"`. Retry the
+same call with its `requestState` and the requested `inputResponses`. Suspended
+calls expire after ten minutes or the configured operation timeout. Code
+execution resumes without rerunning completed upstream calls.
 
 ## Endpoints
 

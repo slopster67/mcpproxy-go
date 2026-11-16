@@ -47,11 +47,11 @@ an empty list exposes none. A profile with no servers exposes no upstream tools.
 
 ## Client switching
 
-For a client assigned to a profile, **Allow switching** is off by default. When
-off, its assigned profile is locked. When on, the agent may use `set_profile`
-to select a profile permitted by the assigned profile's `switchable_to` list.
-The selection lasts for that MCP session and is checked on subsequent requests.
-A client on All servers always allows switching; that setting is not editable.
+For a switchable client, include `ke.oa.mcpproxy/profile` in each request's
+`params._meta` to select a permitted profile. The selection applies only to that
+request. Locked clients always use their assigned profile. A profile can restrict
+selections through `switchable_to`. There is no session selection or `set_profile`
+tool.
 
 Manage client assignments from Clients or the profile list. Renaming a profile
 preserves its ID and client assignments. Deleting an in-use profile requires choosing

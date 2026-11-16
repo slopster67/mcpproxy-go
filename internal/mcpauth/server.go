@@ -28,6 +28,7 @@ const maxPending = 1000
 
 // pending is an authorization request waiting for the dashboard consent page.
 type pending struct {
+	Resource    string
 	ID          string
 	Issuer      string
 	Kind        Kind
@@ -42,6 +43,7 @@ type pending struct {
 
 // grant is an issued, not yet exchanged authorization code.
 type grant struct {
+	Resource    string
 	Kind        Kind
 	Subject     string
 	Version     string
@@ -75,6 +77,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.metadata)
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server/oauth/peers/{peer}", s.metadata)
 	mux.HandleFunc("GET /oauth/peers/{peer}/.well-known/oauth-authorization-server", s.metadata)
+	mux.HandleFunc("GET /oauth/client-metadata", s.ownClientMetadata)
 	mux.HandleFunc("/oauth/register", s.register)
 	mux.HandleFunc("/oauth/token", s.token)
 	mux.HandleFunc("GET /oauth/authorize", s.authorize)
@@ -150,7 +153,7 @@ func AuthorizationMetadata(origin, issuer string) map[string]any {
 		"code_challenge_methods_supported":               []string{"S256"},
 		"token_endpoint_auth_methods_supported":          []string{"none"},
 		"authorization_response_iss_parameter_supported": true,
-		"client_id_metadata_document_supported":          false,
+		"client_id_metadata_document_supported":          true,
 	}
 }
 
@@ -296,8 +299,15 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		}
 		request.Kind, request.App = KindPeer, app{Name: "MCPProxy peer"}
 	} else {
-		if !s.open(appPrefix, request.AppID, &request.App) {
-			failPage(w, 400, "Unknown application. Remove the server from your MCP client and add it again so it can register.")
+		if strings.HasPrefix(request.AppID, "https://") {
+			metadata, err := clientMetadata(r.Context(), request.AppID)
+			if err != nil {
+				failPage(w, 400, "Invalid client metadata document")
+				return
+			}
+			request.App = metadata
+		} else if !s.open(appPrefix, request.AppID, &request.App) {
+			failPage(w, 400, "Unknown application")
 			return
 		}
 		if redirect == "" && len(request.App.RedirectURIs) == 1 {
@@ -316,8 +326,16 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	request.RedirectURI, request.State = redirect, q.Get("state")
+	request.Resource = q.Get("resource")
+	if request.Resource == "" && request.Kind == KindPeer {
+		request.Resource = origin + "/api/peers"
+	}
 	reject := func(code, description string) {
 		http.Redirect(w, r, withParams(redirect, map[string]string{"error": code, "error_description": description, "state": request.State, "iss": request.Issuer}), http.StatusFound)
+	}
+	if request.Kind == KindClient && (len(q["resource"]) != 1 || request.Resource != origin+"/mcp") {
+		reject("invalid_target", "Use this server MCP resource URL")
+		return
 	}
 	if q.Get("response_type") != "code" {
 		reject("unsupported_response_type", "Only the authorization code flow is supported")
@@ -473,7 +491,7 @@ func (s *Server) Decide(id string, approve bool, subject string) (string, error)
 		return "", ErrRequestNotFound
 	}
 	delete(s.requests, id)
-	s.codes[digest(code)] = &grant{Kind: request.Kind, Subject: subject, Version: current, AppID: request.AppID, RedirectURI: request.RedirectURI, Challenge: request.Challenge, Expires: time.Now().Add(codeLifetime)}
+	s.codes[digest(code)] = &grant{Resource: request.Resource, Kind: request.Kind, Subject: subject, Version: current, AppID: request.AppID, RedirectURI: request.RedirectURI, Challenge: request.Challenge, Expires: time.Now().Add(codeLifetime)}
 	s.mu.Unlock()
 	return withParams(request.RedirectURI, map[string]string{"code": code, "state": request.State, "iss": request.Issuer}), nil
 }
@@ -507,13 +525,13 @@ func (s *Server) subjectVersion(kind Kind, id string) (string, bool) {
 
 func (s *Server) current(c claims) bool {
 	value, ok := s.subjectVersion(c.Kind, c.Subject)
-	return ok && value != "" && hmac.Equal([]byte(value), []byte(c.Version))
+	return ok && value != "" && hmac.Equal([]byte(value), []byte(c.Version)) && s.store.RefreshFamilyActive(c.Family)
 }
 
 // AuthenticateClient resolves an OAuth access token to its saved client.
-func (s *Server) AuthenticateClient(raw string) (*auth.ClientCredential, bool) {
+func (s *Server) AuthenticateClient(raw, resource string) (*auth.ClientCredential, bool) {
 	var c claims
-	if !s.open(AccessPrefix, raw, &c) || c.Type != "a" || c.Kind != KindClient || time.Now().Unix() >= c.Expires {
+	if !s.open(AccessPrefix, raw, &c) || c.Type != "a" || c.Kind != KindClient || time.Now().Unix() >= c.Expires || c.Resource != resource || !s.current(c) {
 		return nil, false
 	}
 	client := s.client(c.Subject)
@@ -532,13 +550,29 @@ func (s *Server) AuthenticatePeer(raw string) (string, time.Time, bool) {
 	return c.Subject, time.Unix(c.Expires, 0), true
 }
 
-func (s *Server) issue(w http.ResponseWriter, kind Kind, subject, subjectVersion, appID string) {
+func (s *Server) issue(w http.ResponseWriter, c claims, previous string) {
 	now := time.Now()
-	access := s.sign(AccessPrefix, claims{Type: "a", Kind: kind, Subject: subject, Version: subjectVersion, App: appID, Expires: now.Add(AccessLifetime).Unix()})
-	refresh := s.sign(RefreshPrefix, claims{Type: "r", Kind: kind, Subject: subject, Version: subjectVersion, App: appID, Expires: now.Add(RefreshLifetime).Unix()})
+	if c.Family == "" {
+		c.Family = randomID()
+	}
+	c.TokenID = randomID()
+	expires := now.Add(RefreshLifetime).Unix()
+	valid, err := s.store.RotateRefreshToken(c.Family, previous, c.TokenID, expires)
+	if err != nil {
+		oauthError(w, 500, "server_error", "Could not save refresh token")
+		return
+	}
+	if !valid {
+		oauthError(w, 400, "invalid_grant", "Refresh token was reused or revoked")
+		return
+	}
+	c.Type, c.Expires = "a", now.Add(AccessLifetime).Unix()
+	access := s.sign(AccessPrefix, c)
+	c.Type, c.Expires = "r", expires
+	refresh := s.sign(RefreshPrefix, c)
 	response := map[string]any{"access_token": access, "token_type": "Bearer", "expires_in": int(AccessLifetime.Seconds()), "refresh_token": refresh}
-	if kind == KindPeer {
-		response["peer_id"], response["peer_name"] = subject, s.peers.Name(subject)
+	if c.Kind == KindPeer {
+		response["peer_id"], response["peer_name"] = c.Subject, s.peers.Name(c.Subject)
 	}
 	writeJSON(w, 200, response)
 }
@@ -568,7 +602,11 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 			oauthError(w, 400, "invalid_grant", "The authorization code is invalid or expired")
 			return
 		}
-		if appID != g.AppID || (r.PostForm.Get("redirect_uri") != "" && r.PostForm.Get("redirect_uri") != g.RedirectURI) {
+		if g.Kind == KindClient && (len(r.PostForm["resource"]) != 1 || r.PostForm.Get("resource") != g.Resource) {
+			oauthError(w, 400, "invalid_target", "Resource does not match authorization grant")
+			return
+		}
+		if appID != g.AppID || r.PostForm.Get("redirect_uri") != g.RedirectURI {
 			oauthError(w, 400, "invalid_grant", "The authorization code was issued to another client")
 			return
 		}
@@ -578,7 +616,8 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		c := claims{Kind: g.Kind, Subject: g.Subject, Version: g.Version}
-		if !s.current(c) {
+		current, exists := s.subjectVersion(c.Kind, c.Subject)
+		if !exists || current != c.Version {
 			oauthError(w, 400, "invalid_grant", "The chosen client or peer changed; sign in again")
 			return
 		}
@@ -594,14 +633,18 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 			}
 			g.Version = current
 		}
-		s.issue(w, g.Kind, g.Subject, g.Version, g.AppID)
+		s.issue(w, claims{Kind: g.Kind, Subject: g.Subject, Version: g.Version, App: g.AppID, Resource: g.Resource}, "")
 	case "refresh_token":
 		var c claims
-		if !s.open(RefreshPrefix, r.PostForm.Get("refresh_token"), &c) || c.Type != "r" || time.Now().Unix() >= c.Expires || (appID != "" && appID != c.App) || !s.current(c) {
+		if !s.open(RefreshPrefix, r.PostForm.Get("refresh_token"), &c) || c.Type != "r" || time.Now().Unix() >= c.Expires || appID != c.App || !s.current(c) {
 			oauthError(w, 400, "invalid_grant", "The refresh token is invalid, expired or revoked")
 			return
 		}
-		s.issue(w, c.Kind, c.Subject, c.Version, c.App)
+		if resource := r.PostForm.Get("resource"); len(r.PostForm["resource"]) > 1 || (resource != "" && resource != c.Resource) {
+			oauthError(w, 400, "invalid_target", "Resource does not match refresh token")
+			return
+		}
+		s.issue(w, c, c.TokenID)
 	default:
 		oauthError(w, 400, "unsupported_grant_type", "Use authorization_code or refresh_token")
 	}

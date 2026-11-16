@@ -15,13 +15,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mark3labs/mcp-go/v2/client"
+	"go.uber.org/zap"
+
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/httpx"
 	"github.com/slopster67/mcpproxy-go/internal/storage"
-
-	"github.com/mark3labs/mcp-go/v2/client"
-	"go.uber.org/zap"
 )
 
 const (
@@ -114,9 +114,11 @@ func (m *CallbackServerManager) subjectLoggerLocked(logger *zap.Logger) *zap.Log
 // with an explicit failure page instead of being handed to whichever flow
 // happened to be listening.
 type callbackWaiter struct {
-	channel     chan map[string]string
-	delivered   bool
-	redirectURI string
+	issuer         string
+	issuerRequired bool
+	channel        chan map[string]string
+	delivered      bool
+	redirectURI    string
 }
 
 // CallbackServer represents an active OAuth callback server.
@@ -1100,6 +1102,19 @@ func createOAuthConfigInternal(env Env, serverConfig *config.ServerConfig, stora
 		clientSecret = serverConfig.OAuth.ClientSecret
 	}
 
+	if asDoc != nil && (serverConfig.OAuth == nil || serverConfig.OAuth.ClientID == "") {
+		var metadata struct {
+			Supported bool `json:"client_id_metadata_document_supported"`
+		}
+		if json.Unmarshal(asDoc.raw, &metadata) == nil && metadata.Supported {
+			origin := httpx.PublicOriginFrom(env.ctx())
+			if strings.HasPrefix(origin, "https://") && strings.HasPrefix(redirectURI, origin+config.OAuthRemoteCallbackPrefix) {
+				clientID = origin + "/oauth/client-metadata?" + url.Values{"redirect_uri": []string{redirectURI}}.Encode()
+				clientSecret = ""
+			}
+		}
+	}
+
 	oauthConfig := &client.OAuthConfig{
 		ClientID:              clientID,
 		ClientSecret:          clientSecret,
@@ -1508,7 +1523,6 @@ func (c *CallbackServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	c.logger.Info("📥 HTTP request received on callback server",
 		zap.String("method", r.Method),
 		zap.String("path", LogSafeRequestPath(r.URL.Path)),
-		zap.String("query", LogSafeCallbackQuery(r.URL.RawQuery)),
 		zap.String("user_agent", r.UserAgent()),
 		zap.String("remote_addr", r.RemoteAddr))
 
@@ -1543,16 +1557,25 @@ func (c *CallbackServer) handleCallbackWithFailureNotification(w http.ResponseWr
 	c.logger.Info("🎯 OAuth callback received",
 		zap.String("method", r.Method),
 		zap.String("path", LogSafeRequestPath(r.URL.Path)),
-		zap.String("query", LogSafeCallbackQuery(r.URL.RawQuery)),
 		zap.String("remote_addr", r.RemoteAddr),
 		zap.String("user_agent", r.UserAgent()))
 
-	// Extract query parameters
-	params := make(map[string]string)
-	for key, values := range r.URL.Query() {
-		if len(values) > 0 {
-			params[key] = values[0]
-		}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil || len(query["state"]) != 1 || len(query["iss"]) > 1 || len(query["code"]) > 1 || len(query["error"]) > 1 || (query.Get("code") == "") == (query.Get("error") == "") || (len(query["iss"]) == 1 && query.Get("iss") == "") {
+		http.Error(w, "invalid OAuth callback", http.StatusBadRequest)
+		return
+	}
+	c.waitersMu.Lock()
+	waiter := c.waiters[query.Get("state")]
+	valid := waiter != nil && waiter.issuer != "" && ((query.Get("iss") == "" && !waiter.issuerRequired) || query.Get("iss") == waiter.issuer)
+	c.waitersMu.Unlock()
+	if !valid {
+		http.Error(w, "invalid OAuth callback issuer or state", http.StatusBadRequest)
+		return
+	}
+	params := make(map[string]string, len(query))
+	for key := range query {
+		params[key] = query.Get(key)
 	}
 
 	// The authorization CODE is a
@@ -1839,7 +1862,7 @@ type metadataPreflight struct {
 // preflightMetadataURL finds the working AS metadata URL (and its document) for
 // the configured server, once per cache key.
 func preflightMetadataURL(env Env, serverConfig *config.ServerConfig, ov discoveryOverrides, logger *zap.Logger) (string, *asMetadataDoc) {
-	key := makeDiscoveryKey("metadata-url", serverConfig.URL, ov)
+	key := makeDiscoveryKey("metadata-url", serverConfig.URL, ov, env.ResourceMetadataURL)
 	v, err := globalDiscoveryCache.doWith(key, serverConfig.URL, func() (any, time.Duration, []discoverySeed, error) {
 		// First, try to discover the auth server URL from Protected Resource Metadata
 		// This is necessary for servers like Smithery that use separate domains
@@ -1849,14 +1872,20 @@ func preflightMetadataURL(env Env, serverConfig *config.ServerConfig, ov discove
 			globalDiscoveryCache.noteResourceMetadataURL(serverConfig.URL, prmURL)
 			return cachedPRM(env, serverConfig.URL, ov, prmURL, 5*time.Second)
 		})
-		urlToUse := serverConfig.URL
-		if authServerURL != "" {
-			urlToUse = authServerURL
-			logger.Info("Using discovered auth server URL for metadata discovery",
-				zap.String("server", serverConfig.Name),
-				zap.String("mcp_url", logSafeURL(serverConfig.URL)),
-				zap.String("auth_server_url", logSafeURL(authServerURL)))
+		if env.ResourceMetadataURL != "" {
+			metadata, err := cachedPRM(env, serverConfig.URL, ov, env.ResourceMetadataURL, 5*time.Second)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if metadata.Resource != serverConfig.URL || len(metadata.AuthorizationServers) == 0 {
+				return nil, 0, nil, errors.New("invalid protected resource metadata")
+			}
+			authServerURL = metadata.AuthorizationServers[0]
 		}
+		if authServerURL == "" {
+			return nil, 0, nil, errors.New("protected resource metadata does not identify an authorization server")
+		}
+		urlToUse := authServerURL
 
 		// Now find the working metadata URL using the auth server URL (or server URL as fallback)
 		workingURL, doc, err := findWorkingMetadataDoc(env, urlToUse, 10*time.Second)
@@ -1870,18 +1899,11 @@ func preflightMetadataURL(env Env, serverConfig *config.ServerConfig, ov discove
 		logger.Info("Using validated OAuth metadata URL",
 			zap.String("server", serverConfig.Name),
 			zap.String("metadata_url", logSafeURL(workingURL)))
-		// When the PRM step yielded no authorization server the result came from
-		// the fallback on the MCP origin; that may be a transient PRM failure, so
-		// keep it only for the failure TTL instead of pinning it for an hour.
-		ttl := time.Duration(0)
-		if authServerURL == "" {
-			ttl = discoveryFailureTTL
-		}
 		// Seed the document cache so mcp-go's own metadata GET (served by the
 		// transport wrapper) needs no second request. Stored atomically with this
 		// result, so an invalidation that raced the fetch discards both.
 		seeds := []discoverySeed{{key: asDocKey(serverConfig.URL, ov, workingURL), val: doc}}
-		return metadataPreflight{url: workingURL, doc: doc}, ttl, seeds, nil
+		return metadataPreflight{url: workingURL, doc: doc}, 0, seeds, nil
 	})
 	if err != nil {
 		return "", nil

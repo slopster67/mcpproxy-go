@@ -46,10 +46,11 @@ type OAuthTransportWrapper struct {
 	// endpoints and the learned endpoint URLs drive metadata rewriting and
 	// endpoint-URL matching. mu guards the learned URLs, which are
 	// written from RoundTrip.
-	endpoints wrapperEndpoints
-	mu        sync.RWMutex
-	tokenURL  *url.URL
-	authzURL  *url.URL
+	endpoints       wrapperEndpoints
+	mu              sync.RWMutex
+	tokenURL        *url.URL
+	authzURL        *url.URL
+	registrationURL *url.URL
 }
 
 // SetEndpoints configures discovery overrides for this wrapper. Call before the
@@ -170,6 +171,37 @@ func (w *OAuthTransportWrapper) RoundTrip(req *http.Request) (*http.Response, er
 		}
 	}
 
+	w.mu.RLock()
+	registrationURL := w.registrationURL
+	w.mu.RUnlock()
+	if req.Method == http.MethodPost && registrationURL != nil && urlEndpointMatch(registrationURL, req.URL) {
+		data, err := io.ReadAll(io.LimitReader(req.Body, (64<<10)+1))
+		if err != nil {
+			return nil, err
+		}
+		if len(data) > 64<<10 {
+			return nil, errors.New("registration document too large")
+		}
+		var document map[string]any
+		if err := json.Unmarshal(data, &document); err != nil {
+			return nil, err
+		}
+		applicationType := "web"
+		if redirects, ok := document["redirect_uris"].([]any); ok && len(redirects) == 1 {
+			redirect, _ := redirects[0].(string)
+			if u, err := url.Parse(redirect); err == nil && (u.Scheme != "https") {
+				applicationType = "native"
+			}
+		}
+		document["application_type"] = applicationType
+		data, err = json.Marshal(document)
+		if err != nil {
+			return nil, err
+		}
+		req = req.Clone(req.Context())
+		req.Body = io.NopCloser(bytes.NewReader(data))
+		req.ContentLength = int64(len(data))
+	}
 	tokenReq := w.matchesToken(req)
 
 	if len(w.extraParams) > 0 {
@@ -320,9 +352,7 @@ func (w *OAuthTransportWrapper) isMetadataRequest(req *http.Request) bool {
 // roundTripMetadata serves the AS metadata GET: the
 // document comes from the discovery cache (one fetch shared with the preflight),
 // the override fields are written over it, and the learned endpoints feed
-// endpoint-URL matching. When the document cannot be fetched and the overrides cover
-// authorization_endpoint and token_endpoint, a synthetic document is served so
-// mcp-go never falls back to its /authorize, /token, /register defaults.
+// endpoint-URL matching.
 // handled=false means "forward the request untouched".
 func (w *OAuthTransportWrapper) roundTripMetadata(req *http.Request) (*http.Response, error, bool) {
 	ep := w.endpoints
@@ -349,22 +379,9 @@ func (w *OAuthTransportWrapper) roundTripMetadata(req *http.Request) (*http.Resp
 			return nil, nil, false // not a JSON object: leave it to mcp-go untouched
 		}
 		body = rewritten
-	case ep.overrides.authz != "" && ep.overrides.token != "":
-		synth, serr := w.synthesizeMetadata()
-		if serr != nil {
-			return nil, nil, false
-		}
-		w.logger.Info("Authorization server metadata unreachable; serving a document built from the endpoint overrides",
-			zap.String("metadata_url", logSafeURL(ep.metadataURL)),
-			zap.String("authorization_endpoint", logSafeURL(ep.overrides.authz)),
-			zap.String("token_endpoint", logSafeURL(ep.overrides.token)))
-		body = synth
-		var m map[string]any
-		if json.Unmarshal(body, &m) == nil {
-			w.learnFromDoc(m)
-		}
+
 	default:
-		// Unreachable and nothing to synthesize from. The failure is cached for
+		// The failure is cached for
 		// 30s by the discovery cache, so answer it from the cache too instead
 		// of re-fetching: a status failure replays its status code, a
 		// transport failure replays the error.
@@ -438,27 +455,11 @@ func (w *OAuthTransportWrapper) learnFromDoc(m map[string]any) {
 	authz, _ := m["authorization_endpoint"].(string)
 	token, _ := m["token_endpoint"].(string)
 	w.learnEndpoints(authz, token)
-}
-
-// synthesizeMetadata builds an RFC 8414 document from the endpoint overrides.
-// The issuer is the authorization endpoint's origin.
-func (w *OAuthTransportWrapper) synthesizeMetadata() ([]byte, error) {
-	ov := w.endpoints.overrides
-	au, err := url.Parse(ov.authz)
-	if err != nil {
-		return nil, err
+	registration, _ := m["registration_endpoint"].(string)
+	u, err := url.Parse(registration)
+	if err == nil && u.Host != "" {
+		w.mu.Lock()
+		w.registrationURL = u
+		w.mu.Unlock()
 	}
-	doc := map[string]any{
-		"issuer":                                au.Scheme + "://" + au.Host,
-		"authorization_endpoint":                ov.authz,
-		"token_endpoint":                        ov.token,
-		"response_types_supported":              []string{"code"},
-		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
-		"code_challenge_methods_supported":      []string{"S256"},
-		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_post", "client_secret_basic"},
-	}
-	if ov.registration != "" {
-		doc["registration_endpoint"] = ov.registration
-	}
-	return json.Marshal(doc)
 }

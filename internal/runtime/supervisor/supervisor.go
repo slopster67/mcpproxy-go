@@ -5,11 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"strings"
 
 	"go.uber.org/zap"
 
@@ -1031,6 +1030,7 @@ func toolInfosFromMetadata(tools []*config.ToolMetadata) []stateview.ToolInfo {
 			Description:      tool.Description,
 			InputSchema:      inputSchema,
 			Annotations:      tool.Annotations,
+			Definition:       tool.Definition,
 			OutputSchemaJSON: tool.OutputSchemaJSON,
 		}
 	}

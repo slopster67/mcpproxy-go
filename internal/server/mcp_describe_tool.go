@@ -298,10 +298,7 @@ func (p *MCPProxyServer) handleDescribeTool(ctx context.Context, request mcp.Cal
 // availability from the shared preflight evaluator instead of definitions.
 func (p *MCPProxyServer) handleDescribeToolOnSurface(ctx context.Context, request mcp.CallToolRequest, surface describeSurface) (*mcp.CallToolResult, error) {
 	startTime := time.Now()
-	var sessionID string
-	if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-		sessionID = sess.SessionID()
-	}
+	sessionID := sessionIDFromContext(ctx)
 	requestID := mintCorrelationID("describe_tool")
 
 	// Mode selection and its strict validation run

@@ -9,7 +9,10 @@ import (
 	"github.com/mark3labs/mcp-go/v2/client"
 	sdktransport "github.com/mark3labs/mcp-go/v2/client/transport"
 	"github.com/mark3labs/mcp-go/v2/mcp"
+
+	"github.com/slopster67/mcpproxy-go/internal/mcprelay"
 	"github.com/slopster67/mcpproxy-go/internal/peering"
+	proxytransport "github.com/slopster67/mcpproxy-go/internal/transport"
 )
 
 func (c *Client) SetPeerExecutor(executor peering.Executor) {
@@ -19,11 +22,15 @@ func (c *Client) SetPeerExecutor(executor peering.Executor) {
 }
 func (c *Client) connectPeer(ctx context.Context) error {
 	t := peering.NewTransport(c.peerExecutor, c.config, c.CredentialBinding(), c.peerGeneration)
-	c.client = client.NewClient(t)
+	c.client = client.NewClient(t, client.WithElicitationHandler(mcprelay.Handler{}), client.WithSamplingHandler(mcprelay.Handler{}), client.WithRootsHandler(mcprelay.Handler{}))
 	if err := c.client.Start(ctx); err != nil {
 		return err
 	}
-	return c.initialize(ctx)
+	if err := c.initialize(ctx); err != nil {
+		return err
+	}
+	c.registerNotificationHandler()
+	return nil
 }
 func (c *Client) PeerRPC(ctx context.Context, request sdktransport.JSONRPCRequest) (*sdktransport.JSONRPCResponse, error) {
 	c.mu.RLock()
@@ -37,7 +44,16 @@ func (c *Client) PeerRPC(ctx context.Context, request sdktransport.JSONRPCReques
 	// request IDs disjoint on transports that multiplex responses by ID.
 	original := request.ID
 	request.ID = mcp.NewRequestId("peer-" + uuid.NewString())
-	response, err := sdk.GetTransport().SendRequest(ctx, request)
+	challenge := &proxytransport.AuthChallenge{}
+	response, err := sdk.GetTransport().SendRequest(proxytransport.WithAuthChallenge(ctx, challenge), request)
+	if err != nil && ctx.Err() != nil && c.transportType == transportStdio {
+		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = sdk.GetTransport().SendNotification(cancelCtx, mcp.JSONRPCNotification{JSONRPC: mcp.JSONRPC_VERSION, Notification: mcp.Notification{Method: "notifications/cancelled", Params: mcp.NotificationParams{AdditionalFields: map[string]any{"requestId": request.ID}}}})
+	}
+	if pending := c.authChallenge(err, challenge); pending != nil {
+		return nil, pending
+	}
 	if response != nil {
 		response.ID = original
 	}
@@ -64,10 +80,3 @@ func (c *Client) OnPeerNotification(fn func(mcp.JSONRPCNotification)) {
 func (c *Client) SuppressBrowser() { c.suppressBrowser = true }
 
 func (c *Client) SetPeerGeneration(generation int64) { c.peerGeneration = generation }
-
-type peerCallTimeoutKey struct{}
-
-// WithPeerCallTimeout carries the execution budget already imposed centrally.
-func WithPeerCallTimeout(ctx context.Context, timeout time.Duration) context.Context {
-	return context.WithValue(ctx, peerCallTimeoutKey{}, timeout)
-}

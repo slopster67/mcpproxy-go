@@ -137,6 +137,17 @@ func (p *MCPProxyServer) buildFullToolEntry(result *config.SearchResult, opts to
 		"server":      result.Tool.ServerName,
 	}
 
+	if len(result.Tool.Definition) > 0 {
+		var definition map[string]interface{}
+		if json.Unmarshal(result.Tool.Definition, &definition) == nil {
+			for _, key := range []string{"_meta", "title", "icons", "execution"} {
+				if value, ok := definition[key]; ok {
+					mcpTool[key] = value
+				}
+			}
+		}
+	}
+
 	// Look up tool annotations and derive recommended call_with variant.
 	// result.Tool.Name is the canonical "server:tool" id; lookupToolAnnotations
 	// normalizes the prefix against the bare StateView names, so the prefixed toolName

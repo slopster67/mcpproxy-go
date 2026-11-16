@@ -180,7 +180,6 @@ type Runtime struct {
 	profilesService    *ProfilesService
 	profileEvaluatorMu sync.RWMutex
 	profileEvaluator   ProfileEvaluator
-	profileSessionHook ProfileSessionHook
 
 	appCtx    context.Context
 	appCancel context.CancelFunc

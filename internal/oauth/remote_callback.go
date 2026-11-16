@@ -1,6 +1,10 @@
 package oauth
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -109,4 +113,37 @@ func (m *CallbackServerManager) RemoteCallbackHandler(w http.ResponseWriter, r *
 	// Invalid public requests must not mark an otherwise healthy upstream as
 	// failed. Delivery still atomically consumes the matching waiter once.
 	c.handleCallbackWithFailureNotification(w, r, false)
+}
+
+func (c *CallbackServer) BindIssuer(ctx context.Context, state, metadataURL, expected string, client *http.Client) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var metadata struct {
+		Issuer   string `json:"issuer"`
+		Required bool   `json:"authorization_response_iss_parameter_supported"`
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("issuer metadata: HTTP %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&metadata); err != nil {
+		return err
+	}
+	if metadata.Issuer == "" || metadata.Issuer != expected {
+		return fmt.Errorf("authorization issuer changed")
+	}
+	c.waitersMu.Lock()
+	defer c.waitersMu.Unlock()
+	waiter := c.waiters[state]
+	if waiter == nil {
+		return fmt.Errorf("authorization state expired")
+	}
+	waiter.issuer, waiter.issuerRequired = metadata.Issuer, metadata.Required
+	return nil
 }

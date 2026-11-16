@@ -11,6 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	mcptransport "github.com/mark3labs/mcp-go/v2/client/transport"
+	"github.com/mark3labs/mcp-go/v2/mcp"
+	"go.uber.org/zap"
+
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/diagnostics"
@@ -24,10 +28,6 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/upstream/core"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/dialgate"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/types"
-
-	mcptransport "github.com/mark3labs/mcp-go/v2/client/transport"
-	"github.com/mark3labs/mcp-go/v2/mcp"
-	"go.uber.org/zap"
 )
 
 // Client wraps an upstream connection with state management and health monitoring.
@@ -112,9 +112,6 @@ type Client struct {
 	// (connection refused, no such host, unreachable) bypass the counter
 	// and trigger Error immediately. See recordHealthCheckFailure().
 	consecutiveHealthFailures int
-
-	// sess is the session re-init state (single-flight, baseline, counter).
-	sess sessionReinit
 
 	// ambiguousProbeInFlight gates the async liveness probe fired after an
 	// ambiguous tools/call cancellation so a burst of canceled calls results
@@ -568,10 +565,6 @@ func (mc *Client) Connect(ctx context.Context) error {
 	mc.connectionEpoch.Store(nextConnectionEpoch())
 	mc.epochMu.Unlock()
 
-	// Remember the session id this connect obtained, so a
-	// transport that loses it before the first managed request can recover.
-	_, _, _ = mc.sessionState()
-
 	mc.advertisedIcon.Store(&advertisedIcon)
 
 	// Transition to ready state only if not already ready
@@ -999,7 +992,7 @@ func (mc *Client) runListToolsAsLeader(listCtx context.Context, release func() b
 	}()
 
 	listEpoch := mc.connectionEpoch.Load()
-	tools, err := mc.listToolsUpstream(listCtx)
+	tools, err := mc.coreClient.ListTools(listCtx)
 	mc.publishListToolsResult(tools, err)
 
 	if err != nil {
@@ -1092,7 +1085,7 @@ func (mc *Client) callTool(ctx context.Context, toolName string, args map[string
 
 	// Charge transport failures to the connection generation that dispatched the call.
 	callEpoch := mc.connectionEpoch.Load()
-	result, err := mc.callToolWithSession(core.WithConnectionGeneration(ctx, callEpoch), toolName, args, expectedEpoch)
+	result, err := mc.coreClient.CallTool(core.WithConnectionGeneration(ctx, callEpoch), toolName, args)
 	if err != nil && mc.retired.Load() {
 		// The instance was retired while the call was in flight; its gate closed the connection or refused the
 		// send. Unavailable, and nothing to classify: a retired instance's
@@ -1104,16 +1097,15 @@ func (mc *Client) callTool(ctx context.Context, toolName string, args map[string
 		return nil, ErrInstanceRetired
 	}
 	if err != nil {
-		if errors.Is(err, ErrSessionReestablished) || errors.Is(err, ErrConnectionGenerationChanged) {
-			// The session was re-established and the call was deliberately
-			// not repeated. Not a connection failure.
-			mc.logger.Warn("Tool call not repeated after upstream session re-initialize",
-				zap.String("server", mc.GetConfig().Name),
-				zap.String("tool", toolName),
-				zap.Error(err))
+		if errors.Is(err, ErrConnectionGenerationChanged) {
 			return nil, err
 		}
+
 		mc.recordCallToolOAuthSignal(toolName, err)
+		if core.IsOAuthPending(err) {
+			mc.StateManager.SetPendingAuthProbe(err, false)
+			return nil, err
+		}
 		// A 429 answered to a tools/call is the same instruction as one answered
 		// to connect. Recording it here does NOT mark the server
 		// unhealthy — the classification below owns that — it only makes sure
@@ -1299,7 +1291,7 @@ func (mc *Client) probeAfterAmbiguousCallError(cause error) {
 		ctx, cancel := context.WithTimeout(context.Background(), ambiguousProbeTimeout)
 		defer cancel()
 
-		err := mc.coreClient.Ping(ctx)
+		err := mc.coreClient.Probe(ctx)
 		if err == nil {
 			mc.logger.Debug("Liveness probe after canceled tool call succeeded; server left untouched",
 				zap.String("server", mc.GetConfig().Name),
@@ -1580,14 +1572,8 @@ func (mc *Client) performHealthCheck() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Probe liveness with the MCP-standard lightweight `ping` rather than
-	// re-listing every tool, so health checks add no background `tools/list`
-	// traffic.
-	// The generation this ping runs on: a Disconnect racing the ping closes
-	// the transport (the ping fails with "transport closed") and only then
-	// bumps the epoch, so the verdict below must land on this generation only.
 	pingEpoch := mc.connectionEpoch.Load()
-	err := mc.probeLiveness(ctx)
+	err := mc.coreClient.Probe(ctx)
 
 	// Retired while the ping was in flight: its failure (the retirement closed the transport) is no
 	// health evidence, and neither is a success. No accounting either way.
@@ -2110,7 +2096,16 @@ func (mc *Client) GetServerIcon() string {
 
 func (mc *Client) SetPeerExecutor(executor peering.Executor) { mc.coreClient.SetPeerExecutor(executor) }
 func (mc *Client) PeerRPC(ctx context.Context, request mcptransport.JSONRPCRequest) (*mcptransport.JSONRPCResponse, error) {
-	return mc.coreClient.PeerRPC(ctx, request)
+	if mc.retired.Load() {
+		return nil, ErrInstanceRetired
+	}
+	endCall := mc.beginInFlightCall()
+	defer endCall()
+	response, err := mc.coreClient.PeerRPC(ctx, request)
+	if core.IsOAuthPending(err) {
+		mc.StateManager.SetPendingAuthProbe(err, false)
+	}
+	return response, err
 }
 func (mc *Client) PeerNotify(ctx context.Context, notification mcp.JSONRPCNotification) error {
 	return mc.coreClient.PeerNotify(ctx, notification)

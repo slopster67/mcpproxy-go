@@ -109,7 +109,7 @@ type Authorization struct {
 	// ProfilePin is the client token's pinned profile ("" = unpinned).
 	ProfilePin string `json:"profile_pin,omitempty"`
 	// Profile is the effective profile the request was bounded to (token pin >
-	// URL profile > session set_profile), "" when unscoped.
+	// request metadata), "" when unscoped.
 	Profile string `json:"profile,omitempty"`
 	// ProfileScoped is true when a profile bounded the request. It is kept
 	// separate from ProfileServers because a deny-all scope (an empty profile,
@@ -154,7 +154,7 @@ func (a Authorization) IsAdministrator() bool {
 // than admitted as an administrator: client tokens and OAuth
 // users. A user is allowlist-scoped exactly like an agent at every dispatch
 // gate (call_tool_*, direct dispatch, retrieve_tools/describe_tool
-// visibility, set_profile), so the read gate bounds it the same way.
+// visibility, request selection), so the read gate bounds it the same way.
 func (a Authorization) IsScoped() bool {
 	return kindIsScoped(a.CallerKind)
 }

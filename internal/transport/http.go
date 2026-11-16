@@ -7,13 +7,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/slopster67/mcpproxy-go/internal/config"
-	"github.com/slopster67/mcpproxy-go/internal/oauth"
-	"github.com/slopster67/mcpproxy-go/internal/upstream/dialgate"
-
 	"github.com/mark3labs/mcp-go/v2/client"
 	"github.com/mark3labs/mcp-go/v2/client/transport"
 	"go.uber.org/zap"
+
+	"github.com/slopster67/mcpproxy-go/internal/config"
+	"github.com/slopster67/mcpproxy-go/internal/mcprelay"
+	"github.com/slopster67/mcpproxy-go/internal/oauth"
+	"github.com/slopster67/mcpproxy-go/internal/upstream/dialgate"
 )
 
 const (
@@ -108,7 +109,7 @@ func (cfg *HTTPTransportConfig) wrapClient(c *client.Client) *client.Client {
 	if c == nil {
 		return c
 	}
-	return client.NewClient(dialgate.WrapTransport(cfg.Gate, c.GetTransport()))
+	return client.NewClient(dialgate.WrapTransport(cfg.Gate, c.GetTransport()), client.WithElicitationHandler(mcprelay.Handler{}), client.WithSamplingHandler(mcprelay.Handler{}), client.WithRootsHandler(mcprelay.Handler{}))
 }
 
 // upstreamRoundTripper composes the outbound transport wrappers for an upstream
@@ -126,7 +127,7 @@ func (cfg *HTTPTransportConfig) upstreamRoundTripper(base http.RoundTripper, log
 		rt = NewRetryAfterTransport(rt, cfg.RetryAfter, logger)
 	}
 
-	return rt
+	return challengeTransport{rt}
 }
 
 // maxRedirects mirrors net/http's default redirect limit.
@@ -275,125 +276,6 @@ func CreateHTTPClient(cfg *HTTPTransportConfig) (*client.Client, error) {
 		return nil, fmt.Errorf("failed to create HTTP transport: %w", err)
 	}
 	return cfg.wrapClient(client.NewClient(httpTransport)), nil
-}
-
-// CreateSSEClient creates a new MCP client using SSE transport
-func CreateSSEClient(cfg *HTTPTransportConfig) (*client.Client, error) {
-	logger := zap.L().Named("transport")
-
-	if cfg.URL == "" {
-		return nil, fmt.Errorf("no URL specified for SSE transport")
-	}
-
-	logger.Debug("Creating SSE client",
-		zap.String("url", cfg.logSafeURL()),
-		zap.Bool("use_oauth", cfg.UseOAuth),
-		zap.Bool("has_oauth_config", cfg.OAuthConfig != nil))
-
-	if cfg.UseOAuth && cfg.OAuthConfig != nil {
-		// Use OAuth-enabled SSE client with Dynamic Client Registration
-		logger.Info("Creating OAuth-enabled SSE client with Dynamic Client Registration",
-			zap.String("url", cfg.logSafeURL()),
-			zap.String("redirect_uri", cfg.OAuthConfig.RedirectURI),
-			zap.Strings("scopes", cfg.OAuthConfig.Scopes),
-			zap.Bool("pkce_enabled", cfg.OAuthConfig.PKCEEnabled))
-
-		logger.Debug("OAuth SSE config details",
-			zap.String("client_id", cfg.OAuthConfig.ClientID),
-			zap.Bool("has_client_secret", cfg.OAuthConfig.ClientSecret != ""),
-			zap.Any("token_store", cfg.OAuthConfig.TokenStore))
-
-		logger.Info("Creating OAuth SSE client with context-based timeout",
-			zap.String("url", cfg.logSafeURL()),
-			zap.String("note", "Using 30-minute context timeout from tray"))
-
-		// Add detailed logging about the OAuth config and token store
-		logger.Info("🔍 OAuth SSE client creation details",
-			zap.String("url", cfg.logSafeURL()),
-			zap.String("redirect_uri", cfg.OAuthConfig.RedirectURI),
-			zap.Strings("scopes", cfg.OAuthConfig.Scopes),
-			zap.Bool("pkce_enabled", cfg.OAuthConfig.PKCEEnabled),
-			zap.String("client_id", cfg.OAuthConfig.ClientID),
-			zap.Bool("has_token_store", cfg.OAuthConfig.TokenStore != nil))
-
-		// Log if extra params wrapper is active (custom HTTP client configured)
-		if cfg.OAuthConfig.HTTPClient != nil {
-			logger.Debug("🔧 Using custom HTTP client with OAuth extra params wrapper",
-				zap.String("note", "Extra parameters will be injected into OAuth requests"))
-		}
-
-		// As in the streamable-HTTP OAuth branch: OAuthConfig.HTTPClient covers
-		// only the OAuth metadata/DCR/token calls, so the MCP requests need our
-		// own client for the Retry-After recorder to see a 429. No
-		// Timeout — SSE streams are long-lived by design.
-		var oauthOpts []transport.ClientOption
-		oauthOpts = append(oauthOpts, client.WithHTTPClient(&http.Client{
-			Transport:     cfg.upstreamRoundTripper(cfg.baseTransport(nil), logger),
-			CheckRedirect: upstreamRedirectPolicy,
-		}))
-		// Static headers ride along with the bearer, as in the streamable-HTTP
-		// branch above.
-		if len(cfg.Headers) > 0 {
-			logger.Debug("Adding static headers to OAuth SSE client", zap.Int("header_count", len(cfg.Headers)))
-			oauthOpts = append(oauthOpts, client.WithHeaders(cfg.Headers))
-		}
-
-		client, err := client.NewOAuthSSEClient(cfg.URL, cfg.oauthConfigForGate(), oauthOpts...)
-		if err != nil {
-			// The error may quote the raw URL; see the streamable-HTTP branch.
-			logger.Error("Failed to create OAuth SSE client", logSafeErrorField(err))
-			return nil, fmt.Errorf("failed to create OAuth SSE client: %w", err)
-		}
-
-		logger.Info("✅ OAuth-enabled SSE client created successfully")
-		return cfg.wrapClient(client), nil
-	}
-
-	logger.Debug("Creating regular SSE client", zap.String("url", cfg.logSafeURL()))
-
-	headers := cfg.Headers
-
-	// Create custom HTTP client for SSE - NO Timeout field to allow indefinite streaming
-	// The Timeout field covers the entire request duration, which kills long-lived SSE streams
-	// Instead, we rely on IdleConnTimeout to detect dead connections
-	baseTransport := cfg.baseTransport(&http.Transport{
-		MaxIdleConns:        10,
-		IdleConnTimeout:     300 * time.Second, // 5 minutes idle before closing
-		DisableCompression:  false,
-		DisableKeepAlives:   false, // Enable keep-alives for SSE stability
-		MaxIdleConnsPerHost: 5,
-		// ResponseHeaderTimeout can be used to timeout initial connection, but not ongoing stream
-		ResponseHeaderTimeout: 30 * time.Second,
-	})
-
-	// Tracing and the Retry-After recorder both wrap the base transport; the
-	// SSE-specific tuning above and the deliberately absent Client.Timeout
-	// still apply.
-	httpClient := &http.Client{
-		Transport:     cfg.upstreamRoundTripper(baseTransport, logger),
-		CheckRedirect: upstreamRedirectPolicy,
-	}
-
-	logger.Info("Creating SSE MCP client with indefinite timeout for long-lived streams",
-		zap.String("url", cfg.logSafeURL()),
-		zap.Duration("idle_timeout", 300*time.Second),
-		zap.Duration("header_timeout", 30*time.Second),
-		zap.Int("header_count", len(headers)),
-		zap.String("note", "Removed http.Client.Timeout to allow SSE streams longer than 3 minutes"))
-
-	// Enhanced trace-level debugging for SSE transport
-
-	sseOpts := []transport.ClientOption{client.WithHTTPClient(httpClient)}
-	if len(headers) > 0 {
-		logger.Debug("Adding SSE headers", zap.Int("header_count", len(headers)))
-		sseOpts = append(sseOpts, client.WithHeaders(headers))
-	}
-
-	sseClient, err := client.NewSSEMCPClient(cfg.URL, sseOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SSE client: %w", err)
-	}
-	return cfg.wrapClient(sseClient), nil
 }
 
 // CreateHTTPTransportConfig creates an HTTP transport config from server config

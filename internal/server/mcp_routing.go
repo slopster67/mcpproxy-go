@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -220,7 +219,9 @@ func (p *MCPProxyServer) renderDirectTools(cat *directCatalog) []mcpserver.Serve
 		// the filter runs (see directToolStamp's doc comment). The terminal
 		// stripDirectToolStampFilter removes it before any response reaches a
 		// client.
-		mcpTool.Icons = serverIcons(p.serverIcon(entry.ServerName))
+		if len(mcpTool.Icons) == 0 {
+			mcpTool.Icons = serverIcons(p.serverIcon(entry.ServerName))
+		}
 		mcpTool = stampDirectTool(mcpTool, entry)
 
 		serverTools = append(serverTools, mcpserver.ServerTool{
@@ -247,60 +248,21 @@ func emptyDirectCatalog(mode string, logger *zap.Logger) *directCatalog {
 	return cat
 }
 
-// renderFullDirectTool renders a direct-surface tool with its full upstream
-// input schema (properties, required, and a top-level
-// additionalProperties/$defs when the upstream declares them).
 func renderFullDirectTool(entry *directCatalogEntry, description string) mcp.Tool {
-	opts := []mcp.ToolOption{mcp.WithDescription(description)}
+	mcpTool := mcp.NewTool(entry.DisplayName, mcp.WithDescription(description))
+	mcpTool.Annotations = directToolAnnotations(entry.Annotations)
 
-	if entry.Annotations != nil {
-		if entry.Annotations.Title != "" {
-			opts = append(opts, mcp.WithTitleAnnotation(entry.Annotations.Title))
-			opts = append(opts, mcp.WithToolTitle(entry.Annotations.Title))
+	if len(entry.Definition) > 0 {
+		var definition mcp.Tool
+		if err := json.Unmarshal(entry.Definition, &definition); err == nil {
+			mcpTool = definition
 		}
-		if entry.Annotations.ReadOnlyHint != nil {
-			opts = append(opts, mcp.WithReadOnlyHintAnnotation(*entry.Annotations.ReadOnlyHint))
-		}
-		if entry.Annotations.DestructiveHint != nil {
-			opts = append(opts, mcp.WithDestructiveHintAnnotation(*entry.Annotations.DestructiveHint))
-		}
-		if entry.Annotations.IdempotentHint != nil {
-			opts = append(opts, mcp.WithIdempotentHintAnnotation(*entry.Annotations.IdempotentHint))
-		}
-		if entry.Annotations.OpenWorldHint != nil {
-			opts = append(opts, mcp.WithOpenWorldHintAnnotation(*entry.Annotations.OpenWorldHint))
-		}
+		mcpTool.Name = entry.DisplayName
+		mcpTool.Description = description
 	}
-
-	mcpTool := mcp.NewTool(entry.DisplayName, opts...)
-
 	if entry.ParamsJSON != "" {
-		var schema map[string]interface{}
-		if err := json.Unmarshal([]byte(entry.ParamsJSON), &schema); err == nil {
-			mcpTool.InputSchema = mcp.ToolInputSchema{Type: "object"}
-			if props, ok := schema["properties"].(map[string]interface{}); ok {
-				mcpTool.InputSchema.Properties = props
-			}
-			if req, ok := schema["required"].([]interface{}); ok {
-				reqStrings := make([]string, 0, len(req))
-				for _, r := range req {
-					if str, ok := r.(string); ok {
-						reqStrings = append(reqStrings, str)
-					}
-				}
-				mcpTool.InputSchema.Required = reqStrings
-			}
-			// Keep the object open when upstream declared it open: dropping
-			// additionalProperties advertises {"properties":{}}, which
-			// grammar-constrained clients compile to "no keys allowed".
-			// Carried only when present.
-			if ap, ok := schema["additionalProperties"]; ok {
-				mcpTool.InputSchema.AdditionalProperties = ap
-			}
-			if defs, ok := schema["$defs"].(map[string]interface{}); ok {
-				mcpTool.InputSchema.Defs = defs
-			}
-		}
+		mcpTool.RawInputSchema = json.RawMessage(entry.ParamsJSON)
+		mcpTool.InputSchema = mcp.ToolInputSchema{}
 	}
 
 	applyToolOutputSchemaJSON(&mcpTool, entry.OutputSchemaJSON)
@@ -321,9 +283,12 @@ func renderFullDirectTool(entry *directCatalogEntry, description string) mcp.Too
 // outputSchema is deliberately not applied: a deferred entry
 // advertises no schema in either direction.
 func renderDeferredDirectTool(entry *directCatalogEntry, description string) mcp.Tool {
-	mcpTool := mcp.NewToolWithRawSchema(entry.DisplayName, description, json.RawMessage(deferredDirectInputSchema))
-	mcpTool.Annotations = directToolAnnotations(entry.Annotations)
-	return mcpTool
+	tool := renderFullDirectTool(entry, description)
+	tool.RawInputSchema = json.RawMessage(deferredDirectInputSchema)
+	tool.InputSchema = mcp.ToolInputSchema{}
+	tool.RawOutputSchema = nil
+	tool.OutputSchema = mcp.ToolOutputSchema{}
+	return tool
 }
 
 // directToolAnnotations reproduces, as a struct, exactly what the full-mode
@@ -449,10 +414,7 @@ func (p *MCPProxyServer) makeDirectModeHandler(entry *directCatalogEntry) mcpser
 		startTime := time.Now()
 
 		// Get session ID for activity logging
-		var sessionID string
-		if sess := mcpserver.ClientSessionFromContext(ctx); sess != nil {
-			sessionID = sess.SessionID()
-		}
+		sessionID := sessionIDFromContext(ctx)
 
 		// Get request ID from context. Direct-mode calls that did not arrive
 		// over an HTTP transport carry none, and every activity this handler
@@ -705,7 +667,6 @@ func (p *MCPProxyServer) buildCodeExecModeTools() []mcpserver.ServerTool {
 	}
 	codeExecRetrieveOpts = append(codeExecRetrieveOpts, retrieveToolsAnnotationFilterOptions()...)
 	retrieveToolsTool := newProxyTool("retrieve_tools", codeExecRetrieveOpts...)
-	tools = append(tools, p.setProfileServerTool())
 	tools = append(tools, mcpserver.ServerTool{
 		Tool:    retrieveToolsTool,
 		Handler: p.handleRetrieveToolsForMode(config.RoutingModeCodeExecution),
@@ -759,8 +720,6 @@ func (p *MCPProxyServer) buildCallToolModeTools() []mcpserver.ServerTool {
 		Tool:    buildDescribeToolTool(),
 		Handler: p.handleDescribeTool,
 	})
-
-	tools = append(tools, p.setProfileServerTool())
 
 	// call_tool_read / call_tool_write / call_tool_destructive — all three
 	// built from the shared helper in mcp.go so schema stays in sync across
@@ -935,6 +894,7 @@ func (p *MCPProxyServer) initRoutingModeServers() {
 	// All routing mode servers share the same hooks for session tracking
 	opts := []mcpserver.ServerOption{
 		mcpserver.WithToolCapabilities(true),
+		mcpserver.WithToolHandlerMiddleware(p.continueTool),
 		mcpserver.WithRecovery(),
 		mcpserver.WithIcons(mcpproxyIcons()...),
 	}

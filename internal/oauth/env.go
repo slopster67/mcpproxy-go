@@ -27,9 +27,10 @@ import (
 // the credentials of whatever serves the name now. The zero binding is
 // unbound (the doctor, the REST diagnostics, the standalone CLI).
 type Env struct {
-	Ctx       context.Context
-	Transport http.RoundTripper
-	Binding   commitview.CredentialBinding
+	ResourceMetadataURL string
+	Ctx                 context.Context
+	Transport           http.RoundTripper
+	Binding             commitview.CredentialBinding
 }
 
 func defaultEnv() Env { return Env{} }

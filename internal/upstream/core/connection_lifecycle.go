@@ -7,112 +7,45 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/v2/client"
 	"github.com/mark3labs/mcp-go/v2/mcp"
-	"github.com/slopster67/mcpproxy-go/internal/diagnostics"
-	"github.com/slopster67/mcpproxy-go/internal/oauth"
 	"go.uber.org/zap"
+
+	"github.com/slopster67/mcpproxy-go/internal/diagnostics"
+	"github.com/slopster67/mcpproxy-go/internal/mcprelay"
+	"github.com/slopster67/mcpproxy-go/internal/oauth"
 )
 
-// initialize performs MCP initialization handshake
 func (c *Client) initialize(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	initRequest := mcp.InitializeRequest{}
-	// Pinned to the newest pre-2026-07-28 revision rather than
-	// mcp.LATEST_PROTOCOL_VERSION (2026-07-28): in that era Ping is a no-op (so
-	// health probes stop proving liveness) and server-initiated requests are
-	// gone (so roots-based workspace discovery cannot work).
-	initRequest.Params.ProtocolVersion = mcp.LATEST_LEGACY_PROTOCOL_VERSION
-	initRequest.Params.ClientInfo = mcp.Implementation{
-		Name:    "mcpproxy-go",
-		Version: "1.0.0",
-	}
-	initRequest.Params.Capabilities = mcp.ClientCapabilities{}
-
-	// Log request for trace debugging - use main logger for CLI debug mode
-	if reqBytes, err := json.MarshalIndent(initRequest, "", "  "); err == nil {
-		c.logger.Debug("🔍 JSON-RPC INITIALIZE REQUEST",
-			zap.String("method", "initialize"),
-			zap.String("formatted_json", string(reqBytes)))
-	}
-
-	initStart := time.Now()
-	serverInfo, err := c.client.Initialize(ctx, initRequest)
+	request := mcp.InitializeRequest{}
+	request.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	request.Params.ClientInfo = mcp.Implementation{Name: "mcpproxy-go", Version: "1.0.0"}
+	started := time.Now()
+	info, err := c.client.Initialize(ctx, request)
 	if err != nil {
-		// Log initialization failure to server-specific log
-		if c.upstreamLogger != nil {
-			// The transport error quotes the configured URL,
-			// credentials and all, and this line is written to the per-server
-			// log FILE which `upstream_servers tail_log` hands to any MCP
-			// caller.
-			c.upstreamLogger.Error("MCP initialization failed",
-				logSafeErrorField(err))
-		}
-
-		if c.transportType != transportStdio && isOAuthHeaderFailure(err) {
-			return diagnostics.WrapError(diagnostics.OAuthTokenUnavailable, fmt.Errorf("%s: %w", diagnostics.OAuthCredentialsUnavailableMessage, err))
-		}
-
-		// Surface the useful context that the raw "context deadline exceeded"
-		// swallows: how long we waited and whatever the child process wrote
-		// to stderr before dying. Non-timeout errors pass through unchanged.
 		if errors.Is(err, context.DeadlineExceeded) {
-			return c.initializeTimeout(err, time.Since(initStart))
+			return c.initializeTimeout(err, time.Since(started))
 		}
-
-		// STDIO subprocess exited before completing the handshake: mcp-go reports
-		// a closed transport / EOF on the pipe (not a typed exit error). Surface
-		// the captured stderr so the user sees the real, often self-serviceable
-		// cause (e.g. "Error: --brave-api-key is required") instead of a bare
-		// "transport closed" that the diagnostics layer marks UNKNOWN. Gated to
-		// stdio: initialize() is shared by HTTP/SSE transports, which have no
-		// local subprocess and must keep their generic diagnostics.
 		if c.transportType == transportStdio && isTransportClosedErr(err) {
 			return enrichTransportClosedError(c.formatRecentStderr(), err)
 		}
-
+		if c.transportType != transportStdio && isOAuthHeaderFailure(err) {
+			return diagnostics.WrapError(diagnostics.OAuthTokenUnavailable, err)
+		}
 		return err
 	}
-
-	// Log response for trace debugging - use main logger for CLI debug mode
-	if respBytes, err := json.MarshalIndent(serverInfo, "", "  "); err == nil {
-		c.logger.Debug("🔍 JSON-RPC INITIALIZE RESPONSE",
-			zap.String("method", "initialize"),
-			zap.String("formatted_json", string(respBytes)))
+	if info.ProtocolVersion != mcp.LATEST_PROTOCOL_VERSION {
+		return fmt.Errorf("upstream requires unsupported MCP version %s", info.ProtocolVersion)
 	}
-
-	// The pin above controls what mcpproxy asks for; this checks what it got.
-	// mcp-go accepts a 2026-07-28 answer to an older request and applies it, so
-	// a server answering with that era would silently flip this hop to it. A
-	// compliant server answers with a version the client can speak, so this
-	// fires only for a misbehaving upstream.
-	if negotiated := serverInfo.ProtocolVersion; mcp.IsModernProtocol(negotiated) {
-		return fmt.Errorf("upstream answered MCP protocol version %s to a %s request; mcpproxy does not yet serve the 2026-07-28 era on the upstream hop",
-			negotiated, initRequest.Params.ProtocolVersion)
-	}
-
-	c.serverInfo = serverInfo
-	c.logger.Info("MCP initialization successful",
-		zap.String("server_name", serverInfo.ServerInfo.Name),
-		zap.String("server_version", serverInfo.ServerInfo.Version))
-
-	// Log initialization success to server-specific log
-	if c.upstreamLogger != nil {
-		c.upstreamLogger.Info("MCP initialization completed successfully",
-			zap.String("server_name", serverInfo.ServerInfo.Name),
-			zap.String("server_version", serverInfo.ServerInfo.Version),
-			zap.String("protocol_version", serverInfo.ProtocolVersion))
-	}
-
+	c.serverInfo = info
 	return nil
 }
 
 // enrichTransportClosedError builds the actionable error for a stdio subprocess
-// that exited before completing the MCP initialize handshake, folding in the
+// that exited before completing the MCP discovery, folding in the
 // captured stderr tail so the UI banner and per-server logs show the real,
 // often self-serviceable cause (e.g. a missing API key) instead of a bare
 // "transport closed". It wraps the original cause with %w so callers can still
@@ -123,11 +56,11 @@ func (c *Client) initialize(ctx context.Context) error {
 func enrichTransportClosedError(stderrBlock string, cause error) error {
 	if stderrBlock != "" {
 		return &childOutputError{
-			msg:   fmt.Sprintf("server process exited before completing the MCP initialize handshake; recent stderr:\n%s: %v", stderrBlock, cause),
+			msg:   fmt.Sprintf("server process exited before completing the MCP discovery; recent stderr:\n%s: %v", stderrBlock, cause),
 			cause: cause,
 		}
 	}
-	return fmt.Errorf("server process exited before completing the MCP initialize handshake and produced no stderr output (transport closed before the handshake): %w", cause)
+	return fmt.Errorf("server process exited before completing the MCP discovery and produced no stderr output (transport closed during discovery): %w", cause)
 }
 
 type childOutputError struct {
@@ -146,10 +79,10 @@ func embedsChildOutput(err error) bool {
 }
 
 // isTransportClosedErr reports whether an initialize() failure indicates the
-// child process went away mid-handshake. mcp-go surfaces a premature stdio
+// child process went away during discovery. mcp-go surfaces a premature stdio
 // exit as a closed transport / EOF on the pipe rather than a typed exit error,
 // so we match those shapes to distinguish "the process died" from a genuine
-// malformed-handshake response.
+// malformed discovery response.
 func isTransportClosedErr(err error) bool {
 	if errors.Is(err, io.EOF) {
 		return true
@@ -171,14 +104,69 @@ func (c *Client) registerNotificationHandler() {
 		return
 	}
 
+	var subscriptionID atomic.Value
+	var subscribed atomic.Bool
 	c.client.OnNotification(func(notification mcp.JSONRPCNotification) {
 		switch notification.Method {
+		case string(mcp.MethodNotificationProgress):
+			token, _ := notification.Params.AdditionalFields["progressToken"].(string)
+			if notify, ok := c.progress.Load(token); ok {
+				notify.(func(mcp.JSONRPCNotification))(notification)
+			}
+		case mcp.MethodNotificationSubscriptionsAcknowledged:
+			id, _ := json.Marshal(notification.Params.Meta[mcp.MetaKeySubscriptionID])
+			expected, _ := subscriptionID.Load().(string)
+			if expected != "" && string(id) == expected {
+				var filter mcp.SubscriptionFilter
+				raw, err := json.Marshal(notification.Params.AdditionalFields["notifications"])
+				if err == nil && json.Unmarshal(raw, &filter) == nil {
+					subscribed.Store(filter.ToolsListChanged)
+				}
+			}
 		case string(mcp.MethodNotificationToolsListChanged):
-			c.handleToolsListChangedNotification()
+			id, _ := json.Marshal(notification.Params.Meta[mcp.MetaKeySubscriptionID])
+			expected, _ := subscriptionID.Load().(string)
+			if c.config.ExecutionHost() != "" || (subscribed.Load() && string(id) == expected) {
+				c.handleToolsListChangedNotification()
+			}
 		default:
-			// Ignore all other notifications (logging, resources, progress, ...).
+			// Ignore all other notifications (logging, resources, ...).
 		}
 	})
+
+	if c.subscriptionCancel != nil {
+		c.subscriptionCancel()
+	}
+	listenCtx, cancel := context.WithCancel(c.Gate().Context())
+	c.subscriptionCancel = cancel
+	cl := c.client
+	if c.config.ExecutionHost() == "" && c.serverInfo != nil && c.serverInfo.Capabilities.Tools != nil && c.serverInfo.Capabilities.Tools.ListChanged {
+		go func() {
+			for delay := time.Second; listenCtx.Err() == nil; {
+				ctx := mcprelay.WithSubscription(listenCtx, func(id mcp.RequestId) {
+					raw, _ := json.Marshal(id)
+					subscriptionID.Store(string(raw))
+					subscribed.Store(false)
+				})
+				err := cl.Listen(ctx, mcp.SubscriptionFilter{ToolsListChanged: true})
+				subscribed.Store(false)
+				if listenCtx.Err() != nil {
+					return
+				}
+				c.logger.Debug("Tool subscription ended", zap.Error(err))
+				timer := time.NewTimer(delay)
+				select {
+				case <-listenCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				if delay < 30*time.Second {
+					delay *= 2
+				}
+			}
+		}()
+	}
 
 	// Log capability status after registration
 	if c.serverInfo != nil && c.serverInfo.Capabilities.Tools != nil && c.serverInfo.Capabilities.Tools.ListChanged {
@@ -227,6 +215,10 @@ func (c *Client) Disconnect() error {
 func (c *Client) DisconnectWithContext(_ context.Context) error {
 	// Step 1: Read state under lock, then release for I/O operations
 	c.mu.Lock()
+	if c.subscriptionCancel != nil {
+		c.subscriptionCancel()
+		c.subscriptionCancel = nil
+	}
 	wasConnected := c.connected
 	mcpClient := c.client
 	pgid := c.processGroupID

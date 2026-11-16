@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/profile"
 )
@@ -277,57 +275,11 @@ func (n *profileChangeNotifier) deliver(batch *pendingProfileDelta) {
 			n.publish(e.name, e.change)
 		}
 	}
-	n.p.notifyProfileDelta(batch.cfg, batch.delta)
+	n.p.notifyProfileDelta(batch.delta)
 }
 
-func (p *MCPProxyServer) notifyProfileDelta(cfg *config.Config, d profileDelta) {
-	if p.sessionStore == nil || (len(d.notify) == 0) {
-		return
-	}
-	pins := map[string]string{}
-	pinsKnown := false
-	if p.storage != nil {
-		if tokens, err := p.storage.ListClientCredentials(); err == nil {
-			pinsKnown = true
-			for i := range tokens {
-				pins[tokens[i].Name] = tokens[i].ProfilePin
-			}
-		} else if p.logger != nil {
-			p.logger.Warn("cannot read token pins for a profile change notification; notifying every token session", zap.Error(err))
-		}
-	}
-
-	for _, target := range p.sessionStore.SessionsMatching(func(info *SessionInfo) bool {
-		if info.Profile != "" && d.notify[info.Profile] {
-			return true
-		}
-		switch {
-		case info.TokenName != "":
-			if !pinsKnown {
-				return true // fail toward notifying
-			}
-			pin := pins[info.TokenName]
-			return pin != "" && d.notify[pin]
-		}
-		return false
-	}) {
-		p.sendToolsListChanged(target)
-	}
-}
-
-// ProfileTokensMoved implements runtime.ProfileSessionHook: the sessions of a
-// token whose pin a delete-with-reassign moved get the treatment (their
-// stored selection is cleared and each is re-listed).
-func (p *MCPProxyServer) ProfileTokensMoved(tokenNames []string) {
-	for _, name := range tokenNames {
-		p.NotifyBindingChanged(name)
-	}
-}
-
-// ProfileDeleted implements runtime.ProfileSessionHook: a selection of a
-// deleted profile is cleared (the session falls back to its base).
-func (p *MCPProxyServer) ProfileDeleted(name string) {
-	if p.sessionStore != nil {
-		p.sessionStore.ClearSelection(name)
+func (p *MCPProxyServer) notifyProfileDelta(d profileDelta) {
+	if len(d.notify) > 0 {
+		p.NotifyBindingChanged("")
 	}
 }

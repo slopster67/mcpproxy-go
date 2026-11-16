@@ -30,15 +30,6 @@ type UsedBy struct {
 	Clients []UsedByClient `json:"clients"`
 }
 
-// tokenNames lists the token-store names of every referencing credential.
-func (u UsedBy) tokenNames() []string {
-	out := make([]string, 0, len(u.Clients))
-	for _, c := range u.Clients {
-		out = append(out, "client-"+c.ID)
-	}
-	return out
-}
-
 func (u UsedBy) Empty() bool { return len(u.Clients) == 0 }
 
 // ProfileView is one profile as REST returns it: the config fields as stored,
@@ -78,8 +69,6 @@ type RenameResult struct {
 type DeleteResult struct {
 	Deleted string    `json:"deleted"`
 	Moved   MovedRefs `json:"moved"`
-
-	movedTokenNames []string
 }
 
 // WriteResult is the outcome of a create or update: the stored profile and the

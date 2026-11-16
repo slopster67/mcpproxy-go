@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,10 +16,18 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+	"github.com/mark3labs/mcp-go/v2/client"
+	"github.com/mark3labs/mcp-go/v2/client/transport"
+	"github.com/mark3labs/mcp-go/v2/mcp"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/hash"
 	"github.com/slopster67/mcpproxy-go/internal/logs"
+	"github.com/slopster67/mcpproxy-go/internal/mcprelay"
 	"github.com/slopster67/mcpproxy-go/internal/oauth"
 	"github.com/slopster67/mcpproxy-go/internal/peering"
 	"github.com/slopster67/mcpproxy-go/internal/reqcontext"
@@ -27,23 +37,22 @@ import (
 	proxytransport "github.com/slopster67/mcpproxy-go/internal/transport"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/dialgate"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/launcher"
-
-	"github.com/mark3labs/mcp-go/v2/client"
-	"github.com/mark3labs/mcp-go/v2/client/transport"
-	"github.com/mark3labs/mcp-go/v2/mcp"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 // Client implements basic MCP client functionality without state management
 type Client struct {
-	peerExecutor    peering.Executor
-	peerGeneration  int64
-	suppressBrowser bool
-	config          *config.ServerConfig
-	globalConfig    *config.Config
-	storage         storage.OAuthStore
-	logger          *zap.Logger
+	challengeScopes    atomic.Value
+	challengeMetadata  atomic.Value
+	progress           sync.Map
+	subscriptionCancel context.CancelFunc
+	requireOAuth       atomic.Bool
+	peerExecutor       peering.Executor
+	peerGeneration     int64
+	suppressBrowser    bool
+	config             *config.ServerConfig
+	globalConfig       *config.Config
+	storage            storage.OAuthStore
+	logger             *zap.Logger
 
 	// Upstream server specific logger for debugging
 	upstreamLogger *zap.Logger
@@ -75,11 +84,6 @@ type Client struct {
 	oauthInProgress    bool
 	oauthCompleted     bool
 	lastOAuthTimestamp time.Time
-
-	// SSE request serialization (prevent concurrent requests on SSE transport)
-	// SSE transport has limitations with concurrent requests - responses can get lost
-	// when multiple requests are in-flight simultaneously
-	sseRequestMu sync.Mutex
 
 	// retryAfter collects the `Retry-After` hints this upstream's HTTP/SSE
 	// responses carry. mcp-go flattens a 429 into an error string long before
@@ -215,27 +219,15 @@ func (c *Client) IsConnected() bool {
 	return c.connected
 }
 
-// Ping issues the MCP-standard lightweight liveness check (`ping`) to the
-// upstream server. It is used by the managed client's health loop as a cheap
-// replacement for re-listing every tool just to confirm the connection is
-// alive. Returns an error if the client is not connected or
-// the request fails so the caller can classify and drive reconnection.
-func (c *Client) Ping(ctx context.Context) error {
+func (c *Client) Probe(ctx context.Context) error {
 	c.mu.RLock()
-	client := c.client
+	cl := c.client
 	c.mu.RUnlock()
-
-	if !c.IsConnected() || client == nil {
+	if cl == nil || !c.IsConnected() {
 		return fmt.Errorf("client not connected")
 	}
-
-	// mcp-go deprecates Ping because protocol 2026-07-28 removed the RPC; there
-	// it returns success without sending anything. It is a real probe here
-	// because the upstream handshake is pinned to the earlier era
-	// (connection_lifecycle.go). Lifting that pin requires an era-aware
-	// replacement, or the health loop reports a dead upstream as healthy.
-	//nolint:staticcheck // SA1019: valid on the protocol era this client is pinned to; see above.
-	return client.Ping(ctx)
+	_, err := cl.Discover(ctx, mcp.DiscoverRequest{})
+	return err
 }
 
 // ListTools retrieves available tools from the upstream server
@@ -243,7 +235,6 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 	c.mu.RLock()
 	client := c.client
 	serverInfo := c.serverInfo
-	transportType := c.transportType
 	c.mu.RUnlock()
 
 	if !c.IsConnected() || client == nil {
@@ -259,17 +250,6 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 	if serverInfo.Capabilities.Tools == nil {
 		c.logger.Debug("Server does not support tools")
 		return nil, nil
-	}
-
-	// SSE sends requests via HTTP POST but receives responses on a persistent
-	// stream; concurrent requests can lose responses, so they are serialized.
-	if transportType == "sse" {
-		c.logger.Debug("SSE transport detected - serializing ListTools request",
-			zap.String("server", c.config.Name))
-		c.sseRequestMu.Lock()
-		defer c.sseRequestMu.Unlock()
-		c.logger.Debug("SSE request lock acquired",
-			zap.String("server", c.config.Name))
 	}
 
 	// Always make direct call to upstream server (no caching)
@@ -308,7 +288,12 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 		// contain colons ("ns:erase") or even begin with this server's own
 		// prefix, and every producer downstream (approval records, index
 		// docIDs) keys on it via config.RawToolName.
+		definition, err := json.Marshal(tool)
+		if err != nil {
+			return nil, fmt.Errorf("encode tool %q: %w", tool.Name, err)
+		}
 		toolMeta := &config.ToolMetadata{
+			Definition:       definition,
 			ServerName:       c.config.Name,
 			Name:             tool.Name,
 			RawName:          tool.Name,
@@ -336,9 +321,8 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 
 		toolMeta.Annotations = toolAnnotationsFromWire(tool.Annotations)
 
-		// Compute hash for tool change detection.
-		// Hash is based on serverName + toolName + description + inputSchema + outputSchema.
-		toolMeta.Hash = hash.ComputeToolHashWithOutputSchema(c.config.Name, tool.Name, tool.Description, tool.InputSchema, outputSchemaJSON)
+		sum := sha256.Sum256([]byte(c.config.Name + "\x00" + hash.NormalizeJSON(string(definition))))
+		toolMeta.Hash = hex.EncodeToString(sum[:])
 
 		tools = append(tools, toolMeta)
 	}
@@ -383,23 +367,10 @@ func (e *callTimeoutError) Temporary() bool { return true }
 func (c *Client) CallTool(ctx context.Context, toolName string, args map[string]interface{}) (*mcp.CallToolResult, error) {
 	c.mu.RLock()
 	client := c.client
-	transportType := c.transportType
 	c.mu.RUnlock()
 
 	if !c.IsConnected() || client == nil {
 		return nil, fmt.Errorf("client not connected")
-	}
-
-	// SSE transport requires request serialization to prevent concurrent request issues
-	if transportType == "sse" {
-		c.logger.Debug("SSE transport detected - serializing CallTool request",
-			zap.String("server", c.config.Name),
-			zap.String("tool", toolName))
-		c.sseRequestMu.Lock()
-		defer c.sseRequestMu.Unlock()
-		c.logger.Debug("SSE request lock acquired for CallTool",
-			zap.String("server", c.config.Name),
-			zap.String("tool", toolName))
 	}
 
 	request := mcp.CallToolRequest{}
@@ -408,6 +379,26 @@ func (c *Client) CallTool(ctx context.Context, toolName string, args map[string]
 		args = map[string]interface{}{}
 	}
 	request.Params.Arguments = args
+	if relay := mcprelay.FromContext(ctx); relay != nil {
+		if relay.Meta != nil {
+			meta := *relay.Meta
+			meta.AdditionalFields = make(map[string]any, len(relay.Meta.AdditionalFields))
+			for key, value := range relay.Meta.AdditionalFields {
+				if !strings.HasPrefix(key, "ke.oa.mcpproxy/") {
+					meta.AdditionalFields[key] = value
+				}
+			}
+			request.Params.Meta = &meta
+		}
+		if relay.Meta != nil && relay.Meta.ProgressToken != nil {
+			meta := *request.Params.Meta
+			token := uuid.NewString()
+			meta.ProgressToken = token
+			request.Params.Meta = &meta
+			c.progress.Store(token, relay.Notify)
+			defer c.progress.Delete(token)
+		}
+	}
 
 	// Log to server-specific log
 	if c.upstreamLogger != nil {
@@ -434,10 +425,6 @@ func (c *Client) CallTool(ctx context.Context, toolName string, args map[string]
 		timeout = 2 * time.Minute // Default fallback
 	}
 
-	if remaining, ok := ctx.Value(peerCallTimeoutKey{}).(time.Duration); ok && remaining > 0 {
-		timeout = remaining
-	}
-
 	// If the provided context doesn't have a timeout, add one
 	callCtx := ctx
 	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > timeout {
@@ -451,7 +438,12 @@ func (c *Client) CallTool(ctx context.Context, toolName string, args map[string]
 		zap.String("server", c.config.Name),
 		zap.String("tool", toolName))
 
+	challenge := &proxytransport.AuthChallenge{}
+	callCtx = proxytransport.WithAuthChallenge(callCtx, challenge)
 	result, err := client.CallTool(callCtx, request)
+	if pending := c.authChallenge(err, challenge); pending != nil {
+		return nil, pending
+	}
 	if err != nil {
 		// Log CallTool failure to server-specific log
 		if c.upstreamLogger != nil {
@@ -498,6 +490,16 @@ func (c *Client) CallTool(ctx context.Context, toolName string, args map[string]
 	}
 
 	return result, nil
+}
+
+func (c *Client) authChallenge(err error, challenge *proxytransport.AuthChallenge) *ErrOAuthPending {
+	if err == nil || c.config.OAuthMode() == config.OAuthModeOff || !(hasHTTPAuthChallenge(err) || challenge.Status == http.StatusUnauthorized || (challenge.Status == http.StatusForbidden && oauth.ChallengeParameter(challenge.Header.Get("WWW-Authenticate"), "error") == "insufficient_scope")) {
+		return nil
+	}
+	c.requireOAuth.Store(true)
+	c.challengeScopes.Store(oauth.ChallengeParameter(challenge.Header.Get("WWW-Authenticate"), "scope"))
+	c.challengeMetadata.Store(oauth.ExtractResourceMetadataURL(challenge.Header.Get("WWW-Authenticate")))
+	return &ErrOAuthPending{ServerName: c.config.Name, ServerURL: c.logSafeURL(), Message: "this operation requires OAuth authorization; sign in from the server page"}
 }
 
 // httpTransportConfig builds the transport config for this client's HTTP/SSE

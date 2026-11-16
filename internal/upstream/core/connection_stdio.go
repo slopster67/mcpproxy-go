@@ -8,10 +8,12 @@ import (
 
 	"github.com/mark3labs/mcp-go/v2/client"
 	uptransport "github.com/mark3labs/mcp-go/v2/client/transport"
+	"go.uber.org/zap"
+
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/diagnostics"
+	"github.com/slopster67/mcpproxy-go/internal/mcprelay"
 	"github.com/slopster67/mcpproxy-go/internal/upstream/dialgate"
-	"go.uber.org/zap"
 )
 
 // packageRunnerNoArgs lists commands that behave as "runner for a package
@@ -79,7 +81,7 @@ func (c *Client) connectStdio(ctx context.Context) error {
 
 	// The mcp-go transport is wrapped by the instance's gate, so a retired instance sends no request or
 	// notification on the child's stdin.
-	c.client = client.NewClient(dialgate.WrapTransport(c.Gate(), stdioTransport))
+	c.client = client.NewClient(dialgate.WrapTransport(c.Gate(), stdioTransport), client.WithElicitationHandler(mcprelay.Handler{}), client.WithSamplingHandler(mcprelay.Handler{}), client.WithRootsHandler(mcprelay.Handler{}))
 
 	// Log final stdio configuration for debugging
 	c.logger.Debug("Initialized stdio transport",
