@@ -42,11 +42,15 @@ export interface QuarantineStats {
   blocked_count: number
 }
 
+export type ServerConnectionLifetime = "always" | "shared" | "per_session";
+
 export interface Server {
+  connection_lifetime?: ServerConnectionLifetime;
  host_id?: string
  host_name?: string
  host_online?: boolean
  available_to_peers?: boolean
+  expose_tools_directly?: boolean
   icon_url?: string;
   icon_uploaded?: boolean;
   /** Optional note (up to 100 characters) shown to agents beside the server name. */
@@ -77,6 +81,7 @@ export interface Server {
   enabled: boolean
 
   trust_mode?: string
+  status?: string
   connected: boolean
   connecting: boolean
   authenticated?: boolean

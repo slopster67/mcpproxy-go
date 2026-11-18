@@ -241,7 +241,7 @@ when an `upstreams` row is written anywhere but the storage package and
 
 **Background Services**:
 - **Connection Management**: Periodic reconnection attempts with exponential backoff
-- **Tool Indexing**: Automatic discovery and search index updates every 15 minutes
+- **Tool Indexing**: Automatic discovery after 30 minutes without a tool query, with search index updates when tools change
 - **Configuration Sync**: File-based config changes trigger runtime resync
 
 **Shutdown**:

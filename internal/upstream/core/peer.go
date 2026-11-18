@@ -18,7 +18,7 @@ func (c *Client) SetPeerExecutor(executor peering.Executor) {
 	c.mu.Unlock()
 }
 func (c *Client) connectPeer(ctx context.Context) error {
-	t := peering.NewTransport(c.peerExecutor, c.config, c.CredentialBinding(), c.peerGeneration)
+	t := peering.NewTransport(c.peerExecutor, c.config, c.CredentialBinding(), c.peerGeneration, c.peerSession, c.implementation())
 	c.client = client.NewClient(t)
 	if err := c.client.Start(ctx); err != nil {
 		return err

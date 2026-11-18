@@ -139,6 +139,7 @@ func NewServer(cfg *config.Config, logger *zap.Logger) (*Server, error) {
 	// observer (see warmProfileIndex).
 	server.installProfilePublishObserver(mcpProxy)
 	server.warmProfileIndex()
+	go mcpProxy.runUpstreamLifetime(rt.AppContext())
 
 	server.runtime.StartBackgroundInitialization()
 
@@ -213,7 +214,7 @@ func (s *Server) mcpAuthMiddleware(next http.Handler) http.Handler {
 		caller := record.AuthContext()
 		caller.CredentialKind = kind
 		caller.ServerAvailable = func(name string) bool { return s.mcpProxy.hostAllows(caller, name) }
-		next.ServeHTTP(w, r.WithContext(auth.WithAuthContext(r.Context(), caller)))
+		s.mcpProxy.trackUpstreamRequest(auth.WithAuthContext(r.Context(), caller), next, w, r, record)
 	})
 }
 
@@ -274,8 +275,8 @@ func (s *Server) listenForRoutingModeRefresh() {
 			}
 			s.warmProfileIndex()
 			if s.mcpProxy != nil {
+				s.mcpProxy.signalUpstreamLifetime()
 				s.mcpProxy.RefreshDirectModeTools()
-				s.mcpProxy.RefreshCodeExecModeTools()
 				// retrieve_tools' description names the reachable servers;
 				// re-list clients when that set changes.
 				s.mcpProxy.NotifyUpstreamInventoryChanged()
@@ -496,6 +497,13 @@ func (s *Server) AddServer(ctx context.Context, serverConfig *config.ServerConfi
 // non-zero/non-nil fields of updates, plus Enabled (resolved against the
 // existing server by the REST handler). It is the field logic UpdateServer and PatchServer share.
 func applyServerUpdates(existing, updates *config.ServerConfig) {
+	if updates.ConnectionLifetime != "" {
+		existing.ConnectionLifetime = updates.ConnectionLifetime
+	}
+	if updates.ExposeToolsDirectly != nil {
+		expose := *updates.ExposeToolsDirectly
+		existing.ExposeToolsDirectly = &expose
+	}
 	if updates.HostID != nil {
 		host := *updates.HostID
 		existing.HostID = &host
@@ -1191,67 +1199,7 @@ func (s *Server) GetConfig() (*config.Config, error) {
 
 // GetServerTools returns cached tool definitions, including input/output schemas.
 func (s *Server) GetServerTools(serverName string) ([]map[string]interface{}, error) {
-	s.logger.Debug("GetServerTools called (Phase 7.1: using StateView)", zap.String("server", serverName))
-
-	// Phase 7.1: Use StateView for lock-free cached tool reads
-	supervisor := s.runtime.Supervisor()
-	if supervisor == nil {
-		return nil, fmt.Errorf("supervisor not available")
-	}
-
-	snapshot := supervisor.StateView().Snapshot()
-	serverStatus, exists := snapshot.Servers[serverName]
-	if !exists {
-		return nil, fmt.Errorf("server not found: %s", serverName)
-	}
-
-	if !serverStatus.Connected {
-		return nil, fmt.Errorf("server %s is not connected", serverName)
-	}
-
-	// Convert cached tools to API response format
-	result := make([]map[string]interface{}, len(serverStatus.Tools))
-	for i, tool := range serverStatus.Tools {
-		toolMap := map[string]interface{}{
-			"name":        tool.Name,
-			"description": tool.Description,
-			"inputSchema": tool.InputSchema,
-			"server_name": serverName,
-		}
-		if len(tool.OutputSchemaJSON) > 0 {
-			toolMap["outputSchema"] = string(tool.OutputSchemaJSON)
-		}
-
-		// Include annotations if present
-		if tool.Annotations != nil {
-			annotations := map[string]interface{}{}
-			if tool.Annotations.Title != "" {
-				annotations["title"] = tool.Annotations.Title
-			}
-			if tool.Annotations.ReadOnlyHint != nil {
-				annotations["readOnlyHint"] = *tool.Annotations.ReadOnlyHint
-			}
-			if tool.Annotations.DestructiveHint != nil {
-				annotations["destructiveHint"] = *tool.Annotations.DestructiveHint
-			}
-			if tool.Annotations.IdempotentHint != nil {
-				annotations["idempotentHint"] = *tool.Annotations.IdempotentHint
-			}
-			if tool.Annotations.OpenWorldHint != nil {
-				annotations["openWorldHint"] = *tool.Annotations.OpenWorldHint
-			}
-			if len(annotations) > 0 {
-				toolMap["annotations"] = annotations
-			}
-		}
-
-		result[i] = toolMap
-	}
-
-	s.logger.Debug("Retrieved server tools from cache",
-		zap.String("server", serverName),
-		zap.Int("count", len(result)))
-	return result, nil
+	return s.runtime.GetServerTools(serverName)
 }
 
 // SearchTools searches for tools using the index

@@ -117,13 +117,13 @@ func (p *MCPProxyServer) resolveDescribeDefinition(
 	ctx context.Context,
 	surface describeSurface,
 	id string,
-) (*config.ToolMetadata, toolEntryOpts, string, map[string]interface{}) {
+) (*config.ToolMetadata, string, map[string]interface{}) {
 	if meta := p.managementToolDefinition(ctx, id, surface == describeSurfaceDirect); meta != nil {
 		display := ""
 		if surface == describeSurfaceDirect {
 			display = FormatDirectToolName(config.ManagementServerName, meta.RawName)
 		}
-		return meta, toolEntryOpts{annotationsOverride: meta.Annotations}, display, nil
+		return meta, display, nil
 	}
 	if surface == describeSurfaceDirect {
 		entry, ok := p.resolveDirectDescribeID(ctx, id)
@@ -134,18 +134,14 @@ func (p *MCPProxyServer) resolveDescribeDefinition(
 			if corrected, ok := p.suggestDirectToolID(ctx, id); ok {
 				remediation = fmt.Sprintf("Tool not found. Tool ids are case-sensitive — did you mean '%s'?", corrected)
 			}
-			return nil, toolEntryOpts{}, "", describeToolIDError(id, describeErrNotFound, remediation)
+			return nil, "", describeToolIDError(id, describeErrNotFound, remediation)
 		}
-		// The catalog entry carries the UPSTREAM annotations. Letting the
-		// builder fall back to its StateView lookup would silently downgrade a
-		// listed-but-pending destructive tool to call_with "read", because the
-		// StateView does not carry it.
-		return entry.toolMetadata(), toolEntryOpts{annotationsOverride: entry.Annotations}, entry.DisplayName, nil
+		return entry.ToolMetadata, entry.DisplayName, nil
 	}
 
 	serverName, toolName, ok := splitServerTool(id)
 	if !ok {
-		return nil, toolEntryOpts{}, "", describeToolIDError(id, describeErrNotFound, describeMalformedIDRemediation)
+		return nil, "", describeToolIDError(id, describeErrNotFound, describeMalformedIDRemediation)
 	}
 
 	visible, reason := p.toolVisibleToSession(ctx, serverName, toolName)
@@ -166,15 +162,15 @@ func (p *MCPProxyServer) resolveDescribeDefinition(
 				remediation = fmt.Sprintf("Tool not found. Tool ids are case-sensitive — did you mean '%s'?", canonical)
 			}
 		}
-		return nil, toolEntryOpts{}, "", describeToolIDError(id, code, remediation)
+		return nil, "", describeToolIDError(id, code, remediation)
 	}
 
-	meta := p.lookupIndexedTool(serverName, toolName)
+	meta := p.mainServer.runtime.CatalogTool(serverName, toolName)
 	if meta == nil {
 		// Disappeared between the visibility check and the lookup.
-		return nil, toolEntryOpts{}, "", describeToolIDError(id, describeErrNotFound, describeNotFoundRemediation)
+		return nil, "", describeToolIDError(id, describeErrNotFound, describeNotFoundRemediation)
 	}
-	return meta, toolEntryOpts{}, "", nil
+	return meta, "", nil
 }
 
 // applyDirectSurfaceIdentity rewrites a definition so every identifier in it is
@@ -347,7 +343,7 @@ func (p *MCPProxyServer) handleDescribeToolOnSurface(ctx context.Context, reques
 	definitions := make([]map[string]interface{}, 0, len(ids))
 	idErrors := make([]map[string]interface{}, 0)
 	for _, id := range ids {
-		meta, opts, directDisplayName, idErr := p.resolveDescribeDefinition(ctx, surface, id)
+		meta, directDisplayName, idErr := p.resolveDescribeDefinition(ctx, surface, id)
 		if idErr != nil {
 			idErrors = append(idErrors, idErr)
 			continue
@@ -356,7 +352,7 @@ func (p *MCPProxyServer) handleDescribeToolOnSurface(ctx context.Context, reques
 		// The definition IS the full-mode entry (same builder, so the
 		// shared fields cannot drift) minus the ranked-only score — a lookup
 		// is not a ranked search.
-		entry := p.buildToolEntry(&config.SearchResult{Tool: meta}, config.ToolResponseModeFull, opts)
+		entry := p.buildToolEntry(&config.SearchResult{Tool: meta}, config.ToolResponseModeFull, false)
 		delete(entry, "score")
 
 		// `output_schema` is ADDITIVE and lands at the

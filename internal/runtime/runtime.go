@@ -986,11 +986,12 @@ func (r *Runtime) buildServer(serverStatus *stateview.ServerStatus, gens map[str
 
 	// Call-time OAuth requirement — set when an anonymously-connected
 	// server rejected a tools/call with "authorization required".
-	var callTimeOAuthRequired bool
+	var callTimeOAuthRequired, idle bool
 	if r.upstreamManager != nil {
 		if client, exists := r.upstreamManager.GetClient(serverStatus.Name); exists && client != nil {
 			srv.UserLoggedOut = client.IsUserLoggedOut()
 			callTimeOAuthRequired = client.IsOAuthCallRequired()
+			idle = client.Idle()
 		}
 	}
 
@@ -1049,6 +1050,14 @@ func (r *Runtime) buildServer(serverStatus *stateview.ServerStatus, gens map[str
 
 	srv.Quarantine = r.serverQuarantineStats(serverStatus.Name)
 	r.projectServerHost(&srv)
+	if idle && srv.Enabled && srv.HostOnline && srv.LastError == "" && !srv.UserLoggedOut {
+		srv.Connected = false
+		srv.Status = health.StatusIdle
+		if srv.Health.Status == health.StatusReady {
+			srv.Health.Status = health.StatusIdle
+			srv.Health.Summary = "Idle"
+		}
+	}
 	return srv
 }
 
@@ -1165,50 +1174,10 @@ func (v committedView) unreconciled(seen map[string]struct{}) []*stateview.Serve
 }
 
 func (r *Runtime) GetServerTools(serverName string) ([]map[string]interface{}, error) {
-	r.logger.Debug("Runtime.GetServerTools called", zap.String("server", serverName))
-
-	// Use Supervisor's StateView for lock-free, instant reads
-	if r.supervisor == nil {
-		return nil, fmt.Errorf("supervisor not available")
-	}
-
-	stateView := r.supervisor.StateView()
-	if stateView == nil {
-		return nil, fmt.Errorf("StateView not available")
-	}
-
-	// Read the committed snapshot before the view. A server it does not configure was removed (and not yet re-added):
-	// the view may still hold its tools, but they have no incarnation a
-	// decision could bind to, so the read answers not found rather than
-	// serving them unbound.
 	if r.committedSnapshot().absent(serverName) {
 		return nil, fmt.Errorf("server not found: %s", serverName)
 	}
-
-	// Get snapshot - this is lock-free and instant
-	snapshot := stateView.Snapshot()
-	serverStatus, exists := snapshot.Servers[serverName]
-	if !exists {
-		return nil, fmt.Errorf("server not found: %s", serverName)
-	}
-
-	// The REST listings stamp these
-	// tools with the server's COMMITTED incarnation, read before this call.
-	// The StateView lags the commit, and a remove + same-name re-add leaves
-	// it holding the removed server's definitions until reconcile catches up.
-	// Its tools are served only when the view was reconciled from the
-	// committed incarnation; otherwise they belong to a removed server, and the listing falls through to the index below, which the
-	// removal commit purged and which holds only the replacement's tools.
-	viewTools := serverStatus.Tools
-	if committedInc, ok := r.ServerIncarnation(serverName); ok && serverStatus.Incarnation != committedInc {
-		r.logger.Debug("GetServerTools: StateView lags the committed incarnation; not serving its tools",
-			zap.String("server", serverName),
-			zap.Int64("view_incarnation", serverStatus.Incarnation),
-			zap.Int64("committed_incarnation", committedInc))
-		viewTools = nil
-	}
-
-	// Convert []stateview.ToolInfo to []map[string]interface{}
+	viewTools := r.ServerToolCatalog(serverName)
 	tools := make([]map[string]interface{}, 0, len(viewTools))
 	for _, tool := range viewTools {
 		toolMap := map[string]interface{}{
@@ -1216,8 +1185,9 @@ func (r *Runtime) GetServerTools(serverName string) ([]map[string]interface{}, e
 			"description": tool.Description,
 			"server_name": serverName,
 		}
-		if tool.InputSchema != nil {
-			toolMap["inputSchema"] = tool.InputSchema
+		var schema map[string]any
+		if json.Unmarshal([]byte(tool.ParamsJSON), &schema) == nil && schema != nil {
+			toolMap["inputSchema"] = schema
 		}
 		if len(tool.OutputSchemaJSON) > 0 {
 			toolMap["outputSchema"] = string(tool.OutputSchemaJSON)
@@ -1226,42 +1196,6 @@ func (r *Runtime) GetServerTools(serverName string) ([]map[string]interface{}, e
 			toolMap["annotations"] = tool.Annotations
 		}
 		tools = append(tools, toolMap)
-	}
-
-	if len(tools) == 0 && r.indexManager != nil {
-		if indexed, err := r.indexManager.GetToolsByServer(serverName); err == nil && len(indexed) > 0 {
-			tools = make([]map[string]interface{}, 0, len(indexed))
-			for _, tool := range indexed {
-				// Index stores the full tool name; normalize to the bare tool name
-				// (no "server:" prefix) to match the StateView/approval-record
-				// convention used by the enrichment layer.
-				name := tool.Name
-				if idx := strings.Index(name, ":"); idx != -1 {
-					name = name[idx+1:]
-				}
-				toolMap := map[string]interface{}{
-					"name":        name,
-					"description": tool.Description,
-					"server_name": serverName,
-				}
-				if tool.ParamsJSON != "" {
-					var inputSchema map[string]interface{}
-					if err := json.Unmarshal([]byte(tool.ParamsJSON), &inputSchema); err == nil {
-						toolMap["inputSchema"] = inputSchema
-					}
-				}
-				if tool.OutputSchemaJSON != "" {
-					toolMap["outputSchema"] = tool.OutputSchemaJSON
-				}
-				if tool.Annotations != nil {
-					toolMap["annotations"] = tool.Annotations
-				}
-				tools = append(tools, toolMap)
-			}
-			r.logger.Debug("GetServerTools: StateView empty, served tools from search index fallback",
-				zap.String("server", serverName),
-				zap.Int("tool_count", len(tools)))
-		}
 	}
 
 	return tools, nil

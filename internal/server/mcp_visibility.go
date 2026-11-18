@@ -158,7 +158,7 @@ func (p *MCPProxyServer) usageStatEligible(authCtx *auth.AuthContext, profileSco
 	if !p.serverInScope(authCtx, profileScope, serverName) {
 		return false
 	}
-	if p.lookupIndexedTool(serverName, toolName) == nil {
+	if !p.toolIndexed(serverName, toolName) {
 		return false
 	}
 	if !p.isExactToolCallable(serverName, toolName) {
@@ -181,28 +181,17 @@ func (p *MCPProxyServer) usageStatEligible(authCtx *auth.AuthContext, profileSco
 // (describe_tool visibility step 1 — ids resolve against the same corpus
 // search ranks over).
 func (p *MCPProxyServer) toolIndexed(serverName, toolName string) bool {
-	return p.lookupIndexedTool(serverName, toolName) != nil
-}
-
-// lookupIndexedTool resolves a (server, RAW tool) pair to its indexed metadata
-// — the same corpus retrieve_tools ranks over, so describe_tool definitions
-// and search entries render from identical inputs. nil when absent. The
-// indexed Name is the canonical "<server>:<raw>" id and is matched exactly
-// : a bare-name alternate could only match when a raw name
-// equals a sibling's canonical id (raw "a:erase" on server "a" → the "erase"
-// doc), rendering one tool's schema under another's id.
-func (p *MCPProxyServer) lookupIndexedTool(serverName, toolName string) *config.ToolMetadata {
 	tools, err := p.index.GetToolsByServer(serverName)
 	if err != nil {
-		return nil
+		return false
 	}
 	full := serverName + ":" + toolName
 	for _, tool := range tools {
 		if tool.Name == full {
-			return tool
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 // splitServerTool splits a "<server>:<tool>" id. Whitespace is never

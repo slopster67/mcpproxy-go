@@ -47,6 +47,14 @@
         <FieldLabel :for="ids.trust">Trust all tools</FieldLabel>
         <Switch :id="ids.trust" :model-value="trustMode === 'auto'" :disabled="submitting" @update:model-value="trustMode = $event ? 'auto' : 'manual'" />
       </Field>
+      <Field orientation="horizontal" :data-disabled="submitting">
+        <FieldLabel :for="ids.direct">Expose tools directly</FieldLabel>
+        <Switch :id="ids.direct" v-model="exposeToolsDirectly" :disabled="submitting" />
+      </Field>
+      <Field :data-disabled="submitting">
+        <FieldLabel>Keep running</FieldLabel>
+        <ServerLifetimeControls v-model="connectionLifetime" :disabled="submitting" />
+      </Field>
       <FieldError v-if="error" ref="errorEl" tabindex="-1" role="alert">{{ error }}</FieldError>
       <div class="flex justify-end gap-2">
         <Button type="button" variant="outline" :disabled="submitting" @click="emit('cancel')">Cancel</Button>
@@ -58,6 +66,8 @@
 
 <script setup lang="ts">
 import { usePeersStore } from "@/stores/peers";
+import ServerLifetimeControls from "@/components/ServerLifetimeControls.vue";
+import type { ServerConnectionLifetime } from "@/types";
 import HostSelect from "@/components/HostSelect.vue";
 import { Globe, SquareTerminal, Plus, X } from "@lucide/vue";
 import { Field, FieldGroup, FieldLabel, FieldSet, FieldLegend, FieldError } from "@/components/ui/field";
@@ -100,6 +110,7 @@ const ids = ref({
   type: `${uid}-type`,
   fields: `${uid}-fields`,
   trust: `${uid}-trust`,
+  direct: `${uid}-direct`,
 });
 const errorEl = ref<InstanceType<typeof FieldError> | null>(null);
 
@@ -107,6 +118,8 @@ const name = ref("");
 const description = ref("");
 const host = ref("");
 const shared = ref(false);
+const exposeToolsDirectly = ref(false);
+const connectionLifetime = ref<ServerConnectionLifetime>("always");
 const protocol = ref<"stdio" | "http">("stdio");
 const trustMode = ref<TrustMode>("manual");
 const url = ref("");
@@ -161,6 +174,8 @@ async function handleSubmit() {
       protocol: protocol.value,
       enabled: true,
       trust_mode: trustMode.value,
+      expose_tools_directly: exposeToolsDirectly.value,
+      connection_lifetime: connectionLifetime.value,
     };
     if (description.value.trim()) serverData.description = description.value.trim();
     if (protocol.value === "http") {

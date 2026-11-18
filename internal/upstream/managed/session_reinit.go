@@ -189,6 +189,7 @@ func (mc *Client) runReinit(ctx context.Context) error {
 	if err := mc.coreClient.ReinitializeSession(ctx); err != nil {
 		return err
 	}
+	mc.lastToolQuery.Store(time.Now().UnixNano())
 	tools, err := mc.coreClient.ListTools(ctx)
 	if err != nil {
 		return fmt.Errorf("tools/list after session re-initialize: %w", err)
@@ -276,6 +277,9 @@ func (mc *Client) probeLiveness(ctx context.Context) error {
 
 // listToolsUpstream is the upstream tools/list with session recovery.
 func (mc *Client) listToolsUpstream(ctx context.Context) (tools []*config.ToolMetadata, err error) {
+	if mc.GetConfig().OnDemand() {
+		return mc.listDemandTools(ctx)
+	}
 	err = mc.withSession(ctx, string(mcp.MethodToolsList), func() error {
 		var e error
 		tools, e = mc.coreClient.ListTools(ctx)

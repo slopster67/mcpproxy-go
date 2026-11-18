@@ -9,17 +9,6 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/diagnostics"
 )
 
-// ToolInfo represents a cached tool definition.
-type ToolInfo struct {
-	Name        string
-	Description string
-	InputSchema map[string]interface{}
-	Annotations *config.ToolAnnotations
-	// OutputSchemaJSON is the tool's declared output schema (raw JSON), empty
-	// when the tool declares none. Used for output-schema validation.
-	OutputSchemaJSON string
-}
-
 // ServerStatus represents the runtime status of an upstream server.
 type ServerStatus struct {
 	Name    string
@@ -34,7 +23,7 @@ type ServerStatus struct {
 	DisconnectedAt *time.Time
 	RetryCount     int
 	ToolCount      int
-	Tools          []ToolInfo // Cached tool list for lock-free reads
+	Tools          []*config.ToolMetadata // Immutable server catalog published by discovery
 	// ToolsDiscovered reports that a discovery pass has COMPLETED for this
 	// connection and Tools is its authoritative result — including an
 	// authoritative EMPTY result for an upstream that lists zero tools. It is
@@ -130,10 +119,6 @@ func (v *View) UpdateServer(name string, fn func(*ServerStatus)) {
 			t := *vs.DisconnectedAt
 			newStatus.DisconnectedAt = &t
 		}
-		if vs.Tools != nil {
-			newStatus.Tools = make([]ToolInfo, len(vs.Tools))
-			copy(newStatus.Tools, vs.Tools)
-		}
 		if vs.Metadata != nil {
 			newStatus.Metadata = make(map[string]interface{}, len(vs.Metadata))
 			for mk, mv := range vs.Metadata {
@@ -199,10 +184,6 @@ func (v *View) RemoveServer(name string) {
 		if vs.DisconnectedAt != nil {
 			t := *vs.DisconnectedAt
 			newStatus.DisconnectedAt = &t
-		}
-		if vs.Tools != nil {
-			newStatus.Tools = make([]ToolInfo, len(vs.Tools))
-			copy(newStatus.Tools, vs.Tools)
 		}
 		if vs.Metadata != nil {
 			newStatus.Metadata = make(map[string]interface{}, len(vs.Metadata))

@@ -148,18 +148,12 @@ type MCPProxyServer struct {
 	// surface, so a rebuild that would change nothing can be skipped instead of
 	// notifying every client. See mcp_surface_fingerprint.go.
 	//
-	// The direct pair is guarded by directRefreshMu, which every caller of
-	// refreshDirectModeToolsLocked already holds; the code-exec and call-tool
-	// surfaces have their own mutexes.
+	// All surface fingerprints are guarded by directRefreshMu.
 	directSurfaceToolsFP   string
 	directSurfaceRoutingFP string
 
-	codeExecRefreshMu sync.Mutex
 	codeExecSurfaceFP string
 
-	// The call-tool surface is rebuilt on every config.reloaded; the
-	// fingerprint keeps an unrelated edit from telling every client the tool
-	// set changed.
 	callToolSurfaceFP string
 
 	directCatalogGeneration atomic.Uint64
@@ -167,6 +161,8 @@ type MCPProxyServer struct {
 	// directRefreshMu serializes whole rebuilds so SetTools and the matching
 	// publishDirectCatalog cannot interleave with another rebuild's pair.
 	directRefreshMu sync.Mutex
+	lifetimeWake    chan struct{}
+	lifetimeMu      sync.Mutex
 }
 
 // NewMCPProxyServer creates a new MCP proxy server
@@ -298,18 +294,19 @@ func NewMCPProxyServer(
 			}
 		}
 
-		// Store/update session information with capabilities
-		sessionStore.SetSession(sessionID, clientName, clientVersion, hasRoots, hasSampling, experimental)
-
-		// Record which credential authenticated
-		// this session and which server instance serves it, so a binding
-		// change can find the session and notify it on the right instance.
-		// The credential never changes mid-connection, so this is once.
-		if ac := auth.AuthContextFromContext(ctx); ac != nil && ac.AgentName != "" {
-			sessionStore.SetSessionIdentity(sessionID, ac.AgentName, ac.ClientID)
-			sessionStore.SetSessionTokenPrefix(sessionID, ac.TokenPrefix)
+		credentialHash, _ := ctx.Value(lifetimeCredentialKey{}).(string)
+		info := &SessionInfo{
+			SessionID: sessionID, ClientName: clientName, ClientVersion: clientVersion,
+			hasRoots: hasRoots, hasSampling: hasSampling, experimental: experimental,
+			server: mcpserver.ServerFromContext(ctx), credentialHash: credentialHash,
 		}
-		sessionStore.SetSessionServer(sessionID, mcpserver.ServerFromContext(ctx))
+		if ac := auth.AuthContextFromContext(ctx); ac != nil && ac.AgentName != "" {
+			info.TokenName, info.ClientID, info.TokenPrefix = ac.AgentName, ac.ClientID, ac.TokenPrefix
+		}
+		sessionStore.SetSession(info)
+		if proxy := proxyRef.Load(); proxy != nil {
+			proxy.syncUpstreamLifetime(ctx)
+		}
 
 		logger.Info("MCP client initialized with capabilities",
 			zap.String("session_id", sessionID),
@@ -410,6 +407,7 @@ func NewMCPProxyServer(
 		jsPool:          jsPool,
 		sessionStore:    sessionStore,
 		hooks:           hooks,
+		lifetimeWake:    make(chan struct{}, 1),
 	}
 
 	// Let the hooks (registered before the proxy existed) reach it.
@@ -1066,12 +1064,18 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	// {id, score, sig, desc, lossy} from the shared signature cache. The
 	// ranked order of `results` is already final here — the mode selects
 	// serialization only.
-	entryOpts := toolEntryOpts{includeStats: includeStats}
 	// Must be non-nil so zero matches serialize as [] — strict MCP clients
 	// crash iterating a null tools array.
 	mcpTools := make([]map[string]interface{}, 0, len(results))
 	for _, result := range results {
-		mcpTools = append(mcpTools, p.buildToolEntry(result, responseMode, entryOpts))
+		tool := result.Tool
+		if tool.ServerName != config.ManagementServerName {
+			tool = p.mainServer.runtime.CatalogTool(tool.ServerName, config.RawToolName(tool))
+			if tool == nil {
+				continue
+			}
+		}
+		mcpTools = append(mcpTools, p.buildToolEntry(&config.SearchResult{Tool: tool, Score: result.Score}, responseMode, includeStats))
 	}
 
 	// Build mode-aware usage instructions
@@ -1557,7 +1561,7 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// uncompilable schemas dispatch unvalidated. The self-healing error embeds
 	// the FULL stored schema + hint regardless of tool_response_mode, and the
 	// upstream is never called on a validation failure.
-	if meta := p.lookupIndexedTool(serverName, actualToolName); meta != nil {
+	if meta := p.mainServer.runtime.CatalogTool(serverName, actualToolName); meta != nil {
 		if ok, verr, _ := p.inputValidator.validateArgs(toolName, meta.Hash, meta.ParamsJSON, args); !ok {
 			detail := oneLineValidationDetail(verr)
 			p.logger.Debug("handleCallToolVariant: pre-dispatch argument validation failed",
@@ -1969,7 +1973,7 @@ func (p *MCPProxyServer) createDetailedErrorResponse(err error, serverName, tool
 	// shapes below apply (a self-healing error without a schema would be an
 	// empty promise).
 	if detail, isInvalidParams := classifyUpstreamInvalidParams(err); isInvalidParams {
-		if meta := p.lookupIndexedTool(serverName, toolName); meta != nil && meta.ParamsJSON != "" {
+		if meta := p.mainServer.runtime.CatalogTool(serverName, toolName); meta != nil && meta.ParamsJSON != "" {
 			return invalidParamsErrorResult(serverName+":"+toolName, meta.ParamsJSON, detail)
 		}
 	}
@@ -2152,30 +2156,13 @@ func (p *MCPProxyServer) classifyServerToolStatus(serverName, toolName string) c
 	}
 }
 
-// serverToolNames returns the best-available list of a server's tool names:
-// the StateView snapshot when hydrated, otherwise a live ListTools.
 func (p *MCPProxyServer) serverToolNames(serverName string) []string {
-	if p.mainServer != nil && p.mainServer.runtime != nil {
-		if sup := p.mainServer.runtime.Supervisor(); sup != nil {
-			if ss, ok := sup.StateView().Snapshot().Servers[serverName]; ok && len(ss.Tools) > 0 {
-				names := make([]string, 0, len(ss.Tools))
-				for _, tl := range ss.Tools {
-					names = append(names, tl.Name)
-				}
-				return names
-			}
-		}
+	tools := p.mainServer.runtime.ServerToolCatalog(serverName)
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, config.RawToolName(tool))
 	}
-	if client, exists := p.upstreamManager.GetClient(serverName); exists {
-		if tools, err := client.ListTools(context.Background()); err == nil {
-			names := make([]string, 0, len(tools))
-			for _, tl := range tools {
-				names = append(names, tl.Name)
-			}
-			return names
-		}
-	}
-	return nil
+	return names
 }
 
 // isExactToolCallable is isToolCallable for a pair that is already split into
@@ -2435,6 +2422,7 @@ type toolIdentity struct {
 	DiscoveryEpoch int64
 	// Found reports whether the server's snapshot lists the raw name, verbatim.
 	Found bool
+	Hash  string
 	// Description and Annotations are the snapshot's metadata for the tool;
 	// zero when Found is false.
 	Description string
@@ -2534,6 +2522,7 @@ func (p *MCPProxyServer) resolveExactToolIdentityIn(servers map[string]*statevie
 	for i := range serverStatus.Tools {
 		if serverStatus.Tools[i].Name == toolName {
 			identity.Found = true
+			identity.Hash = serverStatus.Tools[i].Hash
 			identity.Description = serverStatus.Tools[i].Description
 			identity.Annotations = serverStatus.Tools[i].Annotations
 			return identity

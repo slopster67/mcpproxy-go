@@ -1,6 +1,7 @@
 import type { Server } from "@/types";
 import { needsOAuthSignIn, healthStatusText } from "@/utils/health";
 
+const OFFLINE_COLOR = "bg-gray-400";
 const FAILED_COLOR = "bg-[var(--server-status-red)]";
 
 interface ServerCardStatus {
@@ -12,10 +13,15 @@ interface ServerCardStatus {
 
 export function serverCardStatus(server: Server): ServerCardStatus {
   if (!server.enabled)
-    return { order: 3, color: "bg-white", label: "Disabled" };
-  if (server.host_id && server.host_online === false) return {order:3,color:'bg-white',label:`${server.host_name || 'Peer'} is offline`};
+    return { order: 3, color: OFFLINE_COLOR, label: "Disabled" };
+  if (server.host_id && server.host_online === false)
+    return { order: 3, color: OFFLINE_COLOR, label: `${server.host_name || "Peer"} is offline` };
   const health = server.health;
   const signInState = needsOAuthSignIn(server);
+  if (server.status === "idle" && !signInState && health?.level !== "unhealthy")
+    return { order: 2, color: "bg-white", label: "Idle" };
+  if (server.status === "disconnected" && !signInState && !server.last_error && !server.connecting)
+    return { order: 3, color: OFFLINE_COLOR, label: "Offline" };
   const failed =
     signInState ||
     !server.connected ||

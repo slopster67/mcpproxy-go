@@ -87,7 +87,10 @@ func (p *MCPProxyServer) recordSessionResolution(ctx context.Context, res Profil
 type noResolutionRecordKey struct{}
 
 func (p *MCPProxyServer) resolveProfileV3(ctx context.Context, idx *profileIndex) ProfileResolution {
+	return p.resolveSessionProfile(ctx, idx, sessionIDFromContext(ctx))
+}
 
+func (p *MCPProxyServer) resolveSessionProfile(ctx context.Context, idx *profileIndex, sid string) ProfileResolution {
 	if idx == nil {
 		// profileIndexCurrent deliberately returns nil for a scoped request
 		// during a publication gap instead of building an index on the request
@@ -134,19 +137,17 @@ func (p *MCPProxyServer) resolveProfileV3(ctx context.Context, idx *profileIndex
 
 	// Session selection (set_profile), re-validated against the CURRENT base
 	// on every request; a selection no longer permitted is cleared.
-	if p.sessionStore != nil {
-		if sid := sessionIDFromContext(ctx); sid != "" {
-			if sel := p.sessionStore.GetActiveProfile(sid); sel != "" {
-				if base == "" || admittedBySwitchableTo(basePolicy, base, sel) {
-					if scope := profileScopeFromIndex(idx, sel); scope != nil {
-						return ProfileResolution{
-							Name: sel, Source: string(profile.SourceSession),
-							Scope: scope, Policy: idx.PolicyFor(sel), Base: base,
-						}
+	if p.sessionStore != nil && sid != "" {
+		if sel := p.sessionStore.GetActiveProfile(sid); sel != "" {
+			if base == "" || admittedBySwitchableTo(basePolicy, base, sel) {
+				if scope := profileScopeFromIndex(idx, sel); scope != nil {
+					return ProfileResolution{
+						Name: sel, Source: string(profile.SourceSession),
+						Scope: scope, Policy: idx.PolicyFor(sel), Base: base,
 					}
 				}
-				p.sessionStore.SetActiveProfile(sid, "")
 			}
+			p.sessionStore.SetActiveProfile(sid, "")
 		}
 	}
 

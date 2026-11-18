@@ -46,7 +46,7 @@ func (c *Client) ReinitializeSession(ctx context.Context) error {
 
 	req := mcp.InitializeRequest{}
 	req.Params.ProtocolVersion = mcp.LATEST_LEGACY_PROTOCOL_VERSION
-	req.Params.ClientInfo = mcp.Implementation{Name: "mcpproxy-go", Version: "1.0.0"}
+	req.Params.ClientInfo = c.implementation()
 	req.Params.Capabilities = mcp.ClientCapabilities{}
 
 	res, err := cl.Initialize(ctx, req)

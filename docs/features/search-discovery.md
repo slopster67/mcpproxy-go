@@ -175,12 +175,11 @@ MCPProxy supports the MCP `notifications/tools/list_changed` notification protoc
 
 1. **Server Support**: Servers that advertise `capabilities.tools.listChanged: true` send notifications when their tools change
 2. **Automatic Re-indexing**: MCPProxy receives the notification and triggers `DiscoverAndIndexToolsForServer()` within seconds
-3. **No Polling Delay**: Tools are updated immediately instead of waiting for the 5-minute background refresh cycle
+3. **No Polling Delay**: Tools are updated immediately instead of waiting for periodic discovery
 
 ### Fallback Behavior
 
-For servers that don't support tool change notifications:
-- MCPProxy continues to poll every 5 minutes
+By default, MCPProxy queries each enabled, connected server after 30 minutes without tool discovery. A query on any connection, including a new per-session connection, resets that server’s deadline. An idle on-demand server briefly connects for discovery. Set `MCPPROXY_TOOL_DISCOVERY_INTERVAL` to change the interval, or to `0s` to disable periodic discovery.
 
 ### Logs
 

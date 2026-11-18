@@ -10,6 +10,7 @@ import (
 	"time"
 
 	sdktransport "github.com/mark3labs/mcp-go/v2/client/transport"
+	"github.com/mark3labs/mcp-go/v2/mcp"
 	"github.com/slopster67/mcpproxy-go/internal/commitview"
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/storage"
@@ -20,11 +21,12 @@ const MaxMessage = 16 << 20
 var ErrOffline = errors.New("peer is offline")
 
 type Frame struct {
-	ID     string          `json:"id,omitempty"`
-	Op     string          `json:"op"`
-	Server string          `json:"server,omitempty"`
-	Data   json.RawMessage `json:"data,omitempty"`
-	Error  string          `json:"error,omitempty"`
+	Session string          `json:"session,omitempty"`
+	ID      string          `json:"id,omitempty"`
+	Op      string          `json:"op"`
+	Server  string          `json:"server,omitempty"`
+	Data    json.RawMessage `json:"data,omitempty"`
+	Error   string          `json:"error,omitempty"`
 }
 
 type Executor interface {
@@ -62,11 +64,19 @@ type Hello struct {
 
 // RPC carries only headers already admitted by the primary's live forwarding policy.
 type RPC struct {
+	Session string                      `json:"session,omitempty"`
 	Timeout time.Duration               `json:"timeout"`
 	Request sdktransport.JSONRPCRequest `json:"request"`
 }
 
+type Notification struct {
+	Session      string                  `json:"session,omitempty"`
+	Notification mcp.JSONRPCNotification `json:"notification"`
+}
+
 type Connection struct {
+	Session    string                       `json:"session,omitempty"`
+	ClientInfo *mcp.Implementation          `json:"client_info,omitempty"`
 	Secrets    map[string]string            `json:"secrets"`
 	OAuth      storage.OAuthSnapshot        `json:"oauth"`
 	Generation int64                        `json:"generation"`

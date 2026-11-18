@@ -20,20 +20,25 @@ type Transport struct {
 	cfg        *config.ServerConfig
 	binding    commitview.CredentialBinding
 	generation int64
+	session    string
+	clientInfo mcp.Implementation
 	info       mcp.InitializeResult
 	mu         sync.Mutex
 	handler    func(mcp.JSONRPCNotification)
 	unlisten   func()
 }
 
-func NewTransport(executor Executor, cfg *config.ServerConfig, binding commitview.CredentialBinding, generation int64) *Transport {
-	return &Transport{executor: executor, cfg: config.CopyServerConfig(cfg), binding: binding, generation: generation}
+func NewTransport(executor Executor, cfg *config.ServerConfig, binding commitview.CredentialBinding, generation int64, session string, info mcp.Implementation) *Transport {
+	return &Transport{executor: executor, cfg: config.CopyServerConfig(cfg), binding: binding, generation: generation, session: session, clientInfo: info}
 }
 func (t *Transport) Start(ctx context.Context) error {
 	if t.executor == nil {
 		return ErrOffline
 	}
 	desired := Connection{Config: t.cfg, Binding: t.binding, Generation: t.generation}
+	if t.session != "" {
+		desired.Session, desired.ClientInfo = t.session, &t.clientInfo
+	}
 	if hub, ok := t.executor.(*Hub); ok && hub.PrepareConnection != nil {
 		if err := hub.PrepareConnection(ctx, t.cfg.ExecutionHost(), &desired); err != nil {
 			return err
@@ -44,6 +49,9 @@ func (t *Transport) Start(ctx context.Context) error {
 	}
 	if hub, ok := t.executor.(*Hub); ok {
 		t.unlisten = hub.Listen(t.cfg.ExecutionHost()+"/"+t.cfg.Name, func(f Frame) {
+			if f.Session != t.session {
+				return
+			}
 			var notification mcp.JSONRPCNotification
 			if json.Unmarshal(f.Data, &notification) == nil {
 				t.mu.Lock()
@@ -67,7 +75,7 @@ func (t *Transport) SendRequest(ctx context.Context, request sdktransport.JSONRP
 		timeout = time.Until(deadline)
 	}
 	var result sdktransport.JSONRPCResponse
-	if err := t.executor.Call(ctx, t.cfg.ExecutionHost(), "rpc", t.cfg.Name, RPC{Timeout: timeout, Request: request}, &result); err != nil {
+	if err := t.executor.Call(ctx, t.cfg.ExecutionHost(), "rpc", t.cfg.Name, RPC{Session: t.session, Timeout: timeout, Request: request}, &result); err != nil {
 		return nil, err
 	}
 	result.ID = request.ID
@@ -77,7 +85,7 @@ func (t *Transport) SendNotification(ctx context.Context, notification mcp.JSONR
 	if notification.Method == "notifications/initialized" {
 		return nil
 	}
-	return t.executor.Call(ctx, t.cfg.ExecutionHost(), "notify", t.cfg.Name, notification, nil)
+	return t.executor.Call(ctx, t.cfg.ExecutionHost(), "notify", t.cfg.Name, Notification{Session: t.session, Notification: notification}, nil)
 }
 func (t *Transport) SetNotificationHandler(fn func(mcp.JSONRPCNotification)) {
 	t.mu.Lock()
@@ -96,5 +104,5 @@ func (t *Transport) Close() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return t.executor.Call(ctx, t.cfg.ExecutionHost(), "disconnect", t.cfg.Name, nil, nil)
+	return t.executor.Call(ctx, t.cfg.ExecutionHost(), "disconnect", t.cfg.Name, t.session, nil)
 }

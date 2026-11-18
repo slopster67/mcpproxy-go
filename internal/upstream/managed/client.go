@@ -44,6 +44,7 @@ type Client struct {
 	// generation (Generation, SetConfigAt).
 	cfg            atomic.Pointer[stampedConfig]
 	coreClient     *core.Client
+	demand         demandConnections
 	advertisedIcon atomic.Pointer[string]
 
 	instanceID InstanceID
@@ -143,6 +144,7 @@ type Client struct {
 	// discovery stamp was certified against, or an epoch-pinned dispatch would
 	// match the new instance's first connection and send a stale name to it.
 	connectionEpoch atomic.Int64
+	lastToolQuery   atomic.Int64
 
 	// epochMu serializes the probe goroutine's final epoch-check-and-SetError
 	// with Connect's epoch bump. Without it a reconnect could complete between
@@ -305,18 +307,13 @@ func NewClientAt(id string, serverConfig *config.ServerConfig, gen int64, logger
 
 	// Wire up core notification callback to forward to discovery callback
 	coreClient.SetOnToolsChangedCallback(func(serverName string) {
-		mc.mu.RLock()
-		callback := mc.toolDiscoveryCallback
-		mc.mu.RUnlock()
-
-		if callback == nil {
-			mc.logger.Debug("No tool discovery callback set - notification ignored",
-				zap.String("server", serverName))
-			return
-		}
-
-		// Run discovery in a goroutine with timeout to avoid blocking the notification handler
 		go func() {
+			mc.mu.RLock()
+			callback := mc.toolDiscoveryCallback
+			mc.mu.RUnlock()
+			if callback == nil {
+				return
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
@@ -435,6 +432,12 @@ func (mc *Client) Connect(ctx context.Context) error {
 		mc.connectCancel = nil
 		mc.connectMu.Unlock()
 	}()
+
+	if serverConfig.OnDemand() {
+		mc.demand.mu.Lock()
+		mc.closeDemandSessionsLocked()
+		mc.demand.mu.Unlock()
+	}
 
 	// Phase 3: Execute the actual connection (potentially slow - OAuth, MCP initialize)
 	// mc.mu is NOT held here, so Disconnect/SetConfig/GetConfig won't block
@@ -650,6 +653,13 @@ func (mc *Client) Disconnect() error {
 	// Stop background monitoring
 	mc.stopBackgroundMonitoring()
 
+	// Hold the lifetime lock through the state reset so reconciliation cannot
+	// open a replacement connection halfway through teardown.
+	if mc.GetConfig().OnDemand() {
+		mc.demand.mu.Lock()
+		defer mc.demand.mu.Unlock()
+		mc.closeDemandSessionsLocked()
+	}
 	if err := mc.coreClient.Disconnect(); err != nil {
 		mc.logger.Error("Core client disconnect failed", zap.Error(err))
 	}
@@ -804,7 +814,7 @@ func (mc *Client) IsUserLoggedOut() bool {
 // anonymous) won. The runtime uses it to decide whether a stored token record
 // is evidence about this server at all.
 func (mc *Client) ConnectedWithOAuth() bool {
-	return mc.coreClient.AuthStrategy() == core.AuthStrategyOAuth
+	return mc.coreClient.AuthStrategy() == core.AuthStrategyOAuth || mc.demand.usesOAuth.Load()
 }
 
 // IsOAuthCallRequired reports whether a tools/call against this otherwise-
@@ -1003,6 +1013,9 @@ func (mc *Client) runListToolsAsLeader(listCtx context.Context, release func() b
 	mc.publishListToolsResult(tools, err)
 
 	if err != nil {
+		if mc.GetConfig().OnDemand() && !errors.Is(listCtx.Err(), context.Canceled) {
+			mc.setErrorIfCurrentConnection(err, listEpoch)
+		}
 		// Debug for the same reason as the core layer: this is the middle of
 		// three logs of one failure. A ListTools miss that matters is either
 		// re-logged by the caller or promoted by the isConnectionError branch
@@ -1092,6 +1105,15 @@ func (mc *Client) callTool(ctx context.Context, toolName string, args map[string
 
 	// Charge transport failures to the connection generation that dispatched the call.
 	callEpoch := mc.connectionEpoch.Load()
+	if mc.GetConfig().OnDemand() {
+		result, err := mc.callDemandTool(ctx, toolName, args, expectedEpoch)
+		if err != nil {
+			mc.recordCallToolOAuthSignal(toolName, err)
+		} else {
+			mc.oauthCallRequired.Store(false)
+		}
+		return result, err
+	}
 	result, err := mc.callToolWithSession(core.WithConnectionGeneration(ctx, callEpoch), toolName, args, expectedEpoch)
 	if err != nil && mc.retired.Load() {
 		// The instance was retired while the call was in flight; its gate closed the connection or refused the
@@ -1448,7 +1470,7 @@ func (mc *Client) onStateChange(oldState, newState types.ConnectionState, info *
 //
 // Reconnecting the core transport must not start a second health loop.
 func (mc *Client) startBackgroundMonitoring() {
-	if mc.monitoringStarted {
+	if mc.monitoringStarted || mc.GetConfig().OnDemand() {
 		return
 	}
 
@@ -2133,4 +2155,8 @@ func (mc *Client) PrepareConnectionRetry(invalidate bool) bool {
 	}
 	mc.StateManager.ResetForCredentials()
 	return true
+}
+
+func (mc *Client) NewSessionConnection(id string, info mcp.Implementation) (*core.Client, error) {
+	return mc.coreClient.NewSessionConnection(id, info)
 }

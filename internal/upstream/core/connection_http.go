@@ -160,9 +160,6 @@ func (c *Client) runAuthStrategies(ctx context.Context, authStrategies []authStr
 			zap.String("strategy", strategy.name))
 		c.authStrategy.Store(strategy.name)
 
-		// Register notification handler for tools/list_changed
-		c.registerNotificationHandler()
-
 		return nil
 	}
 

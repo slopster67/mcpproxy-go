@@ -17,6 +17,10 @@ type SessionInfo struct {
 	ClientName    string
 	ClientVersion string
 
+	credentialHash string
+	lastActivity   time.Time
+	inFlight       int
+
 	// Workspace is the project the client is working in, as disclosed via MCP
 	// roots. Filled in asynchronously AFTER the handshake completes — never
 	// during initialize, which would deadlock. Empty for
@@ -64,7 +68,7 @@ type SessionInfo struct {
 	// TokenName and ClientID identify the credential that authenticated this
 	// session: the client credential name and its client id. Both
 	// empty for an admin session. Set once at initialize from the
-	// AuthContext (SetSessionIdentity) — never re-derived per call, because
+	// AuthContext — never re-derived per call, because
 	// the credential does not change mid-connection.
 	TokenName string
 	ClientID  string
@@ -208,34 +212,26 @@ func (s *SessionStore) SetStorageManager(manager *storage.Manager) {
 // The in-memory entry is still created here, immediately: activity records
 // resolve their client name from this map (SetSessionClientResolver), so
 // deferring it would strip the identity from the very first thing a session does.
-func (s *SessionStore) SetSession(sessionID, clientName, clientVersion string, hasRoots, hasSampling bool, experimental []string) {
+func (s *SessionStore) SetSession(info *SessionInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	info := &SessionInfo{
-		SessionID:      sessionID,
-		ClientName:     clientName,
-		ClientVersion:  clientVersion,
-		hasRoots:       hasRoots,
-		hasSampling:    hasSampling,
-		experimental:   experimental,
-		startTime:      time.Now(),
-		workspaceReady: make(chan struct{}),
-		persistDone:    make(chan struct{}),
-	}
+	info.startTime = time.Now()
+	info.lastActivity = info.startTime
+	info.workspaceReady = make(chan struct{})
+	info.persistDone = make(chan struct{})
 	// A client that cannot report roots will never make us wait for them.
-	if !hasRoots {
+	if !info.hasRoots {
 		close(info.workspaceReady)
 	}
-	s.sessions[sessionID] = info
+	s.sessions[info.SessionID] = info
 	s.evictClosedLocked()
 
 	s.logger.Debug("session registered (not yet persisted — awaiting first activity)",
-		zap.String("session_id", sessionID),
-		zap.String("client_name", clientName),
-		zap.String("client_version", clientVersion),
-		zap.Bool("has_roots", hasRoots),
-		zap.Bool("has_sampling", hasSampling),
+		zap.String("session_id", info.SessionID),
+		zap.String("client_name", info.ClientName),
+		zap.String("client_version", info.ClientVersion),
+		zap.Bool("has_roots", info.hasRoots),
+		zap.Bool("has_sampling", info.hasSampling),
 	)
 }
 
@@ -554,36 +550,6 @@ func (s *SessionStore) SetActiveProfile(sessionID, profileSlug string) {
 	s.activeProfiles[sessionID] = profileSlug
 }
 
-// SetSessionIdentity records the credential that authenticated a session:
-// the client credential name and its client id (empty for an admin
-// session). Called once at initialize, from the request's AuthContext — the
-// credential never changes mid-connection, so this is never called again for
-// the same sessionID.
-func (s *SessionStore) SetSessionIdentity(sessionID, tokenName, clientID string) {
-	if sessionID == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if info, ok := s.sessions[sessionID]; ok {
-		info.TokenName = tokenName
-		info.ClientID = clientID
-	}
-}
-
-// SetSessionTokenPrefix records the display prefix of the credential that
-// authenticated a session, next to SetSessionIdentity.
-func (s *SessionStore) SetSessionTokenPrefix(sessionID, prefix string) {
-	if sessionID == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if info, ok := s.sessions[sessionID]; ok {
-		info.TokenPrefix = prefix
-	}
-}
-
 // SessionsMatching returns every live session for which pred is true, with its
 // serving instance. pred runs under the store's read
 // lock and must not call back into the store.
@@ -611,19 +577,6 @@ func (s *SessionStore) ClearSelection(name string) {
 		if sel == name {
 			delete(s.activeProfiles, id)
 		}
-	}
-}
-
-// SetSessionServer records the MCP server instance serving a session (the
-// session -> server-instance map). Called once at initialize.
-func (s *SessionStore) SetSessionServer(sessionID string, srv *mcpserver.MCPServer) {
-	if sessionID == "" || srv == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if info, ok := s.sessions[sessionID]; ok {
-		info.server = srv
 	}
 }
 

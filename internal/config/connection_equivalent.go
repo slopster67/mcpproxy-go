@@ -21,6 +21,10 @@ func ConnectionEquivalent(a, b *ServerConfig) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
+	// On-demand servers re-probe when their saved settings change.
+	if a.OnDemand() || b.OnDemand() {
+		return ServerEntryEqual(a, b)
+	}
 	return a.ExecutionHost() == b.ExecutionHost() && a.URL == b.URL &&
 		a.Protocol == b.Protocol &&
 		a.Command == b.Command &&

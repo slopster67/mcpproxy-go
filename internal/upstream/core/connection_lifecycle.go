@@ -16,7 +16,36 @@ import (
 	"go.uber.org/zap"
 )
 
-// initialize performs MCP initialization handshake
+func (c *Client) implementation() mcp.Implementation {
+	if c.clientInfo.Name != "" {
+		return c.clientInfo
+	}
+	return mcp.Implementation{Name: "mcpproxy-go", Title: "MCPProxy", Version: "1.0.0"}
+}
+
+func (c *Client) NewSessionConnection(id string, info mcp.Implementation) (*Client, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	cfg := *c.config
+	if cfg.ExecutionHost() == "" && cfg.LaunchesHTTP() {
+		cfg.Command = ""
+		cfg.Args = nil
+	}
+	session, err := NewClient(id, &cfg, c.logger, nil, c.globalConfig, c.storage, nil)
+	if err != nil {
+		return nil, err
+	}
+	session.clientInfo = info
+	session.peerSession = id
+	session.SetCredentialBinding(c.CredentialBinding())
+	session.SetGate(c.Gate())
+	session.SetPeerExecutor(c.peerExecutor)
+	session.SetPeerGeneration(c.peerGeneration)
+	session.SuppressBrowser()
+	session.upstreamLogger = c.upstreamLogger
+	return session, nil
+}
+
 func (c *Client) initialize(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -27,10 +56,7 @@ func (c *Client) initialize(ctx context.Context) error {
 	// health probes stop proving liveness) and server-initiated requests are
 	// gone (so roots-based workspace discovery cannot work).
 	initRequest.Params.ProtocolVersion = mcp.LATEST_LEGACY_PROTOCOL_VERSION
-	initRequest.Params.ClientInfo = mcp.Implementation{
-		Name:    "mcpproxy-go",
-		Version: "1.0.0",
-	}
+	initRequest.Params.ClientInfo = c.implementation()
 	initRequest.Params.Capabilities = mcp.ClientCapabilities{}
 
 	// Log request for trace debugging - use main logger for CLI debug mode

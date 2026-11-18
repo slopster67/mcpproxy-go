@@ -189,6 +189,18 @@
                   <template v-if="peers.hasPeers"><dt class="text-muted-foreground">Run on</dt>
                   <dd><HostSelect :model-value="server.host_id || ''" :disabled="actionLoading || kvPatchInFlight" @update:model-value="patchServerDiff({host_id:$event, available_to_peers:false}, 'Updated execution host')" /></dd></template>
                   <template v-if="!server.host_id && (peers.hasPeers || server.available_to_peers)"><dt class="text-muted-foreground"><label for="share-with-peers">Available to peers</label></dt><dd><Switch id="share-with-peers" :model-value="!!server.available_to_peers" :disabled="actionLoading || kvPatchInFlight" @update:model-value="patchServerDiff({available_to_peers:$event}, 'Updated peer access')" /></dd></template>
+                  <dt class="text-muted-foreground"><label for="expose-tools-directly">Expose tools directly</label></dt>
+                  <dd>
+                    <Switch id="expose-tools-directly" :model-value="!!server.expose_tools_directly" :disabled="actionLoading || kvPatchInFlight" @update:model-value="patchServerDiff({ expose_tools_directly: $event }, 'Updated tool exposure')" />
+                  </dd>
+                  <dt class="text-muted-foreground">Keep running</dt>
+                  <dd>
+                    <ServerLifetimeControls
+                      :model-value="server.connection_lifetime || 'always'"
+                      :disabled="actionLoading || kvPatchInFlight"
+                      @update:model-value="patchServerDiff({ connection_lifetime: $event }, 'Updated connection lifetime')"
+                    />
+                  </dd>
                   <dt class="text-muted-foreground">Protocol</dt>
                   <dd class="flex items-center gap-2">
                     <SquareTerminal v-if="server.protocol === 'stdio'" class="size-4" aria-hidden="true" />
@@ -506,6 +518,7 @@
 
 <script setup lang="ts">
 import { usePeersStore } from "@/stores/peers";
+import ServerLifetimeControls from "@/components/ServerLifetimeControls.vue";
 import HostSelect from "@/components/HostSelect.vue";
 import ServerIconUpload from "@/components/ServerIconUpload.vue";
 import { Spinner } from "@/components/ui/spinner";
@@ -577,10 +590,10 @@ const error = computed<string | null>(() => {
   return server.value ? null : `Server "${props.serverName}" not found`;
 });
 watch(
-  () => [server.value?.connected, server.value?.connecting, server.value?.last_error],
+  () => [server.value?.status, server.value?.connected, server.value?.connecting, server.value?.last_error],
   () => {
     if (restartingServer.value !== server.value?.name) return;
-    if (server.value.connected) {
+    if (server.value.connected || server.value.status === "idle") {
       restartingServer.value = "";
       systemStore.addToast({ type: "success", title: "Server restarted", message: "" });
     } else if (!server.value.connecting && server.value.last_error) {
@@ -728,7 +741,7 @@ async function restartServer() {
   actionLoading.value = true;
   try {
     const restarted = await serversStore.restart(server.value.name);
-    if (restarted.connected) {
+    if (restarted.connected || restarted.status === "idle") {
       systemStore.addToast({ type: "success", title: "Server restarted", message: "" });
     } else if (!restarted.connecting && restarted.last_error) {
       systemStore.addToast({ type: "error", title: "Restart failed", message: restarted.last_error });

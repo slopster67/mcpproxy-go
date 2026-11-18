@@ -2,7 +2,6 @@ package supervisor
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -781,8 +780,7 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 		status.ToolCount = state.ToolCount
 		status.Incarnation = state.Incarnation
 
-		// Convert ToolMetadata to ToolInfo and cache in StateView
-		status.Tools = toolInfosFromMetadata(state.Tools)
+		status.Tools = state.Tools
 		status.ToolsDiscovered = state.ToolsDiscovered
 		status.DiscoveryEpoch = state.DiscoveryEpoch
 
@@ -1006,37 +1004,6 @@ func (s *Supervisor) SetOnServerConnectedCallback(callback func(serverName strin
 	s.onServerConnectedCallback = callback
 }
 
-// toolInfosFromMetadata converts cached upstream tool metadata into the
-// StateView ToolInfo representation. Shared by reconcile, background-discovery
-// refresh, and reconnect repopulation so all three paths produce an identical
-// StateView tool set.
-func toolInfosFromMetadata(tools []*config.ToolMetadata) []stateview.ToolInfo {
-	if tools == nil {
-		return nil
-	}
-	infos := make([]stateview.ToolInfo, len(tools))
-	for i, tool := range tools {
-		// Parse ParamsJSON into InputSchema. StateView is served verbatim by the
-		// REST/CLI tool listings, so a malformed schema must stay nil (field
-		// omitted downstream) rather than become a misleading empty object.
-		var inputSchema map[string]interface{}
-		if tool.ParamsJSON != "" {
-			if err := json.Unmarshal([]byte(tool.ParamsJSON), &inputSchema); err != nil {
-				inputSchema = nil
-			}
-		}
-
-		infos[i] = stateview.ToolInfo{
-			Name:             tool.Name,
-			Description:      tool.Description,
-			InputSchema:      inputSchema,
-			Annotations:      tool.Annotations,
-			OutputSchemaJSON: tool.OutputSchemaJSON,
-		}
-	}
-	return infos
-}
-
 // DiscoveryGenerations returns every known server's current
 // DiscoveryCapture — the Supervisor's ConnectionGeneration and the live
 // client's connection token. A discovery caller captures it BEFORE listing
@@ -1097,16 +1064,10 @@ func (s *Supervisor) RefreshServerToolsFromDiscovery(serverName string, tools []
 	if serverName == "" {
 		return false, nil
 	}
-	serverTools := make([]*config.ToolMetadata, 0, len(tools))
-	for _, tool := range tools {
-		if tool != nil && tool.ServerName == serverName {
-			serverTools = append(serverTools, tool)
-		}
-	}
-	stale := s.publishDiscoveredTools(map[string][]*config.ToolMetadata{serverName: serverTools}, map[string]DiscoveryCapture{serverName: gen})
+	stale := s.publishDiscoveredTools(map[string][]*config.ToolMetadata{serverName: tools}, map[string]DiscoveryCapture{serverName: gen})
 	s.logger.Debug("Refreshed tools in Supervisor snapshot and StateView from server discovery",
 		zap.String("server", serverName),
-		zap.Int("total_tools", len(serverTools)),
+		zap.Int("total_tools", len(tools)),
 		zap.Bool("published", len(stale) == 0))
 	return len(stale) == 0, nil
 }
@@ -1270,7 +1231,7 @@ func (s *Supervisor) publishDiscoveredTools(toolsByServer map[string][]*config.T
 			// not keep a stale higher count that diverges from the snapshot
 			// and the bleve index.
 			status.ToolCount = len(serverTools)
-			status.Tools = toolInfosFromMetadata(serverTools)
+			status.Tools = serverTools
 			status.ToolsDiscovered = true
 			status.DiscoveryEpoch = epoch
 		})
@@ -1409,7 +1370,7 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 					status.DiscoveryEpoch = 0
 					if len(status.Tools) == 0 {
 						if len(state.Tools) > 0 {
-							status.Tools = toolInfosFromMetadata(state.Tools)
+							status.Tools = state.Tools
 							status.ToolCount = len(state.Tools)
 							// The restored set is the PREVIOUS connection's
 							// discovery result, kept for counts and listings

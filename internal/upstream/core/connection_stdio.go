@@ -130,9 +130,6 @@ func (c *Client) connectStdio(ctx context.Context) error {
 			zap.Int("pgid", c.processGroupID))
 	}
 
-	// Register notification handler for tools/list_changed
-	c.registerNotificationHandler()
-
 	return nil
 }
 
