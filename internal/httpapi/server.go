@@ -580,7 +580,8 @@ type AddServerRequest struct {
 	Protocol         string             `json:"protocol,omitempty"`
 	Enabled          *bool              `json:"enabled,omitempty"`
 
-	ExposeToolsDirectly *bool `json:"expose_tools_directly,omitempty"`
+	ConnectionLifetime  string `json:"connection_lifetime,omitempty"`
+	ExposeToolsDirectly *bool  `json:"expose_tools_directly,omitempty"`
 
 	TrustMode string `json:"trust_mode,omitempty"`
 }
@@ -671,7 +672,11 @@ func resolveServerPatch(serverName string, req *AddServerRequest, existingSrv *c
 	updates.HostID = req.HostID
 	updates.AvailableToPeers = req.AvailableToPeers
 	updates.ExposeToolsDirectly = req.ExposeToolsDirectly
-	hasUpdates := req.HostID != nil || req.AvailableToPeers != nil || req.ExposeToolsDirectly != nil
+	if !config.ValidConnectionLifetime(req.ConnectionLifetime) {
+		return nil, &patchError{status: http.StatusBadRequest, msg: "invalid connection_lifetime"}
+	}
+	updates.ConnectionLifetime = req.ConnectionLifetime
+	hasUpdates := req.HostID != nil || req.AvailableToPeers != nil || req.ExposeToolsDirectly != nil || req.ConnectionLifetime != ""
 	if req.Icon != nil {
 		normalized, err := servericon.Normalize(*req.Icon)
 		if err != nil {

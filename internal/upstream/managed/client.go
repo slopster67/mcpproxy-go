@@ -44,6 +44,7 @@ type Client struct {
 	// generation (Generation, SetConfigAt).
 	cfg            atomic.Pointer[stampedConfig]
 	coreClient     *core.Client
+	demand         demandConnections
 	advertisedIcon atomic.Pointer[string]
 
 	instanceID InstanceID
@@ -317,6 +318,11 @@ func NewClientAt(id string, serverConfig *config.ServerConfig, gen int64, logger
 
 		// Run discovery in a goroutine with timeout to avoid blocking the notification handler
 		go func() {
+			if mc.GetConfig().OnDemand() {
+				mc.demand.mu.Lock()
+				mc.demand.probedAt = time.Time{}
+				mc.demand.mu.Unlock()
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
@@ -435,6 +441,10 @@ func (mc *Client) Connect(ctx context.Context) error {
 		mc.connectCancel = nil
 		mc.connectMu.Unlock()
 	}()
+
+	if serverConfig.OnDemand() {
+		mc.closeDemandSessions()
+	}
 
 	// Phase 3: Execute the actual connection (potentially slow - OAuth, MCP initialize)
 	// mc.mu is NOT held here, so Disconnect/SetConfig/GetConfig won't block
@@ -627,6 +637,9 @@ func (mc *Client) Connect(ctx context.Context) error {
 
 // Disconnect closes the connection and stops monitoring
 func (mc *Client) Disconnect() error {
+	if mc.GetConfig().OnDemand() {
+		mc.closeDemandSessions()
+	}
 	mc.cancelInFlightListTools()
 	mc.cancelInFlightConnect()
 
@@ -804,7 +817,7 @@ func (mc *Client) IsUserLoggedOut() bool {
 // anonymous) won. The runtime uses it to decide whether a stored token record
 // is evidence about this server at all.
 func (mc *Client) ConnectedWithOAuth() bool {
-	return mc.coreClient.AuthStrategy() == core.AuthStrategyOAuth
+	return mc.coreClient.AuthStrategy() == core.AuthStrategyOAuth || mc.demand.usesOAuth.Load()
 }
 
 // IsOAuthCallRequired reports whether a tools/call against this otherwise-
@@ -1003,6 +1016,9 @@ func (mc *Client) runListToolsAsLeader(listCtx context.Context, release func() b
 	mc.publishListToolsResult(tools, err)
 
 	if err != nil {
+		if mc.GetConfig().OnDemand() && !errors.Is(listCtx.Err(), context.Canceled) {
+			mc.setErrorIfCurrentConnection(err, listEpoch)
+		}
 		// Debug for the same reason as the core layer: this is the middle of
 		// three logs of one failure. A ListTools miss that matters is either
 		// re-logged by the caller or promoted by the isConnectionError branch
@@ -1092,6 +1108,15 @@ func (mc *Client) callTool(ctx context.Context, toolName string, args map[string
 
 	// Charge transport failures to the connection generation that dispatched the call.
 	callEpoch := mc.connectionEpoch.Load()
+	if mc.GetConfig().OnDemand() {
+		result, err := mc.callDemandTool(ctx, toolName, args, expectedEpoch)
+		if err != nil {
+			mc.recordCallToolOAuthSignal(toolName, err)
+		} else {
+			mc.oauthCallRequired.Store(false)
+		}
+		return result, err
+	}
 	result, err := mc.callToolWithSession(core.WithConnectionGeneration(ctx, callEpoch), toolName, args, expectedEpoch)
 	if err != nil && mc.retired.Load() {
 		// The instance was retired while the call was in flight; its gate closed the connection or refused the
@@ -1542,10 +1567,16 @@ func planHealthCheckCycle(interval time.Duration) (probe bool, wait time.Duratio
 func (mc *Client) backgroundHealthCheck() {
 	for {
 		probe, wait := planHealthCheckCycle(mc.resolveHealthCheckInterval())
+		onDemand := mc.GetConfig().OnDemand()
+		if onDemand {
+			wait = min(wait, time.Minute)
+		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
-			if probe {
+			if onDemand {
+				mc.probeDemandConnection()
+			} else if probe {
 				mc.performHealthCheck()
 			}
 		case <-mc.stopMonitoring:
@@ -2133,4 +2164,8 @@ func (mc *Client) PrepareConnectionRetry(invalidate bool) bool {
 	}
 	mc.StateManager.ResetForCredentials()
 	return true
+}
+
+func (mc *Client) NewSessionConnection(id string, info mcp.Implementation) (*core.Client, error) {
+	return mc.coreClient.NewSessionConnection(id, info)
 }

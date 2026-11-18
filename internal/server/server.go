@@ -139,6 +139,7 @@ func NewServer(cfg *config.Config, logger *zap.Logger) (*Server, error) {
 	// observer (see warmProfileIndex).
 	server.installProfilePublishObserver(mcpProxy)
 	server.warmProfileIndex()
+	go mcpProxy.runUpstreamLifetime(rt.AppContext())
 
 	server.runtime.StartBackgroundInitialization()
 
@@ -213,7 +214,7 @@ func (s *Server) mcpAuthMiddleware(next http.Handler) http.Handler {
 		caller := record.AuthContext()
 		caller.CredentialKind = kind
 		caller.ServerAvailable = func(name string) bool { return s.mcpProxy.hostAllows(caller, name) }
-		next.ServeHTTP(w, r.WithContext(auth.WithAuthContext(r.Context(), caller)))
+		s.mcpProxy.trackUpstreamRequest(auth.WithAuthContext(r.Context(), caller), next, w, r, record)
 	})
 }
 
@@ -274,6 +275,7 @@ func (s *Server) listenForRoutingModeRefresh() {
 			}
 			s.warmProfileIndex()
 			if s.mcpProxy != nil {
+				s.mcpProxy.upstreamLifetime.signal()
 				s.mcpProxy.RefreshDirectModeTools()
 				// retrieve_tools' description names the reachable servers;
 				// re-list clients when that set changes.
@@ -495,6 +497,9 @@ func (s *Server) AddServer(ctx context.Context, serverConfig *config.ServerConfi
 // non-zero/non-nil fields of updates, plus Enabled (resolved against the
 // existing server by the REST handler). It is the field logic UpdateServer and PatchServer share.
 func applyServerUpdates(existing, updates *config.ServerConfig) {
+	if updates.ConnectionLifetime != "" {
+		existing.ConnectionLifetime = updates.ConnectionLifetime
+	}
 	if updates.ExposeToolsDirectly != nil {
 		expose := *updates.ExposeToolsDirectly
 		existing.ExposeToolsDirectly = &expose

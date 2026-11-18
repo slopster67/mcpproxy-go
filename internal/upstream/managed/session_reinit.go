@@ -276,6 +276,9 @@ func (mc *Client) probeLiveness(ctx context.Context) error {
 
 // listToolsUpstream is the upstream tools/list with session recovery.
 func (mc *Client) listToolsUpstream(ctx context.Context) (tools []*config.ToolMetadata, err error) {
+	if mc.GetConfig().OnDemand() {
+		return mc.listDemandTools(ctx)
+	}
 	err = mc.withSession(ctx, string(mcp.MethodToolsList), func() error {
 		var e error
 		tools, e = mc.coreClient.ListTools(ctx)

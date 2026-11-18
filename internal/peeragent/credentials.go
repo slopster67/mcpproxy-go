@@ -81,6 +81,7 @@ func (a *Agent) configure(ctx context.Context, desired peering.Connection) (*man
 	cfg := config.CopyServerConfig(desired.Config)
 	cfg.HostID = nil
 	cfg.AvailableToPeers = nil
+	cfg.ConnectionLifetime = ""
 	a.mu.Lock()
 	current, previous, token := a.servers[name], a.settings[name], a.tokens[name]
 	version := a.versions[name]
@@ -105,6 +106,7 @@ func (a *Agent) configure(ctx context.Context, desired peering.Connection) (*man
 	}
 	if current != nil {
 		current.Retire()
+		a.closePeerSessions(current)
 		_ = current.Disconnect()
 	}
 	a.refresh.OnTokenCleared(name)

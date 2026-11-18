@@ -37,6 +37,7 @@ export type HealthAction =
 // surface (Web UI, macOS, tray, CLI) renders as text — HealthLevel stays a
 // severity signal for badge/tray coloring only; no renderer may print it as
 // text.
+export const HealthStatusIdle = 'idle' as const;
 export const HealthStatusReady = 'ready' as const;
 export const HealthStatusConnecting = 'connecting' as const;
 export const HealthStatusSignInRequired = 'sign_in_required' as const;
@@ -46,6 +47,7 @@ export const HealthStatusNeedsConfig = 'needs_config' as const;
 export const HealthStatusError = 'error' as const;
 export const HealthStatusDisabled = 'disabled' as const;
 export type HealthStatusValue =
+  | typeof HealthStatusIdle
   | typeof HealthStatusReady
   | typeof HealthStatusConnecting
   | typeof HealthStatusSignInRequired
@@ -58,6 +60,7 @@ export type HealthStatusValue =
 // Label tables — binding for the Web UI, macOS window/tray and CLI table
 // (StatusLabels / ActionLabels in internal/health/constants.go).
 export const HEALTH_STATUS_LABELS: Record<HealthStatusValue, string> = {
+  [HealthStatusIdle]: 'Idle',
   [HealthStatusReady]: 'Online',
   [HealthStatusConnecting]: 'Connecting',
   [HealthStatusSignInRequired]: 'Sign-in required',

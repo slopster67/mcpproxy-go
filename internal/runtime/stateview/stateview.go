@@ -11,6 +11,7 @@ import (
 
 // ToolInfo represents a cached tool definition.
 type ToolInfo struct {
+	Hash        string
 	Name        string
 	Description string
 	InputSchema map[string]interface{}

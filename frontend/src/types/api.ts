@@ -42,7 +42,10 @@ export interface QuarantineStats {
   blocked_count: number
 }
 
+export type ServerConnectionLifetime = "always" | "shared" | "per_session";
+
 export interface Server {
+  connection_lifetime?: ServerConnectionLifetime;
  host_id?: string
  host_name?: string
  host_online?: boolean
@@ -78,6 +81,7 @@ export interface Server {
   enabled: boolean
 
   trust_mode?: string
+  status?: string
   connected: boolean
   connecting: boolean
   authenticated?: boolean

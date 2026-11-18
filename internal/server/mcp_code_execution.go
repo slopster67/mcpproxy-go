@@ -824,7 +824,7 @@ func (u *upstreamToolCaller) callTool(ctx context.Context, serverName, toolName 
 		err    error
 	)
 	if certified.certified() {
-		result, err = client.CallToolOnEpoch(ctx, toolName, args, certified.DiscoveryEpoch)
+		result, err = client.CallToolOnEpoch(managed.WithExpectedTool(ctx, certified.Hash, certified.Annotations), toolName, args, certified.DiscoveryEpoch)
 	} else {
 		result, err = client.CallTool(ctx, toolName, args)
 	}

@@ -986,11 +986,12 @@ func (r *Runtime) buildServer(serverStatus *stateview.ServerStatus, gens map[str
 
 	// Call-time OAuth requirement — set when an anonymously-connected
 	// server rejected a tools/call with "authorization required".
-	var callTimeOAuthRequired bool
+	var callTimeOAuthRequired, idle bool
 	if r.upstreamManager != nil {
 		if client, exists := r.upstreamManager.GetClient(serverStatus.Name); exists && client != nil {
 			srv.UserLoggedOut = client.IsUserLoggedOut()
 			callTimeOAuthRequired = client.IsOAuthCallRequired()
+			idle = client.Idle()
 		}
 	}
 
@@ -1049,6 +1050,14 @@ func (r *Runtime) buildServer(serverStatus *stateview.ServerStatus, gens map[str
 
 	srv.Quarantine = r.serverQuarantineStats(serverStatus.Name)
 	r.projectServerHost(&srv)
+	if idle && srv.Enabled && srv.HostOnline && srv.LastError == "" && !srv.UserLoggedOut {
+		srv.Connected = false
+		srv.Status = health.StatusIdle
+		if srv.Health.Status == health.StatusReady {
+			srv.Health.Status = health.StatusIdle
+			srv.Health.Summary = "Idle"
+		}
+	}
 	return srv
 }
 

@@ -193,6 +193,14 @@
                   <dd>
                     <Switch id="expose-tools-directly" :model-value="!!server.expose_tools_directly" :disabled="actionLoading || kvPatchInFlight" @update:model-value="patchServerDiff({ expose_tools_directly: $event }, 'Updated tool exposure')" />
                   </dd>
+                  <dt class="text-muted-foreground">Keep running</dt>
+                  <dd>
+                    <ServerLifetimeControls
+                      :model-value="server.connection_lifetime || 'always'"
+                      :disabled="actionLoading || kvPatchInFlight"
+                      @update:model-value="patchServerDiff({ connection_lifetime: $event }, 'Updated connection lifetime')"
+                    />
+                  </dd>
                   <dt class="text-muted-foreground">Protocol</dt>
                   <dd class="flex items-center gap-2">
                     <SquareTerminal v-if="server.protocol === 'stdio'" class="size-4" aria-hidden="true" />
@@ -510,6 +518,7 @@
 
 <script setup lang="ts">
 import { usePeersStore } from "@/stores/peers";
+import ServerLifetimeControls from "@/components/ServerLifetimeControls.vue";
 import HostSelect from "@/components/HostSelect.vue";
 import ServerIconUpload from "@/components/ServerIconUpload.vue";
 import { Spinner } from "@/components/ui/spinner";

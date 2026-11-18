@@ -57,6 +57,7 @@ type Agent struct {
 	entryContext context.Context
 	mu           sync.Mutex
 	servers      map[string]*managed.Client
+	sessions     map[string]peerSession
 	settings     map[string]*config.ServerConfig
 	calls        map[string]context.CancelFunc
 	locks        map[string]*sync.Mutex
@@ -90,7 +91,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *zap.Logger) error {
 	transport.ResponseHeaderTimeout = 15 * time.Second
 	controlClient := &http.Client{Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	defer controlClient.CloseIdleConnections()
-	a := &Agent{versions: map[string]int64{}, assigned: map[string]bool{}, cfg: cfg, url: remote, client: controlClient, logger: logger, tokens: map[string]*storage.MemoryOAuth{}, resolvers: map[string]*secret.Resolver{}, secrets: map[string]map[string]string{}, processID: uuid.NewString(), global: global, servers: map[string]*managed.Client{}, settings: map[string]*config.ServerConfig{}, calls: map[string]context.CancelFunc{}, locks: map[string]*sync.Mutex{}, credChanged: make(chan struct{}, 1), signins: map[string]signin{}}
+	a := &Agent{versions: map[string]int64{}, assigned: map[string]bool{}, cfg: cfg, url: remote, client: controlClient, logger: logger, tokens: map[string]*storage.MemoryOAuth{}, resolvers: map[string]*secret.Resolver{}, secrets: map[string]map[string]string{}, processID: uuid.NewString(), global: global, servers: map[string]*managed.Client{}, sessions: map[string]peerSession{}, settings: map[string]*config.ServerConfig{}, calls: map[string]context.CancelFunc{}, locks: map[string]*sync.Mutex{}, credChanged: make(chan struct{}, 1), signins: map[string]signin{}}
 	a.loadCredential()
 	a.refresh = oauth.NewRefreshManager(a, oauth.GetGlobalCoordinator(), logger)
 	a.refresh.SetRuntime(a)
@@ -329,6 +330,7 @@ func (a *Agent) control(parent context.Context) error {
 		}
 		a.mu.Unlock()
 		workers.Wait()
+		a.closePeerSessions(nil)
 	}()
 	scanner := bufio.NewScanner(response.Body)
 	scanner.Buffer(make([]byte, 4096), peering.MaxMessage)
@@ -430,6 +432,7 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 		a.mu.Unlock()
 		for name, instance := range removed {
 			instance.Retire()
+			a.closePeerSessions(instance)
 			_ = instance.Disconnect()
 			a.refresh.OnTokenCleared(name)
 		}
@@ -481,12 +484,24 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 		if err := json.Unmarshal(f.Data, &desired); err != nil {
 			return nil, err
 		}
+		if desired.Config == nil || desired.Config.Name != f.Server {
+			return nil, fmt.Errorf("invalid server connection")
+		}
 		if desired.Generation <= a.syncGen && !a.assigned[f.Server] {
 			return nil, commitview.ErrStaleGeneration
 		}
 		instance, err := a.configure(ctx, desired)
 		if err != nil {
 			return nil, err
+		}
+		if desired.Session != "" {
+			if desired.ClientInfo == nil || desired.Config.ConnectionLifetime != config.KeepRunningPerSession {
+				return nil, fmt.Errorf("invalid per-session connection")
+			}
+			lock := a.serverLock(f.Server)
+			lock.Lock()
+			defer lock.Unlock()
+			return a.openPeerSession(ctx, desired.Session, *desired.ClientInfo, instance)
 		}
 		if !instance.IsConnected() {
 			if err = instance.Connect(ctx); err != nil {
@@ -521,6 +536,15 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 			lock := a.serverLock(f.Server)
 			lock.Lock()
 			defer lock.Unlock()
+			var sessionID string
+			if len(f.Data) != 0 {
+				if err := json.Unmarshal(f.Data, &sessionID); err != nil {
+					return nil, err
+				}
+			}
+			if sessionID != "" {
+				return nil, a.closePeerSession(sessionID, instance)
+			}
 			return nil, instance.Disconnect()
 		}
 		if f.Op == "notify" {
@@ -533,6 +557,15 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 		var payload peering.RPC
 		if err := json.Unmarshal(f.Data, &payload); err != nil {
 			return nil, err
+		}
+		rpc := instance.PeerRPC
+		callTool := instance.CallTool
+		if payload.Session != "" {
+			session := a.getPeerSession(payload.Session, instance)
+			if session == nil {
+				return nil, fmt.Errorf("upstream session is closed")
+			}
+			rpc, callTool = session.PeerRPC, session.CallTool
 		}
 		request := payload.Request
 		if request.Method == "tools/call" {
@@ -548,14 +581,14 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 			if err = json.Unmarshal(raw, &params); err != nil {
 				return nil, err
 			}
-			result, err := instance.CallTool(ctx, params.Name, params.Arguments)
+			result, err := callTool(ctx, params.Name, params.Arguments)
 			if err != nil {
 				return nil, err
 			}
 			data, err := json.Marshal(result)
 			return &sdktransport.JSONRPCResponse{JSONRPC: "2.0", ID: request.ID, Result: data}, err
 		}
-		return instance.PeerRPC(ctx, request)
+		return rpc(ctx, request)
 	default:
 		return a.manage(ctx, f)
 	}

@@ -32,6 +32,10 @@ func (s *Server) prepareServerCreate(req AddServerRequest, masked bool) (*config
 		return nil, &requestError{http.StatusBadRequest, invalidTrustModeMessage(req.TrustMode)}
 	}
 
+	if !config.ValidConnectionLifetime(req.ConnectionLifetime) {
+		return nil, &requestError{http.StatusBadRequest, "invalid connection_lifetime"}
+	}
+
 	protocol := req.Protocol
 	if protocol == "" {
 		if req.Command != "" {
@@ -67,18 +71,21 @@ func (s *Server) prepareServerCreate(req AddServerRequest, masked bool) (*config
 		return nil, &requestError{400, "Unknown execution host"}
 	}
 	serverConfig := &config.ServerConfig{
-		HostID: req.HostID, AvailableToPeers: req.AvailableToPeers, ExposeToolsDirectly: req.ExposeToolsDirectly,
-		Name:        req.Name,
-		Icon:        req.Icon,
-		Description: description,
-		URL:         req.URL,
-		Command:     req.Command,
-		Args:        req.Args,
-		Env:         flattenNullableMap(req.Env),
-		Headers:     flattenNullableMap(req.Headers),
-		WorkingDir:  req.WorkingDir,
-		Protocol:    protocol,
-		Enabled:     enabled,
+		HostID:              req.HostID,
+		AvailableToPeers:    req.AvailableToPeers,
+		ExposeToolsDirectly: req.ExposeToolsDirectly,
+		ConnectionLifetime:  req.ConnectionLifetime,
+		Name:                req.Name,
+		Icon:                req.Icon,
+		Description:         description,
+		URL:                 req.URL,
+		Command:             req.Command,
+		Args:                req.Args,
+		Env:                 flattenNullableMap(req.Env),
+		Headers:             flattenNullableMap(req.Headers),
+		WorkingDir:          req.WorkingDir,
+		Protocol:            protocol,
+		Enabled:             enabled,
 	}
 
 	if req.TrustMode != "" {

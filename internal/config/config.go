@@ -339,7 +339,8 @@ type ServerConfig struct {
 	OAuth            *OAuthConfig      `json:"oauth,omitempty"`   // OAuth mode and overrides of discovered values
 	Enabled          bool              `json:"enabled"`
 
-	ExposeToolsDirectly *bool `json:"expose_tools_directly,omitempty"`
+	ConnectionLifetime  string `json:"connection_lifetime,omitempty"`
+	ExposeToolsDirectly *bool  `json:"expose_tools_directly,omitempty"`
 
 	TrustMode string    `json:"trust_mode,omitempty"` // auto approves tools; manual requires review
 	Created   time.Time `json:"created"`
@@ -351,6 +352,26 @@ type ServerConfig struct {
 	// mcpproxy starts the process AND connects via network. Stdio servers ignore
 	// this field. Zero or unset → 30s default.
 	LauncherWaitTimeout Duration `json:"launcher_wait_timeout,omitempty" swaggertype:"string"`
+}
+
+const (
+	KeepRunningAlways     = "always"
+	KeepRunningShared     = "shared"
+	KeepRunningPerSession = "per_session"
+)
+
+func ValidConnectionLifetime(mode string) bool {
+	return mode == "" || mode == KeepRunningAlways || mode == KeepRunningShared || mode == KeepRunningPerSession
+}
+
+func (sc *ServerConfig) OnDemand() bool {
+	return sc.ConnectionLifetime == KeepRunningShared || sc.ConnectionLifetime == KeepRunningPerSession
+}
+
+// LaunchesHTTP reports whether the command owns the configured HTTP endpoint.
+func (sc *ServerConfig) LaunchesHTTP() bool {
+	return sc.Command != "" && sc.URL != "" &&
+		(sc.Protocol == "http" || sc.Protocol == "streamable-http" || sc.Protocol == "sse")
 }
 
 // OAuth modes. Auto (the empty mode) uses OAuth only when the upstream asks
@@ -908,6 +929,9 @@ func (c *Config) validateDetailedCore() []ValidationError {
 			if _, err := NormalizeServerDescription(*server.Description); err != nil {
 				errors = append(errors, ValidationError{Field: fieldPrefix + ".description", Message: err.Error()})
 			}
+		}
+		if !ValidConnectionLifetime(server.ConnectionLifetime) {
+			errors = append(errors, ValidationError{Field: fieldPrefix + ".connection_lifetime", Message: "invalid connection_lifetime"})
 		}
 		if server.Icon != nil {
 			if err := servericon.Validate(*server.Icon); err != nil {

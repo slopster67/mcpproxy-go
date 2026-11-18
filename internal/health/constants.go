@@ -35,6 +35,7 @@ const (
 )
 
 const (
+	StatusIdle           = "idle"
 	StatusReady          = "ready"
 	StatusConnecting     = "connecting"
 	StatusSignInRequired = "sign_in_required"

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
+	"reflect"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -573,7 +573,18 @@ func (p *MCPProxyServer) makeDirectModeHandler(entry *directCatalogEntry) mcpser
 			err    error
 		)
 		if epoch, ok := p.liveConnectionEpoch(serverName); ok {
-			result, err = p.upstreamManager.CallToolOnEpoch(ctx, qualifiedName, args, epoch)
+			if client, exists := p.upstreamManager.GetClient(serverName); exists && client.GetConfig().OnDemand() {
+				certified := p.resolveExactToolIdentity(serverName, toolName)
+				if !certified.certified() || certified.Hash != entry.Hash || certified.DiscoveryEpoch != epoch ||
+					!reflect.DeepEqual(certified.Annotations, entry.Annotations) {
+					err = managed.ErrConnectionGenerationChanged
+				} else {
+					ctx = managed.WithExpectedTool(ctx, certified.Hash, certified.Annotations)
+				}
+			}
+			if err == nil {
+				result, err = p.upstreamManager.CallToolOnEpoch(ctx, qualifiedName, args, epoch)
+			}
 		} else {
 			result, err = p.upstreamManager.CallTool(ctx, qualifiedName, args)
 		}
@@ -1196,7 +1207,7 @@ func (p *MCPProxyServer) GetMCPServerForMode(mode string) *mcpserver.MCPServer {
 		if p.codeExecServer != nil {
 			return p.codeExecServer
 		}
-	case config.RoutingModeRetrieveTools:
+	case "", config.RoutingModeRetrieveTools:
 		if p.callToolServer != nil {
 			return p.callToolServer
 		}

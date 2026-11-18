@@ -53,8 +53,10 @@ type Client struct {
 	upstreamLogCloser io.Closer
 
 	// MCP client and server info
-	client     *client.Client
-	serverInfo *mcp.InitializeResult
+	client      *client.Client
+	serverInfo  *mcp.InitializeResult
+	clientInfo  mcp.Implementation
+	peerSession string
 
 	envManager *secureenv.Manager
 

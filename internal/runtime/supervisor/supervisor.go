@@ -1027,6 +1027,7 @@ func toolInfosFromMetadata(tools []*config.ToolMetadata) []stateview.ToolInfo {
 		}
 
 		infos[i] = stateview.ToolInfo{
+			Hash:             tool.Hash,
 			Name:             tool.Name,
 			Description:      tool.Description,
 			InputSchema:      inputSchema,

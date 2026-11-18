@@ -160,7 +160,8 @@ type MCPProxyServer struct {
 
 	// directRefreshMu serializes whole rebuilds so SetTools and the matching
 	// publishDirectCatalog cannot interleave with another rebuild's pair.
-	directRefreshMu sync.Mutex
+	directRefreshMu  sync.Mutex
+	upstreamLifetime upstreamLifetime
 }
 
 // NewMCPProxyServer creates a new MCP proxy server
@@ -221,6 +222,11 @@ func NewMCPProxyServer(
 			return
 		}
 		sessionStore.UpdateActivity(session.SessionID())
+		if method != mcp.MethodInitialize {
+			if proxy := proxyRef.Load(); proxy != nil {
+				proxy.touchUpstreamSession(ctx, session)
+			}
+		}
 
 		// Ask the client which project it is working in — once, lazily,
 		// on the first real request after the handshake.
@@ -304,6 +310,9 @@ func NewMCPProxyServer(
 			sessionStore.SetSessionTokenPrefix(sessionID, ac.TokenPrefix)
 		}
 		sessionStore.SetSessionServer(sessionID, mcpserver.ServerFromContext(ctx))
+		if proxy := proxyRef.Load(); proxy != nil {
+			proxy.touchUpstreamSession(ctx, session)
+		}
 
 		logger.Info("MCP client initialized with capabilities",
 			zap.String("session_id", sessionID),
@@ -389,21 +398,22 @@ func NewMCPProxyServer(
 	}
 
 	proxy := &MCPProxyServer{
-		server:          mcpServer,
-		storage:         storage,
-		index:           index,
-		upstreamManager: upstreamManager,
-		cacheManager:    cacheManager,
-		truncator:       truncator,
-		outputValidator: outputValidator,
-		inputValidator:  newInputValidator(logger),
-		logger:          logger,
-		mainServer:      mainServer,
-		config:          config,
-		sigCache:        sigCache,
-		jsPool:          jsPool,
-		sessionStore:    sessionStore,
-		hooks:           hooks,
+		server:           mcpServer,
+		storage:          storage,
+		index:            index,
+		upstreamManager:  upstreamManager,
+		cacheManager:     cacheManager,
+		truncator:        truncator,
+		outputValidator:  outputValidator,
+		inputValidator:   newInputValidator(logger),
+		logger:           logger,
+		mainServer:       mainServer,
+		config:           config,
+		sigCache:         sigCache,
+		jsPool:           jsPool,
+		sessionStore:     sessionStore,
+		hooks:            hooks,
+		upstreamLifetime: upstreamLifetime{sessions: make(map[string]upstreamClientSession), wake: make(chan struct{}, 1)},
 	}
 
 	// Let the hooks (registered before the proxy existed) reach it.
@@ -2429,6 +2439,7 @@ type toolIdentity struct {
 	DiscoveryEpoch int64
 	// Found reports whether the server's snapshot lists the raw name, verbatim.
 	Found bool
+	Hash  string
 	// Description and Annotations are the snapshot's metadata for the tool;
 	// zero when Found is false.
 	Description string
@@ -2528,6 +2539,7 @@ func (p *MCPProxyServer) resolveExactToolIdentityIn(servers map[string]*statevie
 	for i := range serverStatus.Tools {
 		if serverStatus.Tools[i].Name == toolName {
 			identity.Found = true
+			identity.Hash = serverStatus.Tools[i].Hash
 			identity.Description = serverStatus.Tools[i].Description
 			identity.Annotations = serverStatus.Tools[i].Annotations
 			return identity
@@ -2622,7 +2634,7 @@ func (p *MCPProxyServer) liveIdentityRefusal(record *config.ServerConfig, server
 // otherwise (see toolIdentity.certified).
 func (p *MCPProxyServer) dispatchOnEpoch(ctx context.Context, certified toolIdentity, toolName string, args map[string]interface{}) (interface{}, error) {
 	if certified.certified() {
-		return p.upstreamManager.CallToolOnEpoch(ctx, toolName, args, certified.DiscoveryEpoch)
+		return p.upstreamManager.CallToolOnEpoch(managed.WithExpectedTool(ctx, certified.Hash, certified.Annotations), toolName, args, certified.DiscoveryEpoch)
 	}
 	return p.upstreamManager.CallTool(ctx, toolName, args)
 }
