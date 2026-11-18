@@ -391,20 +391,11 @@ func (m *Manager) pruneSweptState(known map[string]struct{}) {
 	}
 }
 
-func (m *Manager) DiscoverTools(ctx context.Context) ([]*config.ToolMetadata, error) {
-	tools, _, _, err := m.discoverTools(ctx, false)
-	return tools, err
-}
-
 // DiscoverToolsReportCaptured is DiscoverToolsReport that also returns, per
 // listed server, the capture of that server's own tools/list: the sweep
 // applies each server's inventory in capture order, not
 // under one ticket for the whole sweep.
 func (m *Manager) DiscoverToolsReportCaptured(ctx context.Context, dueOnly bool) ([]*config.ToolMetadata, []string, map[string]managed.InventoryCapture, error) {
-	return m.discoverTools(ctx, dueOnly)
-}
-
-func (m *Manager) discoverTools(ctx context.Context, dueOnly bool) ([]*config.ToolMetadata, []string, map[string]managed.InventoryCapture, error) {
 	type clientSnapshot struct {
 		id      string
 		name    string
@@ -473,7 +464,10 @@ func (m *Manager) discoverTools(ctx context.Context, dueOnly bool) ([]*config.To
 			continue
 		}
 
-		// Skip servers not yet due under the global discovery cadence.
+		// On-demand servers discover on connect and have their own hourly probe.
+		if client.GetConfig().OnDemand() {
+			continue
+		}
 		if dueOnly {
 			interval := gc.ResolveToolDiscoveryInterval()
 			last, hasSwept := m.lastSweptFor(snapshot.name)

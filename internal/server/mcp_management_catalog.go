@@ -85,7 +85,7 @@ func (p *MCPProxyServer) directManagementTools() []mcpserver.ServerTool {
 	for i := range tools {
 		name := tools[i].Tool.Name
 		meta := managementMetadata(tools[i].Tool)
-		entry := &directCatalogEntry{DisplayName: FormatDirectToolName(config.ManagementServerName, name), ServerName: config.ManagementServerName, ToolName: name, Description: meta.Description, ParamsJSON: meta.ParamsJSON, Annotations: meta.Annotations}
+		entry := &directCatalogEntry{DisplayName: FormatDirectToolName(config.ManagementServerName, name), ToolMetadata: meta, ToolName: name}
 		description := "[mcpproxy] " + meta.Description
 		if p.effectiveDirectToolResponseMode() == config.DirectToolResponseModeDeferred {
 			sig, _ := toolsig.Render(meta.ParamsJSON, meta.Description)

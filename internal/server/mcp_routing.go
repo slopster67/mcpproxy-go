@@ -77,44 +77,16 @@ func FormatDirectToolName(serverName, toolName string) string {
 // Each upstream tool is exposed directly with serverName__toolName naming.
 // Only approved tools from connected, enabled servers are included.
 func (p *MCPProxyServer) buildDirectModeTools() ([]mcpserver.ServerTool, *directCatalog) {
-	ctx := context.Background()
-
-	// Resolved ONCE for this rebuild and stamped on whichever catalog we end up
-	// publishing, including the failure paths: a mode flip made while
-	// discovery is failing must still be recorded, or the guarded reload
-	// would see no drift afterwards and the operator's change would be lost
-	// until something unrelated happened to rebuild.
-	//
-	// The consequence, accepted rather than hidden: after such a failure the
-	// stamp says "deferred" although nothing was ever RENDERED deferred, so a
-	// later config reload sees no drift and will not retry. Recovery does not
-	// depend on the reload path — the empty listing is itself the problem, and
-	// the servers.changed that fixes discovery rebuilds unconditionally, in
-	// whatever mode is then configured. Making the guard retry instead would
-	// mean rebuilding on every reload for as long as discovery stayed down.
 	mode := p.effectiveDirectToolResponseMode()
-
-	// DiscoverTools already filters to connected, enabled, non-quarantined
-	// servers — server-LEVEL filtering only. Tool-level state (pending/changed
-	// approval) is applied later by the callability filter.
-	// The initial rebuild runs during construction, so this can be reached
-	// before the upstream manager is wired. Treat it exactly like a discovery
-	// failure rather than panicking: built-ins still register, the catalog is
-	// still published, and the next servers.changed fills in the upstreams.
-	if p.upstreamManager == nil {
-		return p.withDirectBuiltins(nil), emptyDirectCatalog(mode, p.logger)
+	var tools []*config.ToolMetadata
+	if p.upstreamManager != nil {
+		for _, client := range p.upstreamManager.GetAllClients() {
+			cfg := client.GetConfig()
+			if cfg.Enabled && client.IsConnected() && !client.Retired() {
+				tools = append(tools, p.mainServer.runtime.ServerToolCatalog(cfg.Name)...)
+			}
+		}
 	}
-
-	tools, err := p.upstreamManager.DiscoverTools(ctx)
-	if err != nil {
-		p.logger.Error("failed to discover tools for direct mode", zap.Error(err))
-		// A NON-NIL empty catalog, not nil. A nil catalog would tell the
-		// discovery filters "no catalog yet, do not deny" at exactly the moment
-		// upstream discovery is failing, flipping them from deny-on-miss to
-		// allow-everything.
-		return p.withDirectBuiltins(nil), emptyDirectCatalog(mode, p.logger)
-	}
-
 	cat := buildDirectCatalog(tools, p.logger)
 	cat.mode = mode
 	return p.withDirectBuiltins(p.renderDirectTools(cat)), cat
@@ -139,12 +111,6 @@ var builtinDirectToolNames = func() map[string]struct{} {
 
 // withDirectBuiltins appends the tools mcpproxy serves itself on the direct
 // surface.
-//
-// It is applied on EVERY return path of buildDirectModeTools, including the
-// failure paths, because SetTools REPLACES the whole registry: a rebuild that
-// omitted the built-ins would delete describe_tool from the live surface until
-// some later successful rebuild happened to restore it. A built-in that
-// disappears on the first upstream hiccup is not a built-in.
 //
 // The DEFINITION is the shared one — the schemas and response shape must not
 // drift between surfaces — but the HANDLER is the direct-surface variant, which
@@ -235,16 +201,6 @@ func (p *MCPProxyServer) renderDirectTools(cat *directCatalog) []mcpserver.Serve
 		zap.Int("signature_misses", signatureMisses))
 
 	return serverTools
-}
-
-// emptyDirectCatalog is the non-nil empty snapshot the failure paths publish,
-// carrying the mode this rebuild resolved. Non-nil matters: a nil
-// catalog tells the discovery filters "not built yet, do not deny" at exactly
-// the moment discovery is failing.
-func emptyDirectCatalog(mode string, logger *zap.Logger) *directCatalog {
-	cat := buildDirectCatalog(nil, logger)
-	cat.mode = mode
-	return cat
 }
 
 // renderFullDirectTool renders a direct-surface tool with its full upstream
@@ -576,8 +532,6 @@ func (p *MCPProxyServer) makeDirectModeHandler(entry *directCatalogEntry) mcpser
 				if !certified.certified() || certified.Hash != entry.Hash || certified.DiscoveryEpoch != epoch ||
 					!reflect.DeepEqual(certified.Annotations, entry.Annotations) {
 					err = managed.ErrConnectionGenerationChanged
-				} else {
-					ctx = managed.WithExpectedTool(ctx, certified.Hash, certified.Annotations)
 				}
 			}
 			if err == nil {

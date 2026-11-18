@@ -137,7 +137,7 @@ func (p *MCPProxyServer) syncUpstreamLifetime(ctx context.Context) {
 		workers.Go(func() {
 			connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
-			client.SyncLifetimeSessions(connectCtx, desired[name])
+			client.SyncLifetimeSessions(connectCtx, desired[name], p.mainServer.runtime.RefreshSessionCatalog)
 			if client.IdleChanged() {
 				p.mainServer.runtime.Changes().Invalidate(runtime.EntityServers, name)
 			}

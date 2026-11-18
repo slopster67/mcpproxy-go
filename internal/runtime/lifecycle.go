@@ -379,6 +379,20 @@ func (r *Runtime) DiscoverAndIndexToolsForServer(ctx context.Context, serverName
 	return r.discoverAndIndexToolsForServer(ctx, serverName, false)
 }
 
+// RefreshSessionCatalog publishes through the same approval and indexing path as a probe.
+func (r *Runtime) RefreshSessionCatalog(ctx context.Context, client *managed.Client, id string) {
+	name := client.GetConfig().Name
+	gen := r.discoveryGeneration(name)
+	instanceGen := client.Generation()
+	tools, capture, err := client.ListSessionTools(ctx, id)
+	if err == nil {
+		_, _, err = r.commitInventoryAt(ctx, name, tools, instanceGen, &gen, inventoryRef{capture: capture})
+	}
+	if err != nil && ctx.Err() == nil {
+		r.logger.Debug("Session tool discovery failed", zap.String("server", name), zap.Error(err))
+	}
+}
+
 // RefreshServerTools re-discovers and re-indexes a single server AUTHORITATIVELY:
 // a successful ListTools that returns zero tools is taken as the
 // truth — the server's stale index entries are removed and its last-good
@@ -637,8 +651,10 @@ func (r *Runtime) commitInventoryAt(ctx context.Context, serverName string, tool
 		return false, false, nil
 	}
 	published = true
+	catalogChanged := false
 	held := func() {
 		r.lastGoodToolsMu.Lock()
+		catalogChanged = !reflect.DeepEqual(r.lastGoodTools[serverName], tools)
 		r.storeLastGoodLocked(serverName, tools, inv.capture, instanceGen)
 		r.lastGoodToolsMu.Unlock()
 		if capture != nil && r.supervisor != nil {
@@ -671,6 +687,9 @@ func (r *Runtime) commitInventoryAt(ctx context.Context, serverName string, tool
 			return true, false, nil
 		}
 		return true, published, err
+	}
+	if catalogChanged {
+		r.toolsChanged(serverName)
 	}
 	return true, published, nil
 }

@@ -143,9 +143,7 @@ func (r *Runtime) storeLastGoodLocked(serverName string, tools []*config.ToolMet
 	if prev, ok := r.lastGoodCapture[serverName]; ok && c.Seq < prev.Seq {
 		return
 	}
-	snapshot := make([]*config.ToolMetadata, len(tools))
-	copy(snapshot, tools)
-	r.lastGoodTools[serverName] = snapshot
+	r.lastGoodTools[serverName] = tools
 	r.lastGoodCapture[serverName] = c
 	// The snapshot is bound to the commit generation of the instance it was
 	// listed from, so a local reindex hands it to the final generation check
@@ -155,6 +153,22 @@ func (r *Runtime) storeLastGoodLocked(serverName string, tools []*config.ToolMet
 	}
 	r.lastGoodGen[serverName] = instanceGen
 	r.noteCaptureLocked(serverName)
+}
+
+// ServerToolCatalog returns the immutable inventory from the last accepted discovery.
+func (r *Runtime) ServerToolCatalog(name string) []*config.ToolMetadata {
+	r.lastGoodToolsMu.RLock()
+	defer r.lastGoodToolsMu.RUnlock()
+	return r.lastGoodTools[name]
+}
+
+func (r *Runtime) CatalogTool(serverName, rawName string) *config.ToolMetadata {
+	for _, tool := range r.ServerToolCatalog(serverName) {
+		if config.RawToolName(tool) == rawName {
+			return tool
+		}
+	}
+	return nil
 }
 
 // lastGoodSnapshotWithCaptureGen is lastGoodSnapshotWithCapture that also
@@ -168,9 +182,7 @@ func (r *Runtime) lastGoodSnapshotWithCaptureGen(serverName string) ([]*config.T
 	if len(snapshot) == 0 {
 		return nil, managed.InventoryCapture{}, seq, 0
 	}
-	cp := make([]*config.ToolMetadata, len(snapshot))
-	copy(cp, snapshot)
-	return cp, r.lastGoodCapture[serverName], seq, r.lastGoodGen[serverName]
+	return snapshot, r.lastGoodCapture[serverName], seq, r.lastGoodGen[serverName]
 }
 
 func (r *Runtime) inventoryBeforeApply(serverName string, c managed.InventoryCapture) {

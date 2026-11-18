@@ -114,11 +114,6 @@ func (s *ServerStateSnapshot) Clone() *ServerStateSnapshot {
 				infoCopy := *state.ConnectionInfo
 				stateCopy.ConnectionInfo = &infoCopy
 			}
-			// Clone tools slice
-			if state.Tools != nil {
-				stateCopy.Tools = make([]*config.ToolMetadata, len(state.Tools))
-				copy(stateCopy.Tools, state.Tools)
-			}
 			cloned.Servers[name] = &stateCopy
 		}
 	}

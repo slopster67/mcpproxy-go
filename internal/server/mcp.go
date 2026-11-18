@@ -1064,12 +1064,18 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	// {id, score, sig, desc, lossy} from the shared signature cache. The
 	// ranked order of `results` is already final here — the mode selects
 	// serialization only.
-	entryOpts := toolEntryOpts{includeStats: includeStats}
 	// Must be non-nil so zero matches serialize as [] — strict MCP clients
 	// crash iterating a null tools array.
 	mcpTools := make([]map[string]interface{}, 0, len(results))
 	for _, result := range results {
-		mcpTools = append(mcpTools, p.buildToolEntry(result, responseMode, entryOpts))
+		tool := result.Tool
+		if tool.ServerName != config.ManagementServerName {
+			tool = p.mainServer.runtime.CatalogTool(tool.ServerName, config.RawToolName(tool))
+			if tool == nil {
+				continue
+			}
+		}
+		mcpTools = append(mcpTools, p.buildToolEntry(&config.SearchResult{Tool: tool, Score: result.Score}, responseMode, includeStats))
 	}
 
 	// Build mode-aware usage instructions
@@ -1555,7 +1561,7 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// uncompilable schemas dispatch unvalidated. The self-healing error embeds
 	// the FULL stored schema + hint regardless of tool_response_mode, and the
 	// upstream is never called on a validation failure.
-	if meta := p.lookupIndexedTool(serverName, actualToolName); meta != nil {
+	if meta := p.mainServer.runtime.CatalogTool(serverName, actualToolName); meta != nil {
 		if ok, verr, _ := p.inputValidator.validateArgs(toolName, meta.Hash, meta.ParamsJSON, args); !ok {
 			detail := oneLineValidationDetail(verr)
 			p.logger.Debug("handleCallToolVariant: pre-dispatch argument validation failed",
@@ -1967,7 +1973,7 @@ func (p *MCPProxyServer) createDetailedErrorResponse(err error, serverName, tool
 	// shapes below apply (a self-healing error without a schema would be an
 	// empty promise).
 	if detail, isInvalidParams := classifyUpstreamInvalidParams(err); isInvalidParams {
-		if meta := p.lookupIndexedTool(serverName, toolName); meta != nil && meta.ParamsJSON != "" {
+		if meta := p.mainServer.runtime.CatalogTool(serverName, toolName); meta != nil && meta.ParamsJSON != "" {
 			return invalidParamsErrorResult(serverName+":"+toolName, meta.ParamsJSON, detail)
 		}
 	}
@@ -2150,30 +2156,13 @@ func (p *MCPProxyServer) classifyServerToolStatus(serverName, toolName string) c
 	}
 }
 
-// serverToolNames returns the best-available list of a server's tool names:
-// the StateView snapshot when hydrated, otherwise a live ListTools.
 func (p *MCPProxyServer) serverToolNames(serverName string) []string {
-	if p.mainServer != nil && p.mainServer.runtime != nil {
-		if sup := p.mainServer.runtime.Supervisor(); sup != nil {
-			if ss, ok := sup.StateView().Snapshot().Servers[serverName]; ok && len(ss.Tools) > 0 {
-				names := make([]string, 0, len(ss.Tools))
-				for _, tl := range ss.Tools {
-					names = append(names, tl.Name)
-				}
-				return names
-			}
-		}
+	tools := p.mainServer.runtime.ServerToolCatalog(serverName)
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, config.RawToolName(tool))
 	}
-	if client, exists := p.upstreamManager.GetClient(serverName); exists {
-		if tools, err := client.ListTools(context.Background()); err == nil {
-			names := make([]string, 0, len(tools))
-			for _, tl := range tools {
-				names = append(names, tl.Name)
-			}
-			return names
-		}
-	}
-	return nil
+	return names
 }
 
 // isExactToolCallable is isToolCallable for a pair that is already split into
@@ -2628,7 +2617,7 @@ func (p *MCPProxyServer) liveIdentityRefusal(record *config.ServerConfig, server
 // otherwise (see toolIdentity.certified).
 func (p *MCPProxyServer) dispatchOnEpoch(ctx context.Context, certified toolIdentity, toolName string, args map[string]interface{}) (interface{}, error) {
 	if certified.certified() {
-		return p.upstreamManager.CallToolOnEpoch(managed.WithExpectedTool(ctx, certified.Hash, certified.Annotations), toolName, args, certified.DiscoveryEpoch)
+		return p.upstreamManager.CallToolOnEpoch(ctx, toolName, args, certified.DiscoveryEpoch)
 	}
 	return p.upstreamManager.CallTool(ctx, toolName, args)
 }

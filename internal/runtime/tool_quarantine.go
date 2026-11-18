@@ -18,7 +18,6 @@ import (
 
 	"github.com/slopster67/mcpproxy-go/internal/config"
 	"github.com/slopster67/mcpproxy-go/internal/hash"
-	"github.com/slopster67/mcpproxy-go/internal/runtime/stateview"
 	"github.com/slopster67/mcpproxy-go/internal/storage"
 )
 
@@ -1005,7 +1004,7 @@ func (r *Runtime) newToggleSynthesizedRecord(serverName, toolName, updatedBy str
 // removed incarnation, and an approval writer bound to the replacement must
 // never persist those definitions as the replacement's records. inc == 0 is
 // an unbound capture and accepts the view.
-func (r *Runtime) viewToolsAt(serverName string, inc int64) []stateview.ToolInfo {
+func (r *Runtime) viewToolsAt(serverName string, inc int64) []*config.ToolMetadata {
 	if r.supervisor == nil {
 		return nil
 	}
@@ -1040,21 +1039,7 @@ func (r *Runtime) snapshotToolMetadata(serverName, toolName string, inc int64) *
 		if info.Name != toolName {
 			continue
 		}
-		paramsJSON := ""
-		if info.InputSchema != nil {
-			if raw, err := json.Marshal(info.InputSchema); err == nil {
-				paramsJSON = string(raw)
-			}
-		}
-		return &config.ToolMetadata{
-			ServerName:       serverName,
-			Name:             info.Name,
-			RawName:          info.Name,
-			Description:      info.Description,
-			ParamsJSON:       paramsJSON,
-			OutputSchemaJSON: info.OutputSchemaJSON,
-			Annotations:      info.Annotations,
-		}
+		return info
 	}
 	return nil
 }

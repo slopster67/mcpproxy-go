@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"sort"
 
 	"go.uber.org/zap"
@@ -84,29 +83,10 @@ type directCatalog struct {
 // never validate against a definition other than the one its own registration
 // advertised.
 type directCatalogEntry struct {
-	Title       string
-	Meta        json.RawMessage
-	DisplayName string
-	ServerName  string
-	ToolName    string
-
-	// Description is the RAW upstream description. RenderedDescription is what
-	// was actually registered — "[server] desc", plus the compact signature
-	// suffix in deferred mode.
-	//
-	// Both are stored because they answer different questions, and the rendered
-	// one is captured at render time and never recomputed: the signature cache
-	// mutates independently of rebuilds, so re-rendering to compare would report
-	// a difference that is a cache warm/evict rather than a catalog change
-	// (D13 rule 5).
-	Description         string
+	*config.ToolMetadata
+	DisplayName         string
+	ToolName            string
 	RenderedDescription string
-
-	ParamsJSON       string
-	OutputSchemaJSON string
-	Hash             string
-
-	Annotations *config.ToolAnnotations
 
 	// RequiredPermission is derived from the UPSTREAM annotations above, exactly
 	// as dispatch derives it — never from the registered mcp.Tool's annotations,
@@ -115,28 +95,6 @@ type directCatalogEntry struct {
 	// catalog from read- and write-scoped tokens and disagreeing with dispatch
 	// (D10 / D13 rule 3).
 	RequiredPermission string
-}
-
-// toolMetadata projects an entry back onto the shape the shared entry builder
-// consumes, so a direct definition and a retrieve_tools definition render
-// through ONE builder and cannot drift on the fields they share.
-//
-// Name carries the canonical "<server>:<tool>" prefix because that is what
-// buildFullToolEntry treats as the id, and what describe_tool has always
-// returned as `name` on every other surface.
-func (e *directCatalogEntry) toolMetadata() *config.ToolMetadata {
-	if e == nil {
-		return nil
-	}
-	return &config.ToolMetadata{
-		ServerName:       e.ServerName,
-		Name:             e.ServerName + ":" + e.ToolName,
-		Description:      e.Description,
-		ParamsJSON:       e.ParamsJSON,
-		OutputSchemaJSON: e.OutputSchemaJSON,
-		Hash:             e.Hash,
-		Annotations:      e.Annotations,
-	}
 }
 
 // directCatalogCollision records a display name that two distinct upstream
@@ -231,15 +189,8 @@ func buildDirectCatalog(tools []*config.ToolMetadata, logger *zap.Logger) *direc
 		t := group[0]
 		entry := &directCatalogEntry{
 			DisplayName:        name,
-			Title:              t.Title,
-			Meta:               t.Meta,
-			ServerName:         t.ServerName,
+			ToolMetadata:       t,
 			ToolName:           t.Name,
-			Description:        t.Description,
-			ParamsJSON:         t.ParamsJSON,
-			OutputSchemaJSON:   t.OutputSchemaJSON,
-			Hash:               t.Hash,
-			Annotations:        t.Annotations,
 			RequiredPermission: requiredPermissionForDirectTool(t.Annotations),
 		}
 		cat.byDisplayName[name] = entry

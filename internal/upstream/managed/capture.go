@@ -3,7 +3,6 @@ package managed
 import (
 	"context"
 	"sync/atomic"
-	"time"
 
 	"github.com/slopster67/mcpproxy-go/internal/config"
 )
@@ -44,11 +43,6 @@ func (mc *Client) ListToolsFreshCaptured(ctx context.Context) ([]*config.ToolMet
 	mc.listToolsMu.Lock()
 	entrySeq := mc.listToolsLeaderSeq
 	mc.listToolsMu.Unlock()
-	if mc.GetConfig().OnDemand() {
-		mc.demand.mu.Lock()
-		mc.demand.probedAt = time.Time{}
-		mc.demand.mu.Unlock()
-	}
 	return mc.listTools(ctx, true, entrySeq)
 }
 
