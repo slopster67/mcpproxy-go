@@ -144,6 +144,7 @@ type Client struct {
 	// discovery stamp was certified against, or an epoch-pinned dispatch would
 	// match the new instance's first connection and send a stale name to it.
 	connectionEpoch atomic.Int64
+	lastToolQuery   atomic.Int64
 
 	// epochMu serializes the probe goroutine's final epoch-check-and-SetError
 	// with Connect's epoch bump. Without it a reconnect could complete between
@@ -1469,7 +1470,7 @@ func (mc *Client) onStateChange(oldState, newState types.ConnectionState, info *
 //
 // Reconnecting the core transport must not start a second health loop.
 func (mc *Client) startBackgroundMonitoring() {
-	if mc.monitoringStarted {
+	if mc.monitoringStarted || mc.GetConfig().OnDemand() {
 		return
 	}
 
@@ -1563,16 +1564,10 @@ func planHealthCheckCycle(interval time.Duration) (probe bool, wait time.Duratio
 func (mc *Client) backgroundHealthCheck() {
 	for {
 		probe, wait := planHealthCheckCycle(mc.resolveHealthCheckInterval())
-		onDemand := mc.GetConfig().OnDemand()
-		if onDemand {
-			wait = min(wait, time.Minute)
-		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
-			if onDemand {
-				mc.probeDemandConnection()
-			} else if probe {
+			if probe {
 				mc.performHealthCheck()
 			}
 		case <-mc.stopMonitoring:

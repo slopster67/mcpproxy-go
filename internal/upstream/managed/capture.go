@@ -3,6 +3,7 @@ package managed
 import (
 	"context"
 	"sync/atomic"
+	"time"
 
 	"github.com/slopster67/mcpproxy-go/internal/config"
 )
@@ -29,7 +30,13 @@ func nextCaptureSeq() uint64 { return captureSeq.Add(1) }
 
 // newCapture stamps a capture for a list flight that mc is about to run.
 func (mc *Client) newCapture() InventoryCapture {
+	mc.lastToolQuery.Store(time.Now().UnixNano())
 	return InventoryCapture{Seq: nextCaptureSeq(), Epoch: mc.connectionEpoch.Load(), Client: mc}
+}
+
+// LastToolQuery is shared by all connections for this upstream server.
+func (mc *Client) LastToolQuery() time.Time {
+	return time.Unix(0, mc.lastToolQuery.Load())
 }
 
 // ListToolsCaptured is ListTools that also returns the capture of the flight

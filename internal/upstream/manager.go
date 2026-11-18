@@ -53,11 +53,6 @@ type Manager struct {
 	notificationMgr *NotificationManager
 	secretResolver  *secret.Resolver
 
-	// lastSweptAt tracks each server's last discovery to avoid re-listing
-	// tools before the global discovery interval has elapsed. Guarded by sweepMu.
-	sweepMu     sync.Mutex
-	lastSweptAt map[string]time.Time
-
 	// callStats is the rolling per-server tool-call outcome window that feeds
 	// the health calculator's failure-rate rule. In memory only.
 	callStats  *callstats.Registry
@@ -133,7 +128,6 @@ func NewManager(logger *zap.Logger, globalConfig *config.Config, boltStorage *st
 		secretResolver:    secretResolver,
 		tokenReconnect:    make(map[string]time.Time),
 		tokenFingerprints: make(map[string]string),
-		lastSweptAt:       make(map[string]time.Time),
 		callStats:         callstats.NewRegistry(),
 		shutdownCtx:       shutdownCtx,
 		shutdownCancel:    shutdownCancel,
@@ -349,53 +343,11 @@ func (m *Manager) GetAllServerNames() []string {
 	return names
 }
 
-// shouldSweepServer checks whether the global interval has elapsed since this
-// server was last listed. Connection and notification discovery run independently.
-func shouldSweepServer(interval time.Duration, lastSwept time.Time, hasSwept bool, now time.Time) bool {
-	if interval <= 0 {
-		return false
-	}
-	if !hasSwept {
-		return true
-	}
-	return now.Sub(lastSwept) >= interval
-}
-
-// markSwept records that the periodic sweep just listed serverName's tools, so
-// the per-server cadence gate (shouldSweepServer) can wait the server's own
-// interval before listing it again.
-func (m *Manager) markSwept(serverName string, now time.Time) {
-	m.sweepMu.Lock()
-	defer m.sweepMu.Unlock()
-	m.lastSweptAt[serverName] = now
-}
-
-// lastSweptFor returns the last periodic-sweep time for serverName.
-func (m *Manager) lastSweptFor(serverName string) (time.Time, bool) {
-	m.sweepMu.Lock()
-	defer m.sweepMu.Unlock()
-	last, ok := m.lastSweptAt[serverName]
-	return last, ok
-}
-
-// pruneSweptState drops last-swept entries for servers no longer present so the
-// map can't grow unbounded as servers are added/removed (mirrors the lastGoodTools
-// pruning in the runtime indexing path).
-func (m *Manager) pruneSweptState(known map[string]struct{}) {
-	m.sweepMu.Lock()
-	defer m.sweepMu.Unlock()
-	for name := range m.lastSweptAt {
-		if _, ok := known[name]; !ok {
-			delete(m.lastSweptAt, name)
-		}
-	}
-}
-
 // DiscoverToolsReportCaptured is DiscoverToolsReport that also returns, per
 // listed server, the capture of that server's own tools/list: the sweep
 // applies each server's inventory in capture order, not
 // under one ticket for the whole sweep.
-func (m *Manager) DiscoverToolsReportCaptured(ctx context.Context, dueOnly bool) ([]*config.ToolMetadata, []string, map[string]managed.InventoryCapture, error) {
+func (m *Manager) DiscoverToolsReportCaptured(ctx context.Context) ([]*config.ToolMetadata, []string, map[string]managed.InventoryCapture, error) {
 	type clientSnapshot struct {
 		id      string
 		name    string
@@ -429,27 +381,15 @@ func (m *Manager) DiscoverToolsReportCaptured(ctx context.Context, dueOnly bool)
 	}
 	m.mu.RUnlock()
 
-	// Resolve the global discovery cadence.
-	gc := m.globalConfig.Load()
-	if gc == nil {
-		gc = &config.Config{}
-	}
-	now := time.Now()
-
 	var allTools []*config.ToolMetadata
 	var listed []string
 	captures := make(map[string]managed.InventoryCapture)
 	connectedCount := 0
-	skippedNotDue := 0
-	known := make(map[string]struct{}, len(snapshots))
 
 	for _, snapshot := range snapshots {
 		client := snapshot.client
 		if client == nil {
 			continue
-		}
-		if snapshot.name != "" {
-			known[snapshot.name] = struct{}{}
 		}
 
 		if !snapshot.enabled {
@@ -464,30 +404,14 @@ func (m *Manager) DiscoverToolsReportCaptured(ctx context.Context, dueOnly bool)
 			continue
 		}
 
-		// On-demand servers discover on connect and have their own hourly probe.
+		// On-demand servers are refreshed individually on configuration changes.
 		if client.GetConfig().OnDemand() {
 			continue
 		}
-		if dueOnly {
-			interval := gc.ResolveToolDiscoveryInterval()
-			last, hasSwept := m.lastSweptFor(snapshot.name)
-			if !shouldSweepServer(interval, last, hasSwept, now) {
-				m.logger.Debug("Skipping client not due for periodic tool sweep",
-					zap.String("id", snapshot.id),
-					zap.String("server", snapshot.name),
-					zap.Duration("interval", interval))
-				skippedNotDue++
-				continue
-			}
-		}
-
 		connectedCount++
 
 		tools, capture, err := client.ListToolsCaptured(ctx)
 		if err != nil {
-			// Warn, not Error: markSwept below is deliberately skipped so the
-			// next sweep retries this server, and a failure that will be
-			// retried is not an error.
 			m.logger.Warn("Failed to list tools from client",
 				zap.String("id", snapshot.id),
 				zap.String("server", snapshot.name),
@@ -495,9 +419,6 @@ func (m *Manager) DiscoverToolsReportCaptured(ctx context.Context, dueOnly bool)
 			continue
 		}
 
-		// Record the sweep only after a successful list so a transient failure
-		// retries on the next cycle rather than waiting a full interval.
-		m.markSwept(snapshot.name, now)
 		if snapshot.name != "" {
 			listed = append(listed, snapshot.name)
 			captures[snapshot.name] = capture
@@ -508,14 +429,9 @@ func (m *Manager) DiscoverToolsReportCaptured(ctx context.Context, dueOnly bool)
 		}
 	}
 
-	// Keep the per-server sweep-time map bounded as servers come and go.
-	m.pruneSweptState(known)
-
 	m.logger.Info("Discovered tools from upstream servers",
 		zap.Int("total_tools", len(allTools)),
-		zap.Int("connected_servers", connectedCount),
-		zap.Bool("due_only", dueOnly),
-		zap.Int("skipped_not_due", skippedNotDue))
+		zap.Int("connected_servers", connectedCount))
 
 	return allTools, listed, captures, nil
 }

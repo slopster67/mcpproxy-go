@@ -13,8 +13,6 @@ import (
 	"github.com/slopster67/mcpproxy-go/internal/upstream/core"
 )
 
-const demandProbeInterval = time.Hour
-
 type demandConnections struct {
 	mu           sync.RWMutex
 	idle         atomic.Bool
@@ -22,7 +20,7 @@ type demandConnections struct {
 	usesOAuth    atomic.Bool
 	sessions     map[string]*core.Client
 	shared       bool
-	probedAt     time.Time
+	verified     bool
 }
 
 type lifetimeSessionKey struct{}
@@ -42,14 +40,7 @@ func (mc *Client) IdleChanged() bool {
 }
 
 func (d *demandConnections) updateIdle() {
-	d.idle.Store(!d.probedAt.IsZero() && !d.shared && len(d.sessions) == 0)
-}
-
-func (mc *Client) demandProbeDue() bool {
-	d := &mc.demand
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return time.Since(d.probedAt) >= demandProbeInterval
+	d.idle.Store(d.verified && !d.shared && len(d.sessions) == 0)
 }
 
 func (mc *Client) listDemandTools(ctx context.Context) ([]*config.ToolMetadata, error) {
@@ -74,7 +65,7 @@ func (mc *Client) listDemandTools(ctx context.Context) ([]*config.ToolMetadata, 
 		return nil, err
 	}
 	d.usesOAuth.Store(mc.coreClient.AuthStrategy() == core.AuthStrategyOAuth)
-	d.probedAt = time.Now()
+	d.verified = true
 	return tools, nil
 }
 
@@ -174,7 +165,7 @@ func (mc *Client) closeDemandSessionsLocked() {
 	d.sessions = nil
 	d.shared = false
 	d.usesOAuth.Store(false)
-	d.probedAt = time.Time{}
+	d.verified = false
 }
 
 func (mc *Client) callDemandTool(ctx context.Context, name string, args map[string]interface{}, epoch *int64) (*mcp.CallToolResult, error) {
@@ -212,18 +203,4 @@ func (mc *Client) activeDemandConnection(id string) *core.Client {
 		return mc.coreClient
 	}
 	return nil
-}
-
-func (mc *Client) probeDemandConnection() {
-	if !mc.IsConnected() || mc.IsUserLoggedOut() || !mc.demandProbeDue() {
-		return
-	}
-	mc.mu.RLock()
-	discover := mc.toolDiscoveryCallback
-	mc.mu.RUnlock()
-	if discover != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = discover(ctx, mc.GetConfig().Name)
-	}
 }

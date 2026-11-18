@@ -67,7 +67,7 @@ func (d Duration) Duration() time.Duration {
 // in DefaultConfig) so an unset key resolves to the built-in default.
 const (
 	defaultHealthCheckInterval   = 30 * time.Second
-	defaultToolDiscoveryInterval = 5 * time.Minute
+	defaultToolDiscoveryInterval = 30 * time.Minute
 	// defaultInitTimeout is the deadline applied to a stdio/HTTP upstream's MCP
 	// `initialize` handshake when no per-server or global override is set.
 	defaultInitTimeout = 30 * time.Second

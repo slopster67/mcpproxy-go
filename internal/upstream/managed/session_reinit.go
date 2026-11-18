@@ -189,6 +189,7 @@ func (mc *Client) runReinit(ctx context.Context) error {
 	if err := mc.coreClient.ReinitializeSession(ctx); err != nil {
 		return err
 	}
+	mc.lastToolQuery.Store(time.Now().UnixNano())
 	tools, err := mc.coreClient.ListTools(ctx)
 	if err != nil {
 		return fmt.Errorf("tools/list after session re-initialize: %w", err)

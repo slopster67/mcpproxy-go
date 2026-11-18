@@ -139,53 +139,48 @@ func (r *Runtime) backgroundInitialization() {
 	go r.backgroundSessionCleanup(appCtx)
 }
 
-// toolDiscoveryDisabledRecheckInterval is how long the indexing loop sleeps
-// between re-checks when the periodic sweep is disabled (resolved interval
-// <= 0). It is NOT a sweep — connect-time discovery and reactive
-// notifications/tools/list_changed still keep the index fresh; this only lets a
-// later config hot-reload re-enable the sweep without a restart.
-const toolDiscoveryDisabledRecheckInterval = 5 * time.Minute
-
-// planToolDiscoveryCycle decides one iteration of the indexing loop: whether to
-// run a periodic sweep and how long to wait first. When at least one server (or
-// the global default) has a positive resolved interval the loop ticks at the
-// smallest such cadence (tick) and sweeps; when every interval is disabled
-// (anyEnabled=false) the loop waits the re-check window without sweeping so a
-// later hot-reload can re-enable it.
-func planToolDiscoveryCycle(tick time.Duration, anyEnabled bool, disabledRecheck time.Duration) (sweep bool, wait time.Duration) {
-	if !anyEnabled || tick <= 0 {
-		return false, disabledRecheck
-	}
-	return true, tick
-}
-
+// Connection startup handles initial discovery. One timer tracks the earliest
+// outstanding discovery deadline across all enabled, connected servers.
 func (r *Runtime) backgroundToolIndexing(ctx context.Context) {
 	r.cleanupOrphanedIndexEntries()
-
-	select {
-	case <-time.After(2 * time.Second):
-		_ = r.DiscoverAndIndexTools(ctx)
-	case <-ctx.Done():
-		r.logger.Info("Background tool indexing stopped during initial delay")
-		return
-	}
-
-	// Periodic discovery uses the global cadence.
+	wait := r.Config().ResolveToolDiscoveryInterval()
 	for {
-		tick := r.Config().ResolveToolDiscoveryInterval()
-		anyEnabled := tick > 0
-		sweep, wait := planToolDiscoveryCycle(tick, anyEnabled, toolDiscoveryDisabledRecheckInterval)
+		if wait <= 0 {
+			wait = 5 * time.Minute // Recheck configuration while periodic discovery is disabled.
+		}
 		timer := time.NewTimer(wait)
 		select {
-		case <-timer.C:
-			if sweep {
-				_ = r.discoverAndIndexTools(ctx, true)
-			}
 		case <-ctx.Done():
 			timer.Stop()
-			r.logger.Info("Background tool indexing stopped due to context cancellation")
 			return
+		case <-timer.C:
 		}
+
+		interval := r.Config().ResolveToolDiscoveryInterval()
+		wait = interval
+		if interval <= 0 || r.upstreamManager == nil {
+			continue
+		}
+		next := time.Now().Add(interval)
+		for name, client := range r.upstreamManager.GetAllClients() {
+			if ctx.Err() != nil {
+				return
+			}
+			if !client.GetConfig().Enabled || !client.IsConnected() || client.IsUserLoggedOut() {
+				continue
+			}
+			due := client.LastToolQuery().Add(interval)
+			if time.Until(due) <= 0 {
+				if err := r.DiscoverAndIndexToolsForServer(ctx, name); err != nil {
+					r.logger.Warn("Periodic tool discovery failed", zap.String("server", name), zap.Error(err))
+				}
+				continue
+			}
+			if due.Before(next) {
+				next = due
+			}
+		}
+		wait = max(time.Until(next), time.Millisecond)
 	}
 }
 
@@ -220,23 +215,13 @@ func (r *Runtime) backgroundSessionCleanup(ctx context.Context) {
 	}
 }
 
-// DiscoverAndIndexTools discovers tools from ALL connected upstream servers and
-// indexes them. Used by event-driven callers (boot, server reload, manual
-// refresh) that want a full sweep regardless of per-server cadence.
+// DiscoverAndIndexTools refreshes the connected always-running servers after a configuration change.
 func (r *Runtime) DiscoverAndIndexTools(ctx context.Context) error {
-	return r.discoverAndIndexTools(ctx, false)
-}
-
-// discoverAndIndexTools discovers tools and updates the index. When dueOnly is
-// true, only servers whose global discovery interval has elapsed are
-// re-listed; servers omitted from the
-// sweep keep their last-good index snapshot, so the index does not shrink.
-func (r *Runtime) discoverAndIndexTools(ctx context.Context, dueOnly bool) error {
 	if r.upstreamManager == nil || r.indexManager == nil {
 		return fmt.Errorf("runtime managers not initialized")
 	}
 
-	r.logger.Info("Discovering and indexing tools...", zap.Bool("due_only", dueOnly))
+	r.logger.Info("Discovering and indexing tools...")
 
 	// Capture every server's connection generation AND live connection
 	// token BEFORE listing: the publish below is bound to the generation, so
@@ -250,7 +235,7 @@ func (r *Runtime) discoverAndIndexTools(ctx context.Context, dueOnly bool) error
 	// so every server's result is applied in
 	// capture order: a result older than one already applied for that server
 	// (a concurrent connect or tools/list_changed pass) writes nothing.
-	tools, listed, captures, err := r.upstreamManager.DiscoverToolsReportCaptured(ctx, dueOnly)
+	tools, listed, captures, err := r.upstreamManager.DiscoverToolsReportCaptured(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to discover tools: %w", err)
 	}
