@@ -35,7 +35,8 @@ func (p *MCPProxyServer) trackUpstreamRequest(ctx context.Context, next http.Han
 		next.ServeHTTP(w, r.WithContext(ctx))
 		return
 	}
-	if session.ClientID != credential.ClientID || session.credentialHash == "" {
+	if session.ClientID != credential.ClientID || session.credentialHash == "" ||
+		(session.inFlight == 0 && time.Since(session.lastActivity) >= upstreamSessionIdle) {
 		store.mu.Unlock()
 		http.Error(w, "Session not found", http.StatusNotFound)
 		return
@@ -44,13 +45,8 @@ func (p *MCPProxyServer) trackUpstreamRequest(ctx context.Context, next http.Han
 		session.credentialHash = credential.TokenHash
 		p.signalUpstreamLifetime()
 	}
-	ctx = managed.WithLifetimeSession(ctx, managed.LifetimeSession{ID: id, ClientInfo: mcp.Implementation{
-		Name: session.ClientName, Version: session.ClientVersion, Title: credential.DisplayName,
-	}})
+	ctx = managed.WithLifetimeSession(ctx, id)
 	if r.Method == http.MethodPost {
-		if session.inFlight == 0 && time.Since(session.lastActivity) >= upstreamSessionIdle {
-			p.signalUpstreamLifetime()
-		}
 		session.inFlight++
 		defer func() {
 			store.mu.Lock()
@@ -89,6 +85,8 @@ func (p *MCPProxyServer) runUpstreamLifetime(ctx context.Context) {
 }
 
 func (p *MCPProxyServer) syncUpstreamLifetime(ctx context.Context) {
+	p.lifetimeMu.Lock()
+	defer p.lifetimeMu.Unlock()
 	cfg := p.currentConfig()
 	var servers []string
 	for _, server := range cfg.Servers {

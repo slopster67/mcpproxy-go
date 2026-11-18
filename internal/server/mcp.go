@@ -162,6 +162,7 @@ type MCPProxyServer struct {
 	// publishDirectCatalog cannot interleave with another rebuild's pair.
 	directRefreshMu sync.Mutex
 	lifetimeWake    chan struct{}
+	lifetimeMu      sync.Mutex
 }
 
 // NewMCPProxyServer creates a new MCP proxy server
@@ -304,7 +305,7 @@ func NewMCPProxyServer(
 		}
 		sessionStore.SetSession(info)
 		if proxy := proxyRef.Load(); proxy != nil {
-			proxy.signalUpstreamLifetime()
+			proxy.syncUpstreamLifetime(ctx)
 		}
 
 		logger.Info("MCP client initialized with capabilities",

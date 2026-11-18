@@ -29,11 +29,6 @@ type demandConnections struct {
 
 type lifetimeSessionKey struct{}
 
-type LifetimeSession struct {
-	ID         string
-	ClientInfo mcp.Implementation
-}
-
 type expectedToolKey struct{}
 
 type expectedTool struct {
@@ -45,8 +40,8 @@ func WithExpectedTool(ctx context.Context, hash string, annotations *config.Tool
 	return context.WithValue(ctx, expectedToolKey{}, expectedTool{hash, annotations})
 }
 
-func WithLifetimeSession(ctx context.Context, session LifetimeSession) context.Context {
-	return context.WithValue(ctx, lifetimeSessionKey{}, session)
+func WithLifetimeSession(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, lifetimeSessionKey{}, id)
 }
 
 // Idle is an intentionally closed transport with a verified catalog.
@@ -129,7 +124,7 @@ func (mc *Client) SyncLifetimeSessions(ctx context.Context, sessions map[string]
 		if ctx.Err() != nil {
 			return
 		}
-		_, _ = mc.ensureDemandConnection(ctx, LifetimeSession{id, info})
+		_ = mc.openSessionConnection(ctx, id, info)
 		if cfg.ConnectionLifetime == config.KeepRunningShared {
 			return
 		}
@@ -137,36 +132,36 @@ func (mc *Client) SyncLifetimeSessions(ctx context.Context, sessions map[string]
 }
 
 // Caller holds demand.mu. HTTP launchers own one listening port across sessions.
-func (mc *Client) ensureDemandConnection(ctx context.Context, session LifetimeSession) (*core.Client, error) {
-	if connection := mc.activeDemandConnection(session.ID); connection != nil {
-		return connection, nil
+func (mc *Client) openSessionConnection(ctx context.Context, id string, info mcp.Implementation) error {
+	if mc.activeDemandConnection(id) != nil {
+		return nil
 	}
 	d := &mc.demand
 	cfg := mc.GetConfig()
 	if cfg.ConnectionLifetime == config.KeepRunningShared || cfg.LaunchesHTTP() {
 		if !mc.coreClient.IsConnected() {
 			if err := mc.coreClient.Connect(ctx); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		d.shared = true
 		if cfg.ConnectionLifetime == config.KeepRunningShared {
-			return mc.coreClient, nil
+			return nil
 		}
 	}
-	connection, err := mc.NewSessionConnection(uuid.NewString(), session.ClientInfo)
+	connection, err := mc.NewSessionConnection(uuid.NewString(), info)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := connection.Connect(ctx); err != nil {
 		_ = connection.Disconnect()
-		return nil, err
+		return err
 	}
 	if d.sessions == nil {
 		d.sessions = make(map[string]*core.Client)
 	}
-	d.sessions[session.ID] = connection
-	return connection, nil
+	d.sessions[id] = connection
+	return nil
 }
 
 func (mc *Client) closeDemandSessionsLocked() {
@@ -183,22 +178,22 @@ func (mc *Client) closeDemandSessionsLocked() {
 }
 
 func (mc *Client) callDemandTool(ctx context.Context, name string, args map[string]interface{}, epoch *int64) (*mcp.CallToolResult, error) {
-	session, ok := ctx.Value(lifetimeSessionKey{}).(LifetimeSession)
-	if !ok || session.ID == "" {
+	id, _ := ctx.Value(lifetimeSessionKey{}).(string)
+	if id == "" {
 		return nil, fmt.Errorf("an active MCP session is required")
 	}
 	expected, certified := ctx.Value(expectedToolKey{}).(expectedTool)
 	if !certified || expected.hash == "" {
 		return nil, ErrConnectionGenerationChanged
 	}
-	connection, err := mc.demandConnection(ctx, session)
-	if err != nil {
-		return nil, err
-	}
 	d := &mc.demand
 	d.mu.RLock()
-	if mc.Retired() || !mc.IsConnected() || (epoch != nil && !mc.generationIs(*epoch)) ||
-		mc.activeDemandConnection(session.ID) != connection {
+	connection := mc.activeDemandConnection(id)
+	if connection == nil {
+		d.mu.RUnlock()
+		return nil, fmt.Errorf("upstream connection unavailable for this MCP session")
+	}
+	if mc.Retired() || !mc.IsConnected() || (epoch != nil && !mc.generationIs(*epoch)) {
 		d.mu.RUnlock()
 		return nil, ErrConnectionGenerationChanged
 	}
@@ -207,7 +202,7 @@ func (mc *Client) callDemandTool(ctx context.Context, name string, args map[stri
 	if err != nil {
 		d.mu.RUnlock()
 		if ctx.Err() == nil {
-			mc.dropDemandConnection(session.ID, connection)
+			mc.dropDemandConnection(id, connection)
 		}
 		return nil, err
 	}
@@ -225,24 +220,6 @@ func (mc *Client) callDemandTool(ctx context.Context, name string, args map[stri
 		}
 	}
 	return nil, ErrConnectionGenerationChanged
-}
-
-func (mc *Client) demandConnection(ctx context.Context, session LifetimeSession) (*core.Client, error) {
-	d := &mc.demand
-	d.mu.RLock()
-	connection := mc.activeDemandConnection(session.ID)
-	d.mu.RUnlock()
-	if connection != nil {
-		return connection, nil
-	}
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	defer d.updateIdle()
-	if mc.Retired() || !mc.IsConnected() || mc.IsUserLoggedOut() {
-		return nil, ErrInstanceRetired
-	}
-	return mc.ensureDemandConnection(ctx, session)
 }
 
 func (mc *Client) activeDemandConnection(id string) *core.Client {
