@@ -189,6 +189,10 @@
                   <template v-if="peers.hasPeers"><dt class="text-muted-foreground">Run on</dt>
                   <dd><HostSelect :model-value="server.host_id || ''" :disabled="actionLoading || kvPatchInFlight" @update:model-value="patchServerDiff({host_id:$event, available_to_peers:false}, 'Updated execution host')" /></dd></template>
                   <template v-if="!server.host_id && (peers.hasPeers || server.available_to_peers)"><dt class="text-muted-foreground"><label for="share-with-peers">Available to peers</label></dt><dd><Switch id="share-with-peers" :model-value="!!server.available_to_peers" :disabled="actionLoading || kvPatchInFlight" @update:model-value="patchServerDiff({available_to_peers:$event}, 'Updated peer access')" /></dd></template>
+                  <dt class="text-muted-foreground"><label for="expose-tools-directly">Expose tools directly</label></dt>
+                  <dd>
+                    <Switch id="expose-tools-directly" :model-value="!!server.expose_tools_directly" :disabled="actionLoading || kvPatchInFlight" @update:model-value="patchServerDiff({ expose_tools_directly: $event }, 'Updated tool exposure')" />
+                  </dd>
                   <dt class="text-muted-foreground">Protocol</dt>
                   <dd class="flex items-center gap-2">
                     <SquareTerminal v-if="server.protocol === 'stdio'" class="size-4" aria-hidden="true" />

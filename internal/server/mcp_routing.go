@@ -273,6 +273,17 @@ func renderFullDirectTool(entry *directCatalogEntry, description string) mcp.Too
 	}
 
 	mcpTool := mcp.NewTool(entry.DisplayName, opts...)
+	if entry.Title != "" {
+		mcpTool.Title = entry.Title
+	}
+
+	if len(entry.Meta) != 0 {
+		var meta mcp.Meta
+		if json.Unmarshal(entry.Meta, &meta) == nil {
+			delete(meta.AdditionalFields, directToolStampMetaKey)
+			mcpTool.Meta = &meta
+		}
+	}
 
 	if entry.ParamsJSON != "" {
 		var schema map[string]interface{}
@@ -928,6 +939,34 @@ func directCustomInstructions(cfg *config.Config) string {
 	return cfg.Instructions
 }
 
+// The retrieve and code execution surfaces keep their built-ins and apply
+// direct-tool access checks to the upstream registrations they also carry.
+func (p *MCPProxyServer) filterExposedTools(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
+	var upstream []mcp.Tool
+	builtins := make([]mcp.Tool, 0, len(tools))
+	for _, tool := range tools {
+		if stamp, ok := readDirectToolStamp(tool); ok {
+			if p.exposesToolsDirectly(stamp.owner) {
+				upstream = append(upstream, tool)
+			}
+		} else {
+			builtins = append(builtins, tool)
+		}
+	}
+	upstream = p.filterDirectModeToolsForAuth(ctx, upstream)
+	upstream = p.filterDirectToolsForAgentCallability(ctx, upstream)
+	return append(builtins, stripDirectToolStampFilter(ctx, upstream)...)
+}
+
+func (p *MCPProxyServer) exposesToolsDirectly(name string) bool {
+	for _, server := range p.currentConfig().Servers {
+		if server != nil && server.Name == name {
+			return server.ExposeToolsDirectly != nil && *server.ExposeToolsDirectly
+		}
+	}
+	return false
+}
+
 // initRoutingModeServers creates separate MCP server instances for each routing mode.
 // Each server instance has its own set of tools registered appropriate for that mode.
 // The main "server" field remains the retrieve_tools mode server (default).
@@ -999,6 +1038,7 @@ func (p *MCPProxyServer) initRoutingModeServers() {
 	// endpoint would get no instructions and would not learn that upstream
 	// tools sit behind retrieve_tools. defaultInstructions is routing-mode-aware.
 	sharedInstructions := mcpserver.WithInstructions(resolveInstructions(directCustomInstructions(p.config)))
+	opts = append(opts, mcpserver.WithToolFilter(p.filterExposedTools))
 
 	// Create code execution mode server
 	p.codeExecServer = mcpserver.NewMCPServer(
@@ -1012,23 +1052,6 @@ func (p *MCPProxyServer) initRoutingModeServers() {
 		mcpServerVersion(),
 		append(append([]mcpserver.ServerOption{}, opts...), sharedInstructions)...,
 	)
-
-	// Register tools for code execution mode (static tools that don't change)
-	codeExecTools := p.buildCodeExecModeTools()
-	for _, st := range codeExecTools {
-		p.codeExecServer.AddTool(st.Tool, st.Handler)
-	}
-	// Seed the content guard with what was just registered, so the first
-	// config.reloaded does not re-register (and notify every client about) an
-	// identical surface merely because the fingerprint started out empty.
-	p.codeExecSurfaceFP = toolSetFingerprint(codeExecTools)
-
-	// Register tools for call tool mode
-	callToolModeTools := p.buildCallToolModeTools()
-	for _, st := range callToolModeTools {
-		p.callToolServer.AddTool(st.Tool, st.Handler)
-	}
-	p.callToolSurfaceFP = toolSetFingerprint(callToolModeTools)
 
 	// Initial direct rebuild. Done by CALLING RefreshDirectModeTools so
 	// there is exactly ONE publisher and one copy of the SetTools-then-publish
@@ -1070,6 +1093,7 @@ func (p *MCPProxyServer) RefreshDirectModeTools() {
 // drift check and the rebuild that check authorizes.
 func (p *MCPProxyServer) refreshDirectModeToolsLocked() {
 	directTools, cat := p.buildDirectModeTools()
+	p.refreshExposedToolSurfaces(directTools, cat)
 
 	serverTools := make([]mcpserver.ServerTool, len(directTools))
 	copy(serverTools, directTools)
@@ -1127,40 +1151,41 @@ func (p *MCPProxyServer) refreshDirectModeToolsLocked() {
 		zap.Uint64("catalog_generation", cat.Generation()))
 }
 
-// RefreshCodeExecModeTools rebuilds the code execution mode server's tool catalog description.
-// Should be called when upstream servers change to update the available tools listing.
-func (p *MCPProxyServer) RefreshCodeExecModeTools() {
-	if p.codeExecServer == nil {
-		return
+func (p *MCPProxyServer) refreshExposedToolSurfaces(directTools []mcpserver.ServerTool, cat *directCatalog) {
+	var exposed []mcpserver.ServerTool
+	for _, registered := range directTools {
+		stamp, ok := readDirectToolStamp(registered.Tool)
+		if !ok || !p.exposesToolsDirectly(stamp.owner) {
+			continue
+		}
+		if cat.Mode() == config.DirectToolResponseModeDeferred {
+			entry, _ := cat.Lookup(registered.Tool.Name)
+			tool := renderFullDirectTool(entry, fmt.Sprintf("[%s] %s", entry.ServerName, entry.Description))
+			tool.Icons = registered.Tool.Icons
+			registered.Tool = stampDirectTool(tool, entry)
+		}
+		exposed = append(exposed, registered)
 	}
-
-	codeExecTools := p.buildCodeExecModeTools()
-	serverTools := make([]mcpserver.ServerTool, len(codeExecTools))
-	copy(serverTools, codeExecTools)
-
-	// This surface carries BUILT-INS ONLY — buildCodeExecModeTools never
-	// iterates upstreams — so an unguarded rebuild on every servers.changed
-	// would tell every client its tool list changed on each reconnect.
-	// Guarded on content rather than by dropping the servers.changed call, so
-	// this stays correct if the surface gains fleet-dependent content.
-	fp := toolSetFingerprint(serverTools)
-	p.codeExecRefreshMu.Lock()
-	defer p.codeExecRefreshMu.Unlock()
-	if p.codeExecSurfaceFP == fp {
-		p.logger.Debug("code execution mode tools unchanged; skipping rebuild",
-			zap.Int("tool_count", len(codeExecTools)))
-		return
+	for _, surface := range []struct {
+		server      *mcpserver.MCPServer
+		builtins    func() []mcpserver.ServerTool
+		fingerprint *string
+	}{
+		{p.callToolServer, p.buildCallToolModeTools, &p.callToolSurfaceFP},
+		{p.codeExecServer, p.buildCodeExecModeTools, &p.codeExecSurfaceFP},
+	} {
+		if surface.server == nil {
+			continue
+		}
+		tools := append(surface.builtins(), exposed...)
+		fp := toolSetFingerprint(tools)
+		if fp != *surface.fingerprint {
+			surface.server.SetTools(tools...)
+			*surface.fingerprint = fp
+		}
 	}
-
-	p.codeExecServer.SetTools(serverTools...)
-	p.codeExecSurfaceFP = fp
-
-	p.logger.Info("refreshed code execution mode tools",
-		zap.Int("tool_count", len(codeExecTools)))
 }
 
-// GetMCPServerForMode returns the MCP server instance for the given routing mode.
-// Falls back to the default retrieve_tools server for unknown modes.
 func (p *MCPProxyServer) GetMCPServerForMode(mode string) *mcpserver.MCPServer {
 	switch mode {
 	case config.RoutingModeDirect:

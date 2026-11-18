@@ -47,6 +47,7 @@ export interface Server {
  host_name?: string
  host_online?: boolean
  available_to_peers?: boolean
+  expose_tools_directly?: boolean
   icon_url?: string;
   icon_uploaded?: boolean;
   /** Optional note (up to 100 characters) shown to agents beside the server name. */

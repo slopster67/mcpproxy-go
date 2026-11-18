@@ -17,6 +17,10 @@ import (
 )
 
 // initialize performs MCP initialization handshake
+func proxyClientInfo() mcp.Implementation {
+	return mcp.Implementation{Name: "mcpproxy-go", Title: "MCPProxy", Version: "1.0.0"}
+}
+
 func (c *Client) initialize(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -27,10 +31,7 @@ func (c *Client) initialize(ctx context.Context) error {
 	// health probes stop proving liveness) and server-initiated requests are
 	// gone (so roots-based workspace discovery cannot work).
 	initRequest.Params.ProtocolVersion = mcp.LATEST_LEGACY_PROTOCOL_VERSION
-	initRequest.Params.ClientInfo = mcp.Implementation{
-		Name:    "mcpproxy-go",
-		Version: "1.0.0",
-	}
+	initRequest.Params.ClientInfo = proxyClientInfo()
 	initRequest.Params.Capabilities = mcp.ClientCapabilities{}
 
 	// Log request for trace debugging - use main logger for CLI debug mode

@@ -312,6 +312,7 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 			ServerName:       c.config.Name,
 			Name:             tool.Name,
 			RawName:          tool.Name,
+			Title:            tool.Title,
 			Description:      tool.Description,
 			ParamsJSON:       paramsJSON,
 			OutputSchemaJSON: outputSchemaJSON,
@@ -335,6 +336,9 @@ func (c *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error) 
 		}
 
 		toolMeta.Annotations = toolAnnotationsFromWire(tool.Annotations)
+		if tool.Meta != nil {
+			toolMeta.Meta, _ = json.Marshal(tool.Meta)
+		}
 
 		// Compute hash for tool change detection.
 		// Hash is based on serverName + toolName + description + inputSchema + outputSchema.

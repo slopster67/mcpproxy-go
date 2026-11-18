@@ -339,6 +339,8 @@ type ServerConfig struct {
 	OAuth            *OAuthConfig      `json:"oauth,omitempty"`   // OAuth mode and overrides of discovered values
 	Enabled          bool              `json:"enabled"`
 
+	ExposeToolsDirectly *bool `json:"expose_tools_directly,omitempty"`
+
 	TrustMode string    `json:"trust_mode,omitempty"` // auto approves tools; manual requires review
 	Created   time.Time `json:"created"`
 	Updated   time.Time `json:"updated,omitempty"`
@@ -458,6 +460,8 @@ type ToolMetadata struct {
 	// records, index docIDs — so "ns:erase" never collapses to "erase". Empty
 	// on metadata built outside discovery; RawToolName derives it from Name.
 	RawName          string           `json:"raw_name,omitempty"`
+	Title            string           `json:"title,omitempty"`
+	Meta             json.RawMessage  `json:"_meta,omitempty"`
 	Description      string           `json:"description"`
 	ParamsJSON       string           `json:"params_json"`
 	OutputSchemaJSON string           `json:"output_schema_json,omitempty"` // declared output schema, raw JSON bytes

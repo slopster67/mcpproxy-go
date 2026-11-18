@@ -148,18 +148,12 @@ type MCPProxyServer struct {
 	// surface, so a rebuild that would change nothing can be skipped instead of
 	// notifying every client. See mcp_surface_fingerprint.go.
 	//
-	// The direct pair is guarded by directRefreshMu, which every caller of
-	// refreshDirectModeToolsLocked already holds; the code-exec and call-tool
-	// surfaces have their own mutexes.
+	// All surface fingerprints are guarded by directRefreshMu.
 	directSurfaceToolsFP   string
 	directSurfaceRoutingFP string
 
-	codeExecRefreshMu sync.Mutex
 	codeExecSurfaceFP string
 
-	// The call-tool surface is rebuilt on every config.reloaded; the
-	// fingerprint keeps an unrelated edit from telling every client the tool
-	// set changed.
 	callToolSurfaceFP string
 
 	directCatalogGeneration atomic.Uint64

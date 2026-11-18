@@ -275,7 +275,6 @@ func (s *Server) listenForRoutingModeRefresh() {
 			s.warmProfileIndex()
 			if s.mcpProxy != nil {
 				s.mcpProxy.RefreshDirectModeTools()
-				s.mcpProxy.RefreshCodeExecModeTools()
 				// retrieve_tools' description names the reachable servers;
 				// re-list clients when that set changes.
 				s.mcpProxy.NotifyUpstreamInventoryChanged()
@@ -496,6 +495,10 @@ func (s *Server) AddServer(ctx context.Context, serverConfig *config.ServerConfi
 // non-zero/non-nil fields of updates, plus Enabled (resolved against the
 // existing server by the REST handler). It is the field logic UpdateServer and PatchServer share.
 func applyServerUpdates(existing, updates *config.ServerConfig) {
+	if updates.ExposeToolsDirectly != nil {
+		expose := *updates.ExposeToolsDirectly
+		existing.ExposeToolsDirectly = &expose
+	}
 	if updates.HostID != nil {
 		host := *updates.HostID
 		existing.HostID = &host

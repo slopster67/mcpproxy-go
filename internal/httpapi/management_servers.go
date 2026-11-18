@@ -67,7 +67,7 @@ func (s *Server) prepareServerCreate(req AddServerRequest, masked bool) (*config
 		return nil, &requestError{400, "Unknown execution host"}
 	}
 	serverConfig := &config.ServerConfig{
-		HostID: req.HostID, AvailableToPeers: req.AvailableToPeers,
+		HostID: req.HostID, AvailableToPeers: req.AvailableToPeers, ExposeToolsDirectly: req.ExposeToolsDirectly,
 		Name:        req.Name,
 		Icon:        req.Icon,
 		Description: description,
