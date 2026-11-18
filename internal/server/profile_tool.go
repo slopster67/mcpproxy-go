@@ -75,6 +75,7 @@ func (p *MCPProxyServer) handleSetProfile(ctx context.Context, request mcp.CallT
 	}
 
 	p.sessionStore.SetActiveProfile(sessionID, slug)
+	p.signalUpstreamLifetime()
 
 	if slug != "" {
 		p.logger.Info("set_profile: session profile updated",

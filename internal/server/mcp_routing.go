@@ -273,9 +273,7 @@ func renderFullDirectTool(entry *directCatalogEntry, description string) mcp.Too
 	}
 
 	mcpTool := mcp.NewTool(entry.DisplayName, opts...)
-	if entry.Title != "" {
-		mcpTool.Title = entry.Title
-	}
+	mcpTool.Title = entry.Title
 
 	if len(entry.Meta) != 0 {
 		var meta mcp.Meta
@@ -953,11 +951,12 @@ func directCustomInstructions(cfg *config.Config) string {
 // The retrieve and code execution surfaces keep their built-ins and apply
 // direct-tool access checks to the upstream registrations they also carry.
 func (p *MCPProxyServer) filterExposedTools(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
+	index := p.profileIndexCurrent(ctx)
 	var upstream []mcp.Tool
 	builtins := make([]mcp.Tool, 0, len(tools))
 	for _, tool := range tools {
 		if stamp, ok := readDirectToolStamp(tool); ok {
-			if p.exposesToolsDirectly(stamp.owner) {
+			if index.exposesToolsDirectly(stamp.owner) {
 				upstream = append(upstream, tool)
 			}
 		} else {
@@ -969,13 +968,12 @@ func (p *MCPProxyServer) filterExposedTools(ctx context.Context, tools []mcp.Too
 	return append(builtins, stripDirectToolStampFilter(ctx, upstream)...)
 }
 
-func (p *MCPProxyServer) exposesToolsDirectly(name string) bool {
-	for _, server := range p.currentConfig().Servers {
-		if server != nil && server.Name == name {
-			return server.ExposeToolsDirectly != nil && *server.ExposeToolsDirectly
-		}
+func (index *profileIndex) exposesToolsDirectly(name string) bool {
+	if index == nil {
+		return false
 	}
-	return false
+	position, ok := index.serverPos[name]
+	return ok && index.cfg.Servers[position].ExposeToolsDirectly != nil && *index.cfg.Servers[position].ExposeToolsDirectly
 }
 
 // initRoutingModeServers creates separate MCP server instances for each routing mode.
@@ -1163,10 +1161,11 @@ func (p *MCPProxyServer) refreshDirectModeToolsLocked() {
 }
 
 func (p *MCPProxyServer) refreshExposedToolSurfaces(directTools []mcpserver.ServerTool, cat *directCatalog) {
+	index := p.profileIndexFor(p.currentConfig())
 	var exposed []mcpserver.ServerTool
 	for _, registered := range directTools {
 		stamp, ok := readDirectToolStamp(registered.Tool)
-		if !ok || !p.exposesToolsDirectly(stamp.owner) {
+		if !ok || !index.exposesToolsDirectly(stamp.owner) {
 			continue
 		}
 		if cat.Mode() == config.DirectToolResponseModeDeferred {

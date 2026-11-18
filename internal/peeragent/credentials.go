@@ -81,7 +81,6 @@ func (a *Agent) configure(ctx context.Context, desired peering.Connection) (*man
 	cfg := config.CopyServerConfig(desired.Config)
 	cfg.HostID = nil
 	cfg.AvailableToPeers = nil
-	cfg.ConnectionLifetime = ""
 	a.mu.Lock()
 	current, previous, token := a.servers[name], a.settings[name], a.tokens[name]
 	version := a.versions[name]
@@ -111,7 +110,10 @@ func (a *Agent) configure(ctx context.Context, desired peering.Connection) (*man
 	}
 	a.refresh.OnTokenCleared(name)
 	resolver := secret.ExecutionResolver(desired.Secrets)
-	instance, err := managed.NewClientAt(name, cfg, desired.Generation, a.logger, a.global.Logging, a.global, token, resolver)
+	// The primary owns the lifetime policy. The peer connects this transport on command.
+	executionConfig := *cfg
+	executionConfig.ConnectionLifetime = ""
+	instance, err := managed.NewClientAt(name, &executionConfig, desired.Generation, a.logger, a.global.Logging, a.global, token, resolver)
 	if err != nil {
 		return nil, err
 	}

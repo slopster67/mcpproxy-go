@@ -306,22 +306,12 @@ func NewClientAt(id string, serverConfig *config.ServerConfig, gen int64, logger
 
 	// Wire up core notification callback to forward to discovery callback
 	coreClient.SetOnToolsChangedCallback(func(serverName string) {
-		mc.mu.RLock()
-		callback := mc.toolDiscoveryCallback
-		mc.mu.RUnlock()
-
-		if callback == nil {
-			mc.logger.Debug("No tool discovery callback set - notification ignored",
-				zap.String("server", serverName))
-			return
-		}
-
-		// Run discovery in a goroutine with timeout to avoid blocking the notification handler
 		go func() {
-			if mc.GetConfig().OnDemand() {
-				mc.demand.mu.Lock()
-				mc.demand.probedAt = time.Time{}
-				mc.demand.mu.Unlock()
+			mc.mu.RLock()
+			callback := mc.toolDiscoveryCallback
+			mc.mu.RUnlock()
+			if callback == nil {
+				return
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -443,7 +433,9 @@ func (mc *Client) Connect(ctx context.Context) error {
 	}()
 
 	if serverConfig.OnDemand() {
-		mc.closeDemandSessions()
+		mc.demand.mu.Lock()
+		mc.closeDemandSessionsLocked()
+		mc.demand.mu.Unlock()
 	}
 
 	// Phase 3: Execute the actual connection (potentially slow - OAuth, MCP initialize)
@@ -637,9 +629,6 @@ func (mc *Client) Connect(ctx context.Context) error {
 
 // Disconnect closes the connection and stops monitoring
 func (mc *Client) Disconnect() error {
-	if mc.GetConfig().OnDemand() {
-		mc.closeDemandSessions()
-	}
 	mc.cancelInFlightListTools()
 	mc.cancelInFlightConnect()
 
@@ -663,6 +652,13 @@ func (mc *Client) Disconnect() error {
 	// Stop background monitoring
 	mc.stopBackgroundMonitoring()
 
+	// Hold the lifetime lock through the state reset so reconciliation cannot
+	// open a replacement connection halfway through teardown.
+	if mc.GetConfig().OnDemand() {
+		mc.demand.mu.Lock()
+		defer mc.demand.mu.Unlock()
+		mc.closeDemandSessionsLocked()
+	}
 	if err := mc.coreClient.Disconnect(); err != nil {
 		mc.logger.Error("Core client disconnect failed", zap.Error(err))
 	}

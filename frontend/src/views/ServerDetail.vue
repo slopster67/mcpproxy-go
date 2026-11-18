@@ -590,10 +590,10 @@ const error = computed<string | null>(() => {
   return server.value ? null : `Server "${props.serverName}" not found`;
 });
 watch(
-  () => [server.value?.connected, server.value?.connecting, server.value?.last_error],
+  () => [server.value?.status, server.value?.connected, server.value?.connecting, server.value?.last_error],
   () => {
     if (restartingServer.value !== server.value?.name) return;
-    if (server.value.connected) {
+    if (server.value.connected || server.value.status === "idle") {
       restartingServer.value = "";
       systemStore.addToast({ type: "success", title: "Server restarted", message: "" });
     } else if (!server.value.connecting && server.value.last_error) {
@@ -741,7 +741,7 @@ async function restartServer() {
   actionLoading.value = true;
   try {
     const restarted = await serversStore.restart(server.value.name);
-    if (restarted.connected) {
+    if (restarted.connected || restarted.status === "idle") {
       systemStore.addToast({ type: "success", title: "Server restarted", message: "" });
     } else if (!restarted.connecting && restarted.last_error) {
       systemStore.addToast({ type: "error", title: "Restart failed", message: restarted.last_error });

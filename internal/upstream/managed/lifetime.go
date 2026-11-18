@@ -21,7 +21,6 @@ type demandConnections struct {
 	idle         atomic.Bool
 	reportedIdle atomic.Bool
 	usesOAuth    atomic.Bool
-	discovered   bool
 	sessions     map[string]*core.Client
 	shared       bool
 	tools        []*config.ToolMetadata
@@ -61,7 +60,7 @@ func (mc *Client) IdleChanged() bool {
 }
 
 func (d *demandConnections) updateIdle() {
-	d.idle.Store(d.discovered && !d.shared && len(d.sessions) == 0)
+	d.idle.Store(!d.probedAt.IsZero() && !d.shared && len(d.sessions) == 0)
 }
 
 func (mc *Client) demandProbeDue() bool {
@@ -77,6 +76,9 @@ func (mc *Client) listDemandTools(ctx context.Context) ([]*config.ToolMetadata, 
 	defer d.mu.Unlock()
 	defer d.updateIdle()
 
+	if !mc.IsConnected() || mc.Retired() {
+		return nil, ErrConnectionGenerationChanged
+	}
 	if time.Since(d.probedAt) < demandProbeInterval {
 		return d.tools, nil
 	}
@@ -93,17 +95,16 @@ func (mc *Client) listDemandTools(ctx context.Context) ([]*config.ToolMetadata, 
 		return nil, err
 	}
 	d.tools = tools
-	d.discovered = true
 	d.usesOAuth.Store(mc.coreClient.AuthStrategy() == core.AuthStrategyOAuth)
 	d.probedAt = time.Now()
 	return tools, nil
 }
 
 // SyncLifetimeSessions keeps only the connections with an eligible live
-// downstream session. A call holds a read lock until its upstream reply.
+// downstream session.
 func (mc *Client) SyncLifetimeSessions(ctx context.Context, sessions map[string]mcp.Implementation) {
 	cfg := mc.GetConfig()
-	if !cfg.OnDemand() || !mc.IsConnected() || mc.Retired() {
+	if !cfg.OnDemand() {
 		return
 	}
 	d := &mc.demand
@@ -114,37 +115,44 @@ func (mc *Client) SyncLifetimeSessions(ctx context.Context, sessions map[string]
 	if !mc.IsConnected() || mc.Retired() || mc.IsUserLoggedOut() {
 		return
 	}
-	perSession := cfg.ConnectionLifetime == config.KeepRunningPerSession
 	for id, connection := range d.sessions {
 		if _, keep := sessions[id]; !keep {
 			delete(d.sessions, id)
 			_ = connection.Disconnect()
 		}
 	}
-	if !perSession || cfg.LaunchesHTTP() {
-		if len(sessions) != 0 {
-			if err := mc.openSharedDemandConnection(ctx); err != nil {
-				return
-			}
-		} else if d.shared {
-			d.shared = false
-			_ = mc.coreClient.Disconnect()
-		}
-	}
-	if !perSession {
-		return
+	if len(sessions) == 0 && d.shared {
+		d.shared = false
+		_ = mc.coreClient.Disconnect()
 	}
 	for id, info := range sessions {
-		if d.sessions[id] == nil && ctx.Err() == nil {
-			_, _ = mc.openDemandSession(ctx, LifetimeSession{id, info})
+		if ctx.Err() != nil {
+			return
+		}
+		_, _ = mc.ensureDemandConnection(ctx, LifetimeSession{id, info})
+		if cfg.ConnectionLifetime == config.KeepRunningShared {
+			return
 		}
 	}
 }
 
-func (mc *Client) openDemandSession(ctx context.Context, session LifetimeSession) (*core.Client, error) {
-	d := &mc.demand
-	if connection := d.sessions[session.ID]; connection != nil {
+// Caller holds demand.mu. HTTP launchers own one listening port across sessions.
+func (mc *Client) ensureDemandConnection(ctx context.Context, session LifetimeSession) (*core.Client, error) {
+	if connection := mc.activeDemandConnection(session.ID); connection != nil {
 		return connection, nil
+	}
+	d := &mc.demand
+	cfg := mc.GetConfig()
+	if cfg.ConnectionLifetime == config.KeepRunningShared || cfg.LaunchesHTTP() {
+		if !mc.coreClient.IsConnected() {
+			if err := mc.coreClient.Connect(ctx); err != nil {
+				return nil, err
+			}
+		}
+		d.shared = true
+		if cfg.ConnectionLifetime == config.KeepRunningShared {
+			return mc.coreClient, nil
+		}
 	}
 	connection, err := mc.NewSessionConnection(uuid.NewString(), session.ClientInfo)
 	if err != nil {
@@ -161,10 +169,8 @@ func (mc *Client) openDemandSession(ctx context.Context, session LifetimeSession
 	return connection, nil
 }
 
-func (mc *Client) closeDemandSessions() {
+func (mc *Client) closeDemandSessionsLocked() {
 	d := &mc.demand
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	defer d.updateIdle()
 	for _, connection := range d.sessions {
 		_ = connection.Disconnect()
@@ -172,7 +178,6 @@ func (mc *Client) closeDemandSessions() {
 	d.sessions = nil
 	d.shared = false
 	d.tools = nil
-	d.discovered = false
 	d.usesOAuth.Store(false)
 	d.probedAt = time.Time{}
 }
@@ -198,8 +203,6 @@ func (mc *Client) callDemandTool(ctx context.Context, name string, args map[stri
 		return nil, ErrConnectionGenerationChanged
 	}
 
-	// The independently initialized transport may expose a different tool set.
-	// Validate its definition against the catalog identity authorized for this call.
 	tools, err := connection.ListTools(ctx)
 	if err != nil {
 		d.mu.RUnlock()
@@ -208,7 +211,13 @@ func (mc *Client) callDemandTool(ctx context.Context, name string, args map[stri
 		}
 		return nil, err
 	}
-	defer d.mu.RUnlock()
+	// A shared core can reconnect in place. A dedicated client is never
+	// reused, so its tool call need not delay another session's disconnect.
+	if connection == mc.coreClient {
+		defer d.mu.RUnlock()
+	} else {
+		d.mu.RUnlock()
+	}
 	for _, actual := range tools {
 		if config.RawToolName(actual) == name && actual.Hash == expected.hash &&
 			reflect.DeepEqual(actual.Annotations, expected.annotations) {
@@ -233,16 +242,7 @@ func (mc *Client) demandConnection(ctx context.Context, session LifetimeSession)
 	if mc.Retired() || !mc.IsConnected() || mc.IsUserLoggedOut() {
 		return nil, ErrInstanceRetired
 	}
-	cfg := mc.GetConfig()
-	if cfg.ConnectionLifetime != config.KeepRunningPerSession || cfg.LaunchesHTTP() {
-		if err := mc.openSharedDemandConnection(ctx); err != nil {
-			return nil, err
-		}
-	}
-	if cfg.ConnectionLifetime == config.KeepRunningPerSession {
-		return mc.openDemandSession(ctx, session)
-	}
-	return mc.coreClient, nil
+	return mc.ensureDemandConnection(ctx, session)
 }
 
 func (mc *Client) activeDemandConnection(id string) *core.Client {
@@ -252,16 +252,6 @@ func (mc *Client) activeDemandConnection(id string) *core.Client {
 	if mc.demand.shared {
 		return mc.coreClient
 	}
-	return nil
-}
-
-func (mc *Client) openSharedDemandConnection(ctx context.Context) error {
-	if !mc.coreClient.IsConnected() {
-		if err := mc.coreClient.Connect(ctx); err != nil {
-			return err
-		}
-	}
-	mc.demand.shared = true
 	return nil
 }
 

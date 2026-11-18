@@ -17,103 +17,71 @@ const upstreamSessionIdle = 30 * time.Minute
 
 type lifetimeCredentialKey struct{}
 
-type upstreamClientSession struct {
-	session        mcpserver.ClientSession
-	credentialHash string
-	lastActivity   time.Time
-	inFlight       int
-}
-
-type upstreamLifetime struct {
-	mu       sync.Mutex
-	sessions map[string]upstreamClientSession
-	wake     chan struct{}
-}
-
-func (p *MCPProxyServer) touchUpstreamSession(ctx context.Context, session mcpserver.ClientSession) {
-	hash, _ := ctx.Value(lifetimeCredentialKey{}).(string)
-	caller := auth.AuthContextFromContext(ctx)
-	info := p.sessionStore.GetSession(session.SessionID())
-	if hash == "" || caller == nil || info == nil || info.ClientID != caller.ClientID {
-		return
-	}
-	l := &p.upstreamLifetime
-	l.mu.Lock()
-	entry := l.sessions[session.SessionID()]
-	entry.session, entry.credentialHash, entry.lastActivity = session, hash, time.Now()
-	l.sessions[session.SessionID()] = entry
-	l.mu.Unlock()
-	l.signal()
-}
-
-func (l *upstreamLifetime) signal() {
+func (p *MCPProxyServer) signalUpstreamLifetime() {
 	select {
-	case l.wake <- struct{}{}:
+	case p.lifetimeWake <- struct{}{}:
 	default:
 	}
 }
 
 func (p *MCPProxyServer) trackUpstreamRequest(ctx context.Context, next http.Handler, w http.ResponseWriter, r *http.Request, credential *auth.ClientCredential) {
+	ctx = context.WithValue(ctx, lifetimeCredentialKey{}, credential.TokenHash)
 	id := r.Header.Get(mcpserver.HeaderKeySessionID)
-	info := p.sessionStore.GetSession(id)
-	if info != nil && info.ClientID == credential.ClientID {
-		ctx = managed.WithLifetimeSession(ctx, managed.LifetimeSession{ID: id, ClientInfo: mcp.Implementation{
-			Name: info.ClientName, Version: info.ClientVersion, Title: credential.DisplayName,
-		}})
-		l := &p.upstreamLifetime
-		switch r.Method {
-		case http.MethodDelete:
-			response := &sessionDeleteResponse{ResponseWriter: w}
-			next.ServeHTTP(response, r.WithContext(ctx))
-			if response.status >= 200 && response.status < 300 {
-				l.mu.Lock()
-				delete(l.sessions, id)
-				l.mu.Unlock()
-				l.signal()
-			}
-			return
-		case http.MethodPost:
-			l.mu.Lock()
-			entry, ok := l.sessions[id]
-			if ok {
-				entry.inFlight++
-				l.sessions[id] = entry
-			}
-			l.mu.Unlock()
-			defer func() {
-				l.mu.Lock()
-				if entry, exists := l.sessions[id]; exists {
-					entry.inFlight = max(0, entry.inFlight-1)
-					entry.lastActivity = time.Now()
-					l.sessions[id] = entry
-				}
-				l.mu.Unlock()
-				l.signal()
-			}()
-		}
+	store := p.sessionStore
+	store.mu.Lock()
+	session := store.sessions[id]
+	if session == nil {
+		store.mu.Unlock()
+		next.ServeHTTP(w, r.WithContext(ctx))
+		return
 	}
-	next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, lifetimeCredentialKey{}, credential.TokenHash)))
-}
-
-type sessionDeleteResponse struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *sessionDeleteResponse) WriteHeader(status int) {
-	w.status = status
-	w.ResponseWriter.WriteHeader(status)
+	if session.ClientID != credential.ClientID || session.credentialHash == "" {
+		store.mu.Unlock()
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+	if session.credentialHash != credential.TokenHash {
+		session.credentialHash = credential.TokenHash
+		p.signalUpstreamLifetime()
+	}
+	ctx = managed.WithLifetimeSession(ctx, managed.LifetimeSession{ID: id, ClientInfo: mcp.Implementation{
+		Name: session.ClientName, Version: session.ClientVersion, Title: credential.DisplayName,
+	}})
+	if r.Method == http.MethodPost {
+		if session.inFlight == 0 && time.Since(session.lastActivity) >= upstreamSessionIdle {
+			p.signalUpstreamLifetime()
+		}
+		session.inFlight++
+		defer func() {
+			store.mu.Lock()
+			session.inFlight--
+			session.lastActivity = time.Now()
+			store.mu.Unlock()
+		}()
+	}
+	store.mu.Unlock()
+	if r.Method == http.MethodDelete {
+		response := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(response, r.WithContext(ctx))
+		if response.statusCode >= 200 && response.statusCode < 300 {
+			store.mu.Lock()
+			session.credentialHash = ""
+			store.mu.Unlock()
+			p.signalUpstreamLifetime()
+		}
+		return
+	}
+	next.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func (p *MCPProxyServer) runUpstreamLifetime(ctx context.Context) {
-	l := &p.upstreamLifetime
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-l.wake:
+		case <-p.lifetimeWake:
 		case <-ticker.C:
 		}
 		p.syncUpstreamLifetime(ctx)
@@ -121,18 +89,6 @@ func (p *MCPProxyServer) runUpstreamLifetime(ctx context.Context) {
 }
 
 func (p *MCPProxyServer) syncUpstreamLifetime(ctx context.Context) {
-	l := &p.upstreamLifetime
-	l.mu.Lock()
-	sessions := make([]upstreamClientSession, 0, len(l.sessions))
-	for id, session := range l.sessions {
-		if session.inFlight == 0 && time.Since(session.lastActivity) >= upstreamSessionIdle {
-			delete(l.sessions, id)
-		} else {
-			sessions = append(sessions, session)
-		}
-	}
-	l.mu.Unlock()
-
 	cfg := p.currentConfig()
 	var servers []string
 	for _, server := range cfg.Servers {
@@ -145,20 +101,24 @@ func (p *MCPProxyServer) syncUpstreamLifetime(ctx context.Context) {
 	}
 	desired := make(map[string]map[string]mcp.Implementation)
 	index := p.profileIndexFor(cfg)
+	store := p.sessionStore
+	store.mu.RLock()
+	var sessions []SessionInfo
+	for _, session := range store.sessions {
+		if session.credentialHash != "" && (session.inFlight > 0 || time.Since(session.lastActivity) < upstreamSessionIdle) {
+			sessions = append(sessions, *session)
+		}
+	}
+	store.mu.RUnlock()
 	for _, session := range sessions {
 		record, err := p.storage.GetClientCredentialByHash(session.credentialHash)
 		if err != nil || record == nil {
 			continue
 		}
-		id := session.session.SessionID()
-		info := p.sessionStore.GetSession(id)
-		if info == nil {
-			continue
-		}
 		caller := record.AuthContext()
 		caller.ServerAvailable = func(name string) bool { return p.hostAllows(caller, name) }
-		callerCtx := p.server.WithContext(auth.WithAuthContext(ctx, caller), session.session)
-		scope := p.resolveProfileV3(callerCtx, index).Scope
+		callerCtx := auth.WithAuthContext(ctx, caller)
+		scope := p.resolveSessionProfile(callerCtx, index, session.SessionID).Scope
 		for _, name := range servers {
 			if !directScopeAllows(caller, scope, name) {
 				continue
@@ -166,7 +126,7 @@ func (p *MCPProxyServer) syncUpstreamLifetime(ctx context.Context) {
 			if desired[name] == nil {
 				desired[name] = make(map[string]mcp.Implementation)
 			}
-			desired[name][id] = mcp.Implementation{Name: info.ClientName, Title: record.DisplayName, Version: info.ClientVersion}
+			desired[name][session.SessionID] = mcp.Implementation{Name: session.ClientName, Title: record.DisplayName, Version: session.ClientVersion}
 		}
 	}
 

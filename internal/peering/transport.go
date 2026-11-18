@@ -82,7 +82,7 @@ func (t *Transport) SendNotification(ctx context.Context, notification mcp.JSONR
 	if notification.Method == "notifications/initialized" {
 		return nil
 	}
-	return t.executor.Call(ctx, t.cfg.ExecutionHost(), "notify", t.cfg.Name, notification, nil)
+	return t.executor.Call(ctx, t.cfg.ExecutionHost(), "notify", t.cfg.Name, Notification{Session: t.session, Notification: notification}, nil)
 }
 func (t *Transport) SetNotificationHandler(fn func(mcp.JSONRPCNotification)) {
 	t.mu.Lock()

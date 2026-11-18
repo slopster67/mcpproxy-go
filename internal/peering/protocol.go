@@ -68,6 +68,11 @@ type RPC struct {
 	Request sdktransport.JSONRPCRequest `json:"request"`
 }
 
+type Notification struct {
+	Session      string                  `json:"session,omitempty"`
+	Notification mcp.JSONRPCNotification `json:"notification"`
+}
+
 type Connection struct {
 	Session    string                       `json:"session,omitempty"`
 	ClientInfo *mcp.Implementation          `json:"client_info,omitempty"`

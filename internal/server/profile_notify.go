@@ -24,7 +24,7 @@ func (p *MCPProxyServer) NotifyBindingChanged(tokenName string) {
 		p.sessionStore.SetActiveProfile(target.ID, "")
 		p.sendToolsListChanged(target)
 	}
-	p.upstreamLifetime.signal()
+	p.signalUpstreamLifetime()
 }
 
 // sendToolsListChanged pushes tools/list_changed to one session on its

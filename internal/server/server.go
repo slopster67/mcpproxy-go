@@ -275,7 +275,7 @@ func (s *Server) listenForRoutingModeRefresh() {
 			}
 			s.warmProfileIndex()
 			if s.mcpProxy != nil {
-				s.mcpProxy.upstreamLifetime.signal()
+				s.mcpProxy.signalUpstreamLifetime()
 				s.mcpProxy.RefreshDirectModeTools()
 				// retrieve_tools' description names the reachable servers;
 				// re-list clients when that set changes.

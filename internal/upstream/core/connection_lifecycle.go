@@ -16,16 +16,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// initialize performs MCP initialization handshake
-func proxyClientInfo() mcp.Implementation {
-	return mcp.Implementation{Name: "mcpproxy-go", Title: "MCPProxy", Version: "1.0.0"}
-}
-
 func (c *Client) implementation() mcp.Implementation {
 	if c.clientInfo.Name != "" {
 		return c.clientInfo
 	}
-	return proxyClientInfo()
+	return mcp.Implementation{Name: "mcpproxy-go", Title: "MCPProxy", Version: "1.0.0"}
 }
 
 func (c *Client) NewSessionConnection(id string, info mcp.Implementation) (*Client, error) {

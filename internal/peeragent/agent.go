@@ -57,7 +57,7 @@ type Agent struct {
 	entryContext context.Context
 	mu           sync.Mutex
 	servers      map[string]*managed.Client
-	sessions     map[string]peerSession
+	sessions     map[peerSession]*core.Client
 	settings     map[string]*config.ServerConfig
 	calls        map[string]context.CancelFunc
 	locks        map[string]*sync.Mutex
@@ -91,7 +91,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *zap.Logger) error {
 	transport.ResponseHeaderTimeout = 15 * time.Second
 	controlClient := &http.Client{Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	defer controlClient.CloseIdleConnections()
-	a := &Agent{versions: map[string]int64{}, assigned: map[string]bool{}, cfg: cfg, url: remote, client: controlClient, logger: logger, tokens: map[string]*storage.MemoryOAuth{}, resolvers: map[string]*secret.Resolver{}, secrets: map[string]map[string]string{}, processID: uuid.NewString(), global: global, servers: map[string]*managed.Client{}, sessions: map[string]peerSession{}, settings: map[string]*config.ServerConfig{}, calls: map[string]context.CancelFunc{}, locks: map[string]*sync.Mutex{}, credChanged: make(chan struct{}, 1), signins: map[string]signin{}}
+	a := &Agent{versions: map[string]int64{}, assigned: map[string]bool{}, cfg: cfg, url: remote, client: controlClient, logger: logger, tokens: map[string]*storage.MemoryOAuth{}, resolvers: map[string]*secret.Resolver{}, secrets: map[string]map[string]string{}, processID: uuid.NewString(), global: global, servers: map[string]*managed.Client{}, sessions: map[peerSession]*core.Client{}, settings: map[string]*config.ServerConfig{}, calls: map[string]context.CancelFunc{}, locks: map[string]*sync.Mutex{}, credChanged: make(chan struct{}, 1), signins: map[string]signin{}}
 	a.loadCredential()
 	a.refresh = oauth.NewRefreshManager(a, oauth.GetGlobalCoordinator(), logger)
 	a.refresh.SetRuntime(a)
@@ -331,6 +331,12 @@ func (a *Agent) control(parent context.Context) error {
 		a.mu.Unlock()
 		workers.Wait()
 		a.closePeerSessions(nil)
+		// Losing the primary also ends the lease on shared on-demand transports.
+		for name, instance := range a.servers {
+			if a.settings[name].OnDemand() {
+				_ = instance.Disconnect()
+			}
+		}
 	}()
 	scanner := bufio.NewScanner(response.Body)
 	scanner.Buffer(make([]byte, 4096), peering.MaxMessage)
@@ -548,11 +554,18 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 			return nil, instance.Disconnect()
 		}
 		if f.Op == "notify" {
-			var notification mcp.JSONRPCNotification
-			if err := json.Unmarshal(f.Data, &notification); err != nil {
+			var payload peering.Notification
+			if err := json.Unmarshal(f.Data, &payload); err != nil {
 				return nil, err
 			}
-			return nil, instance.PeerNotify(ctx, notification)
+			if payload.Session != "" {
+				session := a.getPeerSession(payload.Session, instance)
+				if session == nil {
+					return nil, fmt.Errorf("upstream session is closed")
+				}
+				return nil, session.PeerNotify(ctx, payload.Notification)
+			}
+			return nil, instance.PeerNotify(ctx, payload.Notification)
 		}
 		var payload peering.RPC
 		if err := json.Unmarshal(f.Data, &payload); err != nil {

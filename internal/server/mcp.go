@@ -160,8 +160,8 @@ type MCPProxyServer struct {
 
 	// directRefreshMu serializes whole rebuilds so SetTools and the matching
 	// publishDirectCatalog cannot interleave with another rebuild's pair.
-	directRefreshMu  sync.Mutex
-	upstreamLifetime upstreamLifetime
+	directRefreshMu sync.Mutex
+	lifetimeWake    chan struct{}
 }
 
 // NewMCPProxyServer creates a new MCP proxy server
@@ -222,11 +222,6 @@ func NewMCPProxyServer(
 			return
 		}
 		sessionStore.UpdateActivity(session.SessionID())
-		if method != mcp.MethodInitialize {
-			if proxy := proxyRef.Load(); proxy != nil {
-				proxy.touchUpstreamSession(ctx, session)
-			}
-		}
 
 		// Ask the client which project it is working in — once, lazily,
 		// on the first real request after the handshake.
@@ -298,20 +293,18 @@ func NewMCPProxyServer(
 			}
 		}
 
-		// Store/update session information with capabilities
-		sessionStore.SetSession(sessionID, clientName, clientVersion, hasRoots, hasSampling, experimental)
-
-		// Record which credential authenticated
-		// this session and which server instance serves it, so a binding
-		// change can find the session and notify it on the right instance.
-		// The credential never changes mid-connection, so this is once.
-		if ac := auth.AuthContextFromContext(ctx); ac != nil && ac.AgentName != "" {
-			sessionStore.SetSessionIdentity(sessionID, ac.AgentName, ac.ClientID)
-			sessionStore.SetSessionTokenPrefix(sessionID, ac.TokenPrefix)
+		credentialHash, _ := ctx.Value(lifetimeCredentialKey{}).(string)
+		info := &SessionInfo{
+			SessionID: sessionID, ClientName: clientName, ClientVersion: clientVersion,
+			hasRoots: hasRoots, hasSampling: hasSampling, experimental: experimental,
+			server: mcpserver.ServerFromContext(ctx), credentialHash: credentialHash,
 		}
-		sessionStore.SetSessionServer(sessionID, mcpserver.ServerFromContext(ctx))
+		if ac := auth.AuthContextFromContext(ctx); ac != nil && ac.AgentName != "" {
+			info.TokenName, info.ClientID, info.TokenPrefix = ac.AgentName, ac.ClientID, ac.TokenPrefix
+		}
+		sessionStore.SetSession(info)
 		if proxy := proxyRef.Load(); proxy != nil {
-			proxy.touchUpstreamSession(ctx, session)
+			proxy.signalUpstreamLifetime()
 		}
 
 		logger.Info("MCP client initialized with capabilities",
@@ -398,22 +391,22 @@ func NewMCPProxyServer(
 	}
 
 	proxy := &MCPProxyServer{
-		server:           mcpServer,
-		storage:          storage,
-		index:            index,
-		upstreamManager:  upstreamManager,
-		cacheManager:     cacheManager,
-		truncator:        truncator,
-		outputValidator:  outputValidator,
-		inputValidator:   newInputValidator(logger),
-		logger:           logger,
-		mainServer:       mainServer,
-		config:           config,
-		sigCache:         sigCache,
-		jsPool:           jsPool,
-		sessionStore:     sessionStore,
-		hooks:            hooks,
-		upstreamLifetime: upstreamLifetime{sessions: make(map[string]upstreamClientSession), wake: make(chan struct{}, 1)},
+		server:          mcpServer,
+		storage:         storage,
+		index:           index,
+		upstreamManager: upstreamManager,
+		cacheManager:    cacheManager,
+		truncator:       truncator,
+		outputValidator: outputValidator,
+		inputValidator:  newInputValidator(logger),
+		logger:          logger,
+		mainServer:      mainServer,
+		config:          config,
+		sigCache:        sigCache,
+		jsPool:          jsPool,
+		sessionStore:    sessionStore,
+		hooks:           hooks,
+		lifetimeWake:    make(chan struct{}, 1),
 	}
 
 	// Let the hooks (registered before the proxy existed) reach it.

@@ -9,18 +9,14 @@ import (
 )
 
 type peerSession struct {
-	owner      *managed.Client
-	connection *core.Client
+	owner *managed.Client
+	id    string
 }
 
 func (a *Agent) getPeerSession(id string, owner *managed.Client) *core.Client {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	session := a.sessions[id]
-	if session.owner == owner {
-		return session.connection
-	}
-	return nil
+	return a.sessions[peerSession{owner, id}]
 }
 
 func (a *Agent) openPeerSession(ctx context.Context, id string, info mcp.Implementation, owner *managed.Client) (*mcp.InitializeResult, error) {
@@ -36,20 +32,19 @@ func (a *Agent) openPeerSession(ctx context.Context, id string, info mcp.Impleme
 		return nil, err
 	}
 	a.mu.Lock()
-	a.sessions[id] = peerSession{owner, connection}
+	a.sessions[peerSession{owner, id}] = connection
 	a.mu.Unlock()
 	return connection.GetServerInfo(), nil
 }
 
 func (a *Agent) closePeerSession(id string, owner *managed.Client) error {
 	a.mu.Lock()
-	session := a.sessions[id]
-	if session.owner == owner {
-		delete(a.sessions, id)
-	}
+	key := peerSession{owner, id}
+	connection := a.sessions[key]
+	delete(a.sessions, key)
 	a.mu.Unlock()
-	if session.owner == owner {
-		return session.connection.Disconnect()
+	if connection != nil {
+		return connection.Disconnect()
 	}
 	return nil
 }
@@ -57,10 +52,10 @@ func (a *Agent) closePeerSession(id string, owner *managed.Client) error {
 func (a *Agent) closePeerSessions(owner *managed.Client) {
 	a.mu.Lock()
 	var closing []*core.Client
-	for id, session := range a.sessions {
+	for session, connection := range a.sessions {
 		if owner == nil || owner == session.owner {
-			delete(a.sessions, id)
-			closing = append(closing, session.connection)
+			delete(a.sessions, session)
+			closing = append(closing, connection)
 		}
 	}
 	a.mu.Unlock()
