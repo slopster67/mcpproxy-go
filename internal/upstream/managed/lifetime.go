@@ -102,7 +102,7 @@ func (mc *Client) listDemandTools(ctx context.Context) ([]*config.ToolMetadata, 
 	}
 	d.tools = probe.tools
 	for id, session := range d.sessions {
-		if err := session.discover(ctx); err != nil {
+		if err := session.discover(ctx); err != nil && ctx.Err() == nil {
 			delete(d.sessions, id)
 			_ = session.client.Disconnect()
 		}
@@ -169,6 +169,18 @@ func (mc *Client) openSessionConnection(ctx context.Context, id string, info mcp
 	if err != nil {
 		return err
 	}
+	// A dedicated upstream reports changes to its own catalog.
+	connection.SetOnToolsChangedCallback(func(string) {
+		go func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if session := d.sessions[id]; session != nil && session.client == connection {
+				refreshCtx, cancel := context.WithTimeout(connection.Gate().Context(), 30*time.Second)
+				defer cancel()
+				_ = session.discover(refreshCtx)
+			}
+		}()
+	})
 	session, err := connectAndDiscover(ctx, connection)
 	if err != nil {
 		return err
