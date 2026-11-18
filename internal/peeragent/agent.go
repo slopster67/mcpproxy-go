@@ -514,10 +514,7 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 				return nil, err
 			}
 		}
-		instance.OnPeerNotification(func(notification mcp.JSONRPCNotification) {
-			data, _ := json.Marshal(notification)
-			_ = a.post(context.Background(), peering.Frame{Op: "notification", Server: f.Server, Data: data})
-		})
+		instance.OnPeerNotification(a.forwardNotification(f.Server, ""))
 		if token := a.token(f.Server); token != nil {
 			if record := token.Token(); record != nil && record.RefreshToken != "" {
 				a.refresh.OnTokenSavedFor(f.Server, record.ExpiresAt, desired.Binding)
@@ -606,6 +603,13 @@ func (a *Agent) execute(ctx context.Context, f peering.Frame) (any, error) {
 		return a.manage(ctx, f)
 	}
 }
+func (a *Agent) forwardNotification(server, session string) func(mcp.JSONRPCNotification) {
+	return func(notification mcp.JSONRPCNotification) {
+		data, _ := json.Marshal(notification)
+		_ = a.post(context.Background(), peering.Frame{Op: "notification", Server: server, Session: session, Data: data})
+	}
+}
+
 func (a *Agent) closeServers() {
 	a.mu.Lock()
 	clients := make([]*managed.Client, 0, len(a.servers))

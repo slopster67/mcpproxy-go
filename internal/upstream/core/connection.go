@@ -335,6 +335,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	// Each auth strategy runs both client.Start() and initialize(), so
 	// connection and OAuth errors were already detected above.
 
+	c.registerNotificationHandler()
 	c.connected = true
 
 	// The upstream answered, so any rate-limit window we were holding is spent.

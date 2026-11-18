@@ -31,6 +31,7 @@ func (a *Agent) openPeerSession(ctx context.Context, id string, info mcp.Impleme
 		_ = connection.Disconnect()
 		return nil, err
 	}
+	connection.OnPeerNotification(a.forwardNotification(owner.GetConfig().Name, id))
 	a.mu.Lock()
 	a.sessions[peerSession{owner, id}] = connection
 	a.mu.Unlock()

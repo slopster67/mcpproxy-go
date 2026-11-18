@@ -21,11 +21,12 @@ const MaxMessage = 16 << 20
 var ErrOffline = errors.New("peer is offline")
 
 type Frame struct {
-	ID     string          `json:"id,omitempty"`
-	Op     string          `json:"op"`
-	Server string          `json:"server,omitempty"`
-	Data   json.RawMessage `json:"data,omitempty"`
-	Error  string          `json:"error,omitempty"`
+	Session string          `json:"session,omitempty"`
+	ID      string          `json:"id,omitempty"`
+	Op      string          `json:"op"`
+	Server  string          `json:"server,omitempty"`
+	Data    json.RawMessage `json:"data,omitempty"`
+	Error   string          `json:"error,omitempty"`
 }
 
 type Executor interface {

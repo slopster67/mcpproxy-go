@@ -47,8 +47,11 @@ func (t *Transport) Start(ctx context.Context) error {
 	if err := t.executor.Call(ctx, t.cfg.ExecutionHost(), "connect", t.cfg.Name, desired, &t.info); err != nil {
 		return err
 	}
-	if hub, ok := t.executor.(*Hub); ok && t.session == "" {
+	if hub, ok := t.executor.(*Hub); ok {
 		t.unlisten = hub.Listen(t.cfg.ExecutionHost()+"/"+t.cfg.Name, func(f Frame) {
+			if f.Session != t.session {
+				return
+			}
 			var notification mcp.JSONRPCNotification
 			if json.Unmarshal(f.Data, &notification) == nil {
 				t.mu.Lock()

@@ -21,10 +21,22 @@ type demandConnections struct {
 	idle         atomic.Bool
 	reportedIdle atomic.Bool
 	usesOAuth    atomic.Bool
-	sessions     map[string]*core.Client
-	shared       bool
+	sessions     map[string]*demandSession
+	shared       *demandSession
 	tools        []*config.ToolMetadata
 	probedAt     time.Time
+}
+
+// A session's client identity can affect the tools its upstream advertises.
+type demandSession struct {
+	client *core.Client
+	tools  []*config.ToolMetadata
+}
+
+func (s *demandSession) discover(ctx context.Context) error {
+	tools, err := s.client.ListTools(ctx)
+	s.tools = tools
+	return err
 }
 
 type lifetimeSessionKey struct{}
@@ -55,7 +67,7 @@ func (mc *Client) IdleChanged() bool {
 }
 
 func (d *demandConnections) updateIdle() {
-	d.idle.Store(!d.probedAt.IsZero() && !d.shared && len(d.sessions) == 0)
+	d.idle.Store(!d.probedAt.IsZero() && d.shared == nil && len(d.sessions) == 0)
 }
 
 func (mc *Client) demandProbeDue() bool {
@@ -77,22 +89,27 @@ func (mc *Client) listDemandTools(ctx context.Context) ([]*config.ToolMetadata, 
 	if time.Since(d.probedAt) < demandProbeInterval {
 		return d.tools, nil
 	}
-	if !mc.coreClient.IsConnected() {
-		if err := mc.coreClient.Connect(ctx); err != nil {
+	probe := d.shared
+	if probe == nil {
+		var err error
+		probe, err = connectAndDiscover(ctx, mc.coreClient)
+		if err != nil {
 			return nil, err
 		}
-	}
-	if !d.shared {
 		defer mc.coreClient.Disconnect()
-	}
-	tools, err := mc.coreClient.ListTools(ctx)
-	if err != nil {
+	} else if err := probe.discover(ctx); err != nil {
 		return nil, err
 	}
-	d.tools = tools
+	d.tools = probe.tools
+	for id, session := range d.sessions {
+		if err := session.discover(ctx); err != nil {
+			delete(d.sessions, id)
+			_ = session.client.Disconnect()
+		}
+	}
 	d.usesOAuth.Store(mc.coreClient.AuthStrategy() == core.AuthStrategyOAuth)
 	d.probedAt = time.Now()
-	return tools, nil
+	return d.tools, nil
 }
 
 // SyncLifetimeSessions keeps only the connections with an eligible live
@@ -113,11 +130,11 @@ func (mc *Client) SyncLifetimeSessions(ctx context.Context, sessions map[string]
 	for id, connection := range d.sessions {
 		if _, keep := sessions[id]; !keep {
 			delete(d.sessions, id)
-			_ = connection.Disconnect()
+			_ = connection.client.Disconnect()
 		}
 	}
-	if len(sessions) == 0 && d.shared {
-		d.shared = false
+	if len(sessions) == 0 && d.shared != nil {
+		d.shared = nil
 		_ = mc.coreClient.Disconnect()
 	}
 	for id, info := range sessions {
@@ -138,13 +155,12 @@ func (mc *Client) openSessionConnection(ctx context.Context, id string, info mcp
 	}
 	d := &mc.demand
 	cfg := mc.GetConfig()
-	if cfg.ConnectionLifetime == config.KeepRunningShared || cfg.LaunchesHTTP() {
-		if !mc.coreClient.IsConnected() {
-			if err := mc.coreClient.Connect(ctx); err != nil {
-				return err
-			}
+	if d.shared == nil && (cfg.ConnectionLifetime == config.KeepRunningShared || cfg.LaunchesHTTP()) {
+		session, err := connectAndDiscover(ctx, mc.coreClient)
+		if err != nil {
+			return err
 		}
-		d.shared = true
+		d.shared = session
 		if cfg.ConnectionLifetime == config.KeepRunningShared {
 			return nil
 		}
@@ -153,25 +169,40 @@ func (mc *Client) openSessionConnection(ctx context.Context, id string, info mcp
 	if err != nil {
 		return err
 	}
-	if err := connection.Connect(ctx); err != nil {
-		_ = connection.Disconnect()
+	session, err := connectAndDiscover(ctx, connection)
+	if err != nil {
 		return err
 	}
 	if d.sessions == nil {
-		d.sessions = make(map[string]*core.Client)
+		d.sessions = make(map[string]*demandSession)
 	}
-	d.sessions[id] = connection
+	d.sessions[id] = session
 	return nil
+}
+
+func connectAndDiscover(ctx context.Context, client *core.Client) (*demandSession, error) {
+	if !client.IsConnected() {
+		if err := client.Connect(ctx); err != nil {
+			_ = client.Disconnect()
+			return nil, err
+		}
+	}
+	session := &demandSession{client: client}
+	if err := session.discover(ctx); err != nil {
+		_ = client.Disconnect()
+		return nil, err
+	}
+	return session, nil
 }
 
 func (mc *Client) closeDemandSessionsLocked() {
 	d := &mc.demand
 	defer d.updateIdle()
 	for _, connection := range d.sessions {
-		_ = connection.Disconnect()
+		_ = connection.client.Disconnect()
 	}
 	d.sessions = nil
-	d.shared = false
+	d.shared = nil
 	d.tools = nil
 	d.usesOAuth.Store(false)
 	d.probedAt = time.Time{}
@@ -198,17 +229,10 @@ func (mc *Client) callDemandTool(ctx context.Context, name string, args map[stri
 		return nil, ErrConnectionGenerationChanged
 	}
 
-	tools, err := connection.ListTools(ctx)
-	if err != nil {
-		d.mu.RUnlock()
-		if ctx.Err() == nil {
-			mc.dropDemandConnection(id, connection)
-		}
-		return nil, err
-	}
+	tools := connection.tools
 	// A shared core can reconnect in place. A dedicated client is never
 	// reused, so its tool call need not delay another session's disconnect.
-	if connection == mc.coreClient {
+	if connection == d.shared {
 		defer d.mu.RUnlock()
 	} else {
 		d.mu.RUnlock()
@@ -216,34 +240,17 @@ func (mc *Client) callDemandTool(ctx context.Context, name string, args map[stri
 	for _, actual := range tools {
 		if config.RawToolName(actual) == name && actual.Hash == expected.hash &&
 			reflect.DeepEqual(actual.Annotations, expected.annotations) {
-			return connection.CallTool(ctx, name, args)
+			return connection.client.CallTool(ctx, name, args)
 		}
 	}
 	return nil, ErrConnectionGenerationChanged
 }
 
-func (mc *Client) activeDemandConnection(id string) *core.Client {
+func (mc *Client) activeDemandConnection(id string) *demandSession {
 	if mc.GetConfig().ConnectionLifetime == config.KeepRunningPerSession {
 		return mc.demand.sessions[id]
 	}
-	if mc.demand.shared {
-		return mc.coreClient
-	}
-	return nil
-}
-
-func (mc *Client) dropDemandConnection(id string, connection *core.Client) {
-	d := &mc.demand
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	defer d.updateIdle()
-	if d.sessions[id] == connection {
-		delete(d.sessions, id)
-		_ = connection.Disconnect()
-	} else if d.shared && connection == mc.coreClient {
-		d.shared = false
-		_ = connection.Disconnect()
-	}
+	return mc.demand.shared
 }
 
 func (mc *Client) probeDemandConnection() {

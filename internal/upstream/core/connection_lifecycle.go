@@ -35,6 +35,7 @@ func (c *Client) NewSessionConnection(id string, info mcp.Implementation) (*Clie
 	if err != nil {
 		return nil, err
 	}
+	session.onToolsChanged = c.onToolsChanged
 	session.clientInfo = info
 	session.peerSession = id
 	session.SetCredentialBinding(c.CredentialBinding())
